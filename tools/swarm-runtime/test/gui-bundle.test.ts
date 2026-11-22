@@ -51,10 +51,14 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("toastEnabled");
     expect(code).toContain("pinned");
 
-    // Composer pill, overlay & bee branding
+    // Composer pill, overlay, searchable A-Z select, onboarding & bee branding
     expect(code).toContain("🐝 Swarm: Buzzing");
     expect(code).toContain("🐝 Swarm: Dozing");
     expect(code).toContain("🐝 Swarm Control");
+    expect(code).toContain("🐝 Swarm Model Setup");
+    expect(code).toContain("Search models...");
+    expect(code).toContain("session-activity-chip");
+    expect(code).toContain("onboardingComplete");
     expect(code).toContain("getRoleConfig");
     expect(code).toContain("setRoleModel");
 

@@ -1,15 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
+import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
 
 function createHarness(repoDir: string, dbPath: string) {
   const tools = new Map<string, any>();
   const sessions = new Map<string, any>();
   const prompts: Array<{ sessionID: string; text: string }> = [];
+  const eventQueue: any[] = [];
+  let resolveNextEvent: ((ev: IteratorResult<any>) => void) | null = null;
   let seq = 1;
+
+  function pushEvent(ev: any) {
+    if (resolveNextEvent) {
+      const r = resolveNextEvent;
+      resolveNextEvent = null;
+      r({ value: ev, done: false });
+    } else {
+      eventQueue.push(ev);
+    }
+  }
 
   sessions.set("sess_coord", {
     id: "sess_coord",
@@ -104,13 +117,35 @@ function createHarness(repoDir: string, dbPath: string) {
       async hook() {},
     },
     event: {
-      subscribe() {
-        return { async *[Symbol.asyncIterator]() {} };
+      subscribe({ signal }: { signal?: AbortSignal } = {}) {
+        return {
+          async *[Symbol.asyncIterator]() {
+            while (!signal?.aborted) {
+              if (eventQueue.length > 0) {
+                yield eventQueue.shift();
+                continue;
+              }
+              const next = await new Promise<IteratorResult<any>>((resolve) => {
+                resolveNextEvent = resolve;
+                signal?.addEventListener(
+                  "abort",
+                  () => {
+                    if (resolveNextEvent === resolve) resolveNextEvent = null;
+                    resolve({ value: undefined, done: true });
+                  },
+                  { once: true },
+                );
+              });
+              if (next.done) break;
+              yield next.value;
+            }
+          },
+        };
       },
     },
   };
 
-  return { ctx, tools, prompts };
+  return { ctx, tools, prompts, pushEvent };
 }
 
 describe("Concurrency, State & Contract Audit Regressions", () => {
@@ -301,5 +336,141 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
       } catch {}
     }
+  });
+
+  test("post_message [done]/PASS, session.status events, and zero-spam instant coordinator completion handoff", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-fast-handoff-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+      const rpcEvents = (ctx as any)._rpcEvents as Array<{ event: string; payload: any }>;
+
+      const addWorker = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature A" }, { sessionID: "sess_coord" })).content,
+      );
+      const addVerifier = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "verifier", role: "verifier", brief: "Verify feature A" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      const w1Sess = addWorker.spawned[0].session_id as string;
+      const verSess = addVerifier.spawned[0].session_id as string;
+
+      // Worker finishes -> immediately waiting + track_status=done + emits member_state
+      await postTool.execute({ text: "[done] @verifier please check feature A" }, { sessionID: w1Sess });
+      let snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const w1Snap = snap.members.find((m: any) => m.name === "w1");
+      expect(w1Snap.state).toBe("waiting");
+      expect(w1Snap.track_status).toBe("done");
+      expect(rpcEvents.some((e) => e.payload?.reason === "member_state" && e.payload?.handle === "w1")).toBe(true);
+
+      // While @coordinator is still working, coordinator gets 0 handoff prompts
+      expect(prompts.filter((p) => p.sessionID === "sess_coord").length).toBe(0);
+
+      // Verifier finishes with PASS -> verifier transitions to waiting immediately
+      await postTool.execute({ text: "@coordinator PASS all checks green" }, { sessionID: verSess });
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verSnap = snap.members.find((m: any) => m.name === "verifier");
+      expect(verSnap.state).toBe("waiting");
+      expect(verSnap.track_status).toBe("done");
+      expect(prompts.filter((p) => p.sessionID === "sess_coord").length).toBe(0);
+
+      // Test session.status busy -> idle on verifier & idle on coordinator
+      pushEvent({ type: "session.status", data: { sessionID: verSess, status: { type: "busy" } } });
+      await new Promise((r) => setTimeout(r, 25));
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snap.members.find((m: any) => m.name === "verifier").state).toBe("working");
+
+      pushEvent({ type: "session.status", data: { sessionID: verSess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 25));
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snap.members.find((m: any) => m.name === "verifier").state).toBe("waiting");
+
+      // Now @coordinator finishes its turn -> session.status idle wakes coordinator ONCE cleanly!
+      pushEvent({ type: "session.status", data: { sessionID: "sess_coord", status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 40));
+
+      const coordPrompts = prompts.filter((p) => p.sessionID === "sess_coord");
+      expect(coordPrompts.length).toBe(1);
+      expect(coordPrompts[0].text).not.toContain("[SWARM BOARD WAKE-UP");
+      expect(coordPrompts[0].text).toContain("All swarm members finished");
+
+      // Duplicate session.idle event MUST NOT re-wake coordinator for the same post
+      pushEvent({ type: "session.idle", data: { sessionID: "sess_coord" } });
+      await new Promise((r) => setTimeout(r, 25));
+      expect(prompts.filter((p) => p.sessionID === "sess_coord").length).toBe(1);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("role-model persistence to role-models.json survives plugin restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-role-persist-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const h1 = createHarness(repoDir, dbPath);
+    const cleanup1 = (await swarmRuntimePlugin.setup(h1.ctx)) as () => Promise<void>;
+    try {
+      const handlers1 = (h1.ctx as any)._rpcHandlers;
+      const res = await handlers1.setRoleModel({ role: "worker", model: "openai/gpt-5.4#high" });
+      expect(res.ok).toBe(true);
+      expect(existsSync(join(root, "data", "role-models.json"))).toBe(true);
+    } finally {
+      await cleanup1();
+    }
+
+    const h2 = createHarness(repoDir, dbPath);
+    const cleanup2 = (await swarmRuntimePlugin.setup(h2.ctx)) as () => Promise<void>;
+    try {
+      const handlers2 = (h2.ctx as any)._rpcHandlers;
+      const cfg = await handlers2.getRoleConfig({});
+      expect(cfg.roleModels.worker).toBe("openai/gpt-5.4#high");
+    } finally {
+      await cleanup2();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("buildSortedModelOptions sorts A-Z and resolveRecommendedRoleModels picks expected defaults", () => {
+    const catalog = [
+      { providerID: "zeta", id: "z-model", variants: ["low"] },
+      { providerID: "opencode-go", id: "glm-5.3-flash", variants: ["fast"] },
+      { providerID: "opencode-go", id: "deepseek-v4.1-flash", variants: ["low", "high", "max"] },
+      { providerID: "opencode-go", id: "muse-spark-1.3-contributor", variants: ["default", "xhigh"] },
+      { providerID: "alpha", id: "a-model", variants: [] },
+    ];
+
+    const sorted = buildSortedModelOptions(catalog);
+    const labels = sorted.map((o) => o.label);
+    const expected = [...labels].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }));
+    expect(labels).toEqual(expected);
+
+    const rec = resolveRecommendedRoleModels(catalog);
+    expect(rec.coordinator).toBe("opencode-go/muse-spark-1.3-contributor#xhigh");
+    expect(rec.worker).toBe("opencode-go/deepseek-v4.1-flash#high");
+    expect(rec.verifier).toBe("opencode-go/deepseek-v4.1-flash#max");
+    expect(rec.monitor).toBe("opencode-go/glm-5.3-flash");
+
+    const manualOpts = buildSortedModelOptions(catalog, undefined, rec.worker);
+    expect(manualOpts[0].spec).toBe(rec.worker);
+    expect(manualOpts[0].isRecommended).toBe(true);
   });
 });

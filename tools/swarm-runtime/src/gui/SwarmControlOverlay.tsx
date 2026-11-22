@@ -1,8 +1,10 @@
 import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import type { SetRoleModelResult, SwarmRoleConfig } from "../../src/rpc.js";
+import { buildSortedModelOptions, type SwarmControlRole } from "./recommendedModels.js";
+import { SearchableModelSelect } from "./SearchableModelSelect.js";
 import type { SwarmGuiContext, SwarmSnapshot } from "./types.js";
 
-export type SwarmControlRole = "coordinator" | "worker" | "verifier" | "monitor";
+export type { SwarmControlRole };
 
 export interface SwarmControlOverlayProps {
   ctx: SwarmGuiContext;
@@ -12,6 +14,7 @@ export interface SwarmControlOverlayProps {
   loadRoleConfig: () => Promise<SwarmRoleConfig | null>;
   onSetRoleModel: (role: SwarmControlRole, modelSpec: string) => Promise<SetRoleModelResult | null>;
   onOpenBoard: () => void;
+  onOpenSetupWizard?: () => void;
   onClose: () => void;
 }
 
@@ -62,34 +65,9 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
     void fetchConfig();
   });
 
-  const modelOptions = createMemo(() => {
-    const cfg = config();
-    const specs: Array<{ spec: string; label: string }> = [];
-    const seen = new Set<string>();
-    for (const m of cfg?.models ?? []) {
-      const base = `${m.providerID}/${m.id}`;
-      if (!seen.has(base)) {
-        seen.add(base);
-        specs.push({ spec: base, label: m.name ? `${base} (${m.name})` : base });
-      }
-      for (const v of m.variants ?? []) {
-        const withVar = `${base}#${v}`;
-        if (!seen.has(withVar)) {
-          seen.add(withVar);
-          specs.push({ spec: withVar, label: withVar });
-        }
-      }
-    }
-    return specs;
-  });
-
   const optionsForRole = (role: SwarmControlRole) => {
     const current = config()?.roleModels[role] ?? "";
-    const base = modelOptions();
-    if (current && !base.some((o) => o.spec === current)) {
-      return [{ spec: current, label: `${current} (current)` }, ...base];
-    }
-    return base;
+    return buildSortedModelOptions(config()?.models ?? [], current);
   };
 
   const roleCounts = (role: SwarmControlRole) => {
@@ -164,15 +142,26 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
               </span>
             </div>
           </div>
-          <Button
-            variant="contrast"
-            onClick={() => {
-              props.onOpenBoard();
-              props.onClose();
-            }}
-          >
-            Board
-          </Button>
+          <div class="swarm-overlay-actions">
+            <Show when={props.onOpenSetupWizard}>
+              <Button
+                variant="ghost"
+                size="small"
+                onClick={() => props.onOpenSetupWizard?.()}
+              >
+                Setup Wizard
+              </Button>
+            </Show>
+            <Button
+              variant="contrast"
+              onClick={() => {
+                props.onOpenBoard();
+                props.onClose();
+              }}
+            >
+              Board
+            </Button>
+          </div>
         </div>
 
         <Show when={errorMsg()}>
@@ -190,10 +179,11 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
         >
           <div class="swarm-overlay-roles">
             <For each={ROLE_META}>
-              {(item) => {
+              {(item, idx) => {
                 const rc = () => roleCounts(item.role);
                 const currentSpec = () => config()?.roleModels[item.role] ?? "";
                 const busy = () => savingRole() === item.role;
+                const opts = createMemo(() => optionsForRole(item.role));
                 return (
                   <div class="swarm-overlay-role-row">
                     <div class="swarm-overlay-role-info">
@@ -207,24 +197,16 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
                       </div>
                       <span class="swarm-overlay-role-sub">{item.subtitle}</span>
                     </div>
-                    <select
-                      class="swarm-gui-select swarm-overlay-select"
-                      value={currentSpec()}
-                      disabled={busy()}
-                      aria-label={`${item.title} model`}
-                      onChange={(e) => void handleModelChange(item.role, e.currentTarget.value)}
-                    >
-                      <Show when={optionsForRole(item.role).length === 0}>
-                        <option value="">No models available</option>
-                      </Show>
-                      <For each={optionsForRole(item.role)}>
-                        {(opt) => (
-                          <option value={opt.spec} selected={opt.spec === currentSpec()}>
-                            {opt.label}
-                          </option>
-                        )}
-                      </For>
-                    </select>
+                    <div class="swarm-overlay-select-wrap">
+                      <SearchableModelSelect
+                        value={currentSpec()}
+                        options={opts()}
+                        disabled={busy()}
+                        ariaLabel={`${item.title} model`}
+                        menuUpward={idx() >= ROLE_META.length - 1}
+                        onChange={(spec) => void handleModelChange(item.role, spec)}
+                      />
+                    </div>
                   </div>
                 );
               }}

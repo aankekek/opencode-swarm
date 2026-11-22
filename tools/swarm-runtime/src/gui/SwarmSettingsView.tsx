@@ -13,6 +13,7 @@ export interface SwarmSettingsViewProps {
   rpcStatus: () => SwarmRpcStatus;
   activeSwarmCount: () => number;
   onOpenPanel: () => void;
+  onOpenSetupWizard?: () => void;
   onRefresh: () => void;
   target?: string;
 }
@@ -152,6 +153,11 @@ export function SwarmSettingsView(props: SwarmSettingsViewProps) {
               <Button size="small" variant="ghost" onClick={props.onRefresh}>
                 Refresh
               </Button>
+              {props.onOpenSetupWizard && (
+                <Button size="small" variant="ghost" onClick={props.onOpenSetupWizard}>
+                  Setup Role Models
+                </Button>
+              )}
               <Button size="small" variant="neutral" onClick={props.onOpenPanel}>
                 Open Swarm Board
               </Button>

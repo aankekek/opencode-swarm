@@ -17,6 +17,7 @@ import { createEffect, createMemo, createSignal, lazy, onCleanup, Show, Suspense
 import SWARM_RPC_DEF, { type SetRoleModelResult, type SwarmRoleConfig } from "../src/rpc.js";
 import { SWARM_GUI_STYLES } from "./gui/styles.js";
 import { SwarmControlOverlay, type SwarmControlRole } from "./gui/SwarmControlOverlay.js";
+import { SwarmOnboardingModal } from "./gui/SwarmOnboardingModal.js";
 import { SwarmSettingsView, type SwarmRpcStatus } from "./gui/SwarmSettingsView.js";
 import {
   DEFAULT_SWARM_SETTINGS,
@@ -80,7 +81,20 @@ const SETTINGS_ENTRIES: readonly SettingEntry[] = [
     description: "Show toast alerts for quota pauses, @verifier PASS/FAIL, @monitor stall nudges, and swarm completion",
     keywords: "swarm toast notifications",
   },
+  {
+    id: "swarm-board.status",
+    title: "Setup Role Models",
+    description: "Choose recommended or custom models for Coordinator, Worker, Verifier, and Monitor",
+    keywords: "swarm models onboarding wizard setup",
+  },
 ];
+
+const HIDE_SUBAGENT_PILL_CSS = `
+[data-component="session-activity-chips"],
+[data-slot="session-activity-chip"] {
+  display: none !important;
+}
+`;
 
 export default Plugin.define({
   stores: {
@@ -126,6 +140,7 @@ export default Plugin.define({
     let refreshSeq = 0;
     let lastKnownRunningId: string | null = null;
     let lastDir: string | undefined;
+    let onboardingPrompted = false;
 
     const currentDirectory = () => ctx.sessions.current()?.location?.directory ?? mountedDirectory();
     const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
@@ -232,6 +247,10 @@ export default Plugin.define({
         const snap = normalizeSwarmSnapshot(rawSnap);
         setSnapshot(snap);
         setRpcStatus({ state: "connected" });
+        if (!settings().onboardingComplete && !onboardingPrompted) {
+          onboardingPrompted = true;
+          queueMicrotask(() => openOnboardingWizard());
+        }
         if (snap) {
           maybeNotify(snap);
         }
@@ -362,6 +381,55 @@ export default Plugin.define({
       );
     });
 
+    safeAdd(Style, () => (isBuzzing() ? HIDE_SUBAGENT_PILL_CSS : undefined));
+
+    const openOnboardingWizard = () => {
+      ctx.dialogs.open((dialog) => (
+        <SwarmOnboardingModal
+          ctx={ctx}
+          loadRoleConfig={async () => {
+            const targetId = selectedSwarmId();
+            const sessionId = ctx.sessions.current()?.id;
+            return (await getRpc().getRoleConfig(
+              targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {},
+              getCallOptions()
+            )) as SwarmRoleConfig | null;
+          }}
+          onApplyModels={async (selections) => {
+            const errors: string[] = [];
+            const targetId = selectedSwarmId();
+            const sessionId = ctx.sessions.current()?.id;
+            for (const role of ["coordinator", "worker", "verifier", "monitor"] as const) {
+              const model = selections[role];
+              if (!model) continue;
+              const res = (await getRpc().setRoleModel(
+                {
+                  role,
+                  model,
+                  ...(targetId ? { swarmId: targetId } : {}),
+                  ...(sessionId ? { sessionId } : {}),
+                },
+                getCallOptions()
+              )) as SetRoleModelResult | null;
+              if (!res?.ok) {
+                errors.push(`${role}: ${res?.error ?? "failed"}`);
+              }
+            }
+            void refresh();
+            return { ok: errors.length === 0, errors };
+          }}
+          onComplete={() => {
+            updateSetting("onboardingComplete", true);
+            dialog.close();
+          }}
+          onSkip={() => {
+            updateSetting("onboardingComplete", true);
+            dialog.close();
+          }}
+        />
+      ));
+    };
+
     const openSwarmOverlay = () => {
       ctx.dialogs.open((dialog) => (
         <SwarmControlOverlay
@@ -393,6 +461,10 @@ export default Plugin.define({
             return res;
           }}
           onOpenBoard={() => openSwarmPanel(false)}
+          onOpenSetupWizard={() => {
+            dialog.close();
+            openOnboardingWizard();
+          }}
           onClose={() => dialog.close()}
         />
       ));
@@ -411,6 +483,7 @@ export default Plugin.define({
           rpcStatus={rpcStatus}
           activeSwarmCount={() => swarms().length}
           onOpenPanel={() => openSwarmPanel(false)}
+          onOpenSetupWizard={openOnboardingWizard}
           onRefresh={() => void refresh()}
           target={target}
         />
@@ -527,6 +600,15 @@ export default Plugin.define({
       group: "Swarm",
       section: "general" as const,
       run: () => openSwarmSettings(),
+    }));
+
+    safeAdd(Command, () => ({
+      id: "setup-models",
+      title: "Swarm Model Setup Wizard",
+      description: "Choose recommended or manual models for Swarm roles",
+      group: "Swarm",
+      section: "model" as const,
+      run: () => openOnboardingWizard(),
     }));
 
     const swarmTab: PanelTab = {

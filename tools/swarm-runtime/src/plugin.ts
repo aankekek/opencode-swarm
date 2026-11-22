@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin";
 
 type Context = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0];
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { startBoardServer, type BoardServerHandle } from "./board-server.js";
@@ -48,7 +48,6 @@ export const swarmRuntimePlugin = Plugin.define({
     const monitorIntervalMs = options.monitorIntervalMs ?? 30_000;
     const debugEvents = options.debugEvents ?? false;
     const debugHooks = options.debugHooks ?? false;
-    const roleModels: Partial<Record<MemberRole, string>> = { ...(options.roleModels ?? {}) };
 
     const repoHash = createHash("sha256")
       .update(IS_WINDOWS ? canonicalWorkspaceRoot.toLowerCase() : canonicalWorkspaceRoot)
@@ -59,6 +58,43 @@ export const swarmRuntimePlugin = Plugin.define({
       : join(homedir(), ".opencode-swarm", repoHash);
     const dbPath = options.dbPath ? resolve(options.dbPath) : join(dataDir, "board.db");
     mkdirSync(dataDir, { recursive: true });
+
+    const roleModelsPath = options.dbPath
+      ? join(dataDir, "role-models.json")
+      : join(homedir(), ".opencode-swarm", "role-models.json");
+    mkdirSync(dirname(roleModelsPath), { recursive: true });
+
+    const VALID_ROLE_KEYS = new Set<MemberRole>(["coordinator", "worker", "verifier", "monitor"]);
+    const roleModels: Partial<Record<MemberRole, string>> = {};
+    try {
+      if (existsSync(roleModelsPath)) {
+        const parsed = JSON.parse(readFileSync(roleModelsPath, "utf8")) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (VALID_ROLE_KEYS.has(k as MemberRole) && typeof v === "string" && v.trim()) {
+              roleModels[k as MemberRole] = v.trim();
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore missing or malformed role-models.json
+    }
+    if (options.roleModels) {
+      for (const [k, v] of Object.entries(options.roleModels)) {
+        if (VALID_ROLE_KEYS.has(k as MemberRole) && typeof v === "string" && v.trim()) {
+          roleModels[k as MemberRole] = v.trim();
+        }
+      }
+    }
+
+    function persistRoleModels() {
+      try {
+        writeFileSync(roleModelsPath, JSON.stringify(roleModels, null, 2), "utf8");
+      } catch {
+        // Ignore persistence write errors
+      }
+    }
 
     const eventDebugLogPath = join(dataDir, "events.debug.jsonl");
     const hookDebugLogPath = join(dataDir, "hooks.debug.jsonl");
@@ -113,6 +149,7 @@ export const swarmRuntimePlugin = Plugin.define({
 
     // Waiter resolvers for swarm_wait(since, mentions_only)
     const waiters = new Map<string, { resolve: (posts: BoardPostRow[]) => void; sinceSeq: number; mentionsOnly: boolean }>();
+    const lastCoordinatorWakeSeq = new Map<string, number>();
 
     async function getSessionModel(sessionId: string): Promise<ModelSelection | undefined> {
       try {
@@ -216,6 +253,7 @@ export const swarmRuntimePlugin = Plugin.define({
           waiters.delete(member.id);
           db.setMemberState(member.id, "working");
           db.advanceReadCursor(member.id, matched[matched.length - 1].swarm_seq);
+          emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
           waiter.resolve(matched);
           return;
         }
@@ -256,6 +294,7 @@ export const swarmRuntimePlugin = Plugin.define({
 
       db.setMemberState(fresh.id, "working");
       db.advanceReadCursor(fresh.id, lastSeq);
+      emitSwarmChanged({ swarmId: fresh.swarm_id, reason: "member_state", handle: fresh.name });
       try {
         await ctx.session.prompt({
           sessionID: fresh.session_id,
@@ -267,7 +306,83 @@ export const swarmRuntimePlugin = Plugin.define({
         db.setMemberState(fresh.id, "waiting", {
           error: err instanceof Error ? err.message : String(err),
         });
+        emitSwarmChanged({ swarmId: fresh.swarm_id, reason: "member_state", handle: fresh.name });
         throw err;
+      }
+    }
+
+    async function maybeWakeIdleCoordinator(swarmId: string, triggerPost?: BoardPostRow) {
+      const swarm = db.getSwarm(swarmId);
+      if (!swarm || swarm.status !== "running") return;
+
+      const members = db.listMembers(swarmId, false);
+      const coord = members.find((m) => m.role === "coordinator");
+      if (!coord || coord.state !== "waiting" || coord.paused_quota === 1 || waiters.has(coord.id)) {
+        return;
+      }
+
+      const latestPost = triggerPost ?? db.getLatestPost(swarmId);
+      if (!latestPost || latestPost.author_name === coord.name) return;
+
+      if (
+        coord.last_read_seq >= latestPost.swarm_seq ||
+        (lastCoordinatorWakeSeq.get(swarmId) ?? 0) >= latestPost.swarm_seq
+      ) {
+        return;
+      }
+
+      const nonCoord = members.filter(
+        (m) => m.role !== "coordinator" && m.role !== "monitor" && m.role !== "narrator",
+      );
+      const anyWorking = nonCoord.some((m) => m.state === "working");
+      const workers = nonCoord.filter((m) => m.role === "worker");
+      const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
+      const isVerifierReport = latestPost.author_name === "verifier" && /\b(PASS|FAIL)\b/i.test(latestPost.body);
+      const isMonitorStall = latestPost.author_name === "monitor";
+      let parsedMentions: string[] = [];
+      try {
+        parsedMentions = JSON.parse(latestPost.mentions_json || "[]") as string[];
+      } catch {
+        parsedMentions = [];
+      }
+      const mentionsCoord = parsedMentions.includes(coord.name);
+      const isExplicitHandoff =
+        mentionsCoord && /\[done\]|\[blocked\]|\[question\]|\bPASS\b|\bFAIL\b/i.test(latestPost.body);
+
+      const shouldWake =
+        (!anyWorking && (allWorkersDone || isVerifierReport)) ||
+        isMonitorStall ||
+        (!anyWorking && isExplicitHandoff);
+      if (!shouldWake) return;
+
+      const prevReadSeq = coord.last_read_seq;
+      lastCoordinatorWakeSeq.set(swarmId, latestPost.swarm_seq);
+      db.setMemberState(coord.id, "working");
+      db.advanceReadCursor(coord.id, latestPost.swarm_seq);
+      emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
+
+      const allPassOrNoVerifier =
+        allWorkersDone &&
+        !anyWorking &&
+        (isVerifierReport
+          ? /\bPASS\b/i.test(latestPost.body)
+          : !nonCoord.some((m) => m.role === "verifier"));
+
+      const handoffText = allPassOrNoVerifier
+        ? `All swarm members finished (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Read board updates since #${prevReadSeq} with read_board, present the final summary to the user, and call swarm{action:"complete"}.`
+        : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
+
+      try {
+        await ctx.session.prompt({
+          sessionID: coord.session_id,
+          text: handoffText,
+          delivery: "queue",
+        });
+      } catch (err) {
+        db.setMemberState(coord.id, "waiting", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
       }
     }
 
@@ -578,6 +693,7 @@ export const swarmRuntimePlugin = Plugin.define({
               switchMemberModelInPlace(swarmId, memberName, model, variant, { interruptAndRerunIfWorking: true }),
             setRoleModelDefault: (role, spec) => {
               roleModels[role] = spec;
+              persistRoleModels();
             },
             getRoleModelDefaults: () => ({ ...roleModels }),
           },
@@ -856,6 +972,7 @@ export const swarmRuntimePlugin = Plugin.define({
 
           const spec = formatModelSpec(resolved);
           roleModels[roleArg as MemberRole] = spec;
+          persistRoleModels();
 
           let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
           if (!swarm && sessionIdArg) {
@@ -1296,10 +1413,6 @@ export const swarmRuntimePlugin = Plugin.define({
             db.releaseAllLocksForSwarm(caller.swarm_id);
             db.setSwarmStatus(caller.swarm_id, "completed");
             emitSwarmChanged({ swarmId: caller.swarm_id, reason: "swarm_completed" });
-            emitSwarmChanged({
-              swarmId: caller.swarm_id,
-              reason: "swarm_completed",
-            });
 
             // SEC-H7: Clear/restore coordinator session permissions
             try {
@@ -1335,12 +1448,24 @@ export const swarmRuntimePlugin = Plugin.define({
           const caller = db.getActiveMemberBySession(toolCtx.sessionID);
           if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
           const input = rawInput as { text: string; channel?: string; mark_done?: boolean };
-          if (input.mark_done || /^\s*\[done\]/i.test(input.text) || /@\S+\s+\[done\]/i.test(input.text)) {
+          const isDonePost =
+            Boolean(input.mark_done) ||
+            /^\s*\[done\]/i.test(input.text) ||
+            /@\S+\s+\[done\]/i.test(input.text);
+          const isVerifierPass = caller.role === "verifier" && /\bPASS\b/i.test(input.text);
+          const isVerifierFail = caller.role === "verifier" && /\bFAIL\b/i.test(input.text);
+
+          if (isDonePost || isVerifierPass) {
             db.setTrackStatus(caller.id, "done");
+          }
+          if (caller.role !== "coordinator" && (isDonePost || isVerifierPass || isVerifierFail)) {
+            db.setMemberState(caller.id, "waiting", { activity: null, pausedQuota: false });
+            emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
           }
           try {
             const post = await postToBoard(caller.swarm_id, caller.name, input.channel ?? "main", input.text);
             db.advanceReadCursor(caller.id, post.swarm_seq);
+            await maybeWakeIdleCoordinator(caller.swarm_id, post);
             return toolJson({ ok: true, seq: post.swarm_seq, channel: post.channel });
           } catch (err) {
             return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -1465,6 +1590,10 @@ export const swarmRuntimePlugin = Plugin.define({
           }
 
           db.setMemberWait(caller.id, mentionsOnly ? "mentions" : "any", sinceSeq);
+          emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
+          if (caller.role !== "coordinator") {
+            void maybeWakeIdleCoordinator(caller.swarm_id);
+          }
 
           const wokenPosts = await new Promise<BoardPostRow[]>((resolveWait) => {
             const onAbort = () => {
@@ -1744,12 +1873,35 @@ export const swarmRuntimePlugin = Plugin.define({
           const member = db.getActiveMemberBySession(sessionId);
           if (!member) continue;
 
-          if (eventType === "session.execution.started") {
+          if (eventType === "session.status") {
+            const statusObj = data.status as { type?: string; message?: string } | undefined;
+            if (statusObj?.type === "idle") {
+              db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
+              emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+              await maybeWakeIdleCoordinator(member.swarm_id);
+            } else if (statusObj?.type === "busy") {
+              db.setMemberState(member.id, "working", { pausedQuota: false });
+              emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+            } else if (statusObj?.type === "retry") {
+              if (isQuotaOrRateLimitError(statusObj.message ?? data)) {
+                db.setMemberState(member.id, "waiting", {
+                  activity: null,
+                  error: "Quota/rate limit reached",
+                  pausedQuota: true,
+                });
+                emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+              }
+            }
+          } else if (eventType === "session.execution.started") {
             db.setMemberState(member.id, "working", { pausedQuota: false });
+            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
           } else if (eventType === "session.idle" || eventType === "session.execution.succeeded") {
             db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
+            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+            await maybeWakeIdleCoordinator(member.swarm_id);
           } else if (eventType === "session.execution.interrupted") {
             db.setMemberState(member.id, "stopped", { activity: null });
+            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
           } else if (eventType === "session.execution.failed") {
             const isQuota = isQuotaOrRateLimitError(data.error ?? data);
             db.setMemberState(member.id, "waiting", {
@@ -1757,6 +1909,7 @@ export const swarmRuntimePlugin = Plugin.define({
               error: isQuota ? "Quota/rate limit reached" : String(data.error ?? "Execution failed"),
               pausedQuota: isQuota,
             });
+            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
           } else if (eventType === "session.step.started") {
             db.incrementMemberSteps(member.id, "Thinking...");
           } else if (eventType === "session.tool.called") {
@@ -1765,6 +1918,7 @@ export const swarmRuntimePlugin = Plugin.define({
           } else if (eventType === "session.deleted") {
             db.setMemberState(member.id, "killed");
             db.releaseLocksForMember(member.id);
+            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
           }
         }
       } catch {
@@ -1786,6 +1940,7 @@ export const swarmRuntimePlugin = Plugin.define({
       abortController.abort();
       pendingCalls.clear();
       waiters.clear();
+      lastCoordinatorWakeSeq.clear();
       if (rpcCleanup) {
         await rpcCleanup();
       }

@@ -8,7 +8,7 @@ export const COORDINATOR_PROTOCOL = [
   "3. **Manual Model & Variant Rule:** Leave `model` and `variant` unset to inherit your own model/variant, UNLESS the user explicitly asks for a specific model or variant. Use `swarm{action:\"models\"}` to inspect available models and variants.",
   "4. **Workspace Isolation:** Use `workspace:\"share\"` (Git worktree) for authors editing in parallel, or `owned_globs` when sharing `inherit`. Leave readers/verifiers on `inherit`.",
   "5. **Addressing:** Use `@name` for one worker, `@all` only for broadcast rules, `@#channel` for channel-wide asks. Cite earlier posts by `#seq`.",
-  "6. **Finish:** When `@verifier` confirms checks pass, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}`.",
+  "6. **Finish:** Call `swarm_wait` or end your turn cleanly after spawning workers; once `@verifier` confirms PASS (or all worker tracks finish), post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
 ].join("\n");
 
 export function buildMemberOpeningPrompt(args: {

@@ -14,6 +14,7 @@ export const SwarmSettingsSchema = Schema.Struct({
   bottomStrip: Schema.Boolean,
   withSidePanel: Schema.Boolean,
   toastEnabled: Schema.Boolean,
+  onboardingComplete: Schema.Boolean,
 });
 
 export type SwarmSettings = typeof SwarmSettingsSchema.Type;
@@ -26,6 +27,7 @@ export const DEFAULT_SWARM_SETTINGS: SwarmSettings = {
   bottomStrip: false,
   withSidePanel: false,
   toastEnabled: true,
+  onboardingComplete: false,
 };
 
 export interface SwarmSummary {
