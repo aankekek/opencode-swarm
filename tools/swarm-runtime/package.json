@@ -1,13 +1,21 @@
 {
   "name": "swarm-runtime",
-  "version": "0.3.0-draft",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./index.ts",
     "./server": "./index.ts"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
   "dependencies": {
-    "@opencode/plugin": "2.0.29"
+    "@opencode/plugin": "2.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
   }
 }

@@ -1,0 +1,258 @@
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import type { PermissionEffect } from "./types.js";
+
+const PROTECTED_TOP_DIRS = new Set([".git", ".opencode", "node_modules"]);
+const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * Antigravity member name rules:
+ * lowercase, starts with [a-z0-9], up to 24 chars of [a-z0-9_-],
+ * cannot be all, everyone, coordinator, or coordinator-*.
+ */
+export function validateMemberName(raw: string): string {
+  const cleaned = raw.trim().replace(/^@+/, "").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,23}$/.test(cleaned)) {
+    throw new Error(
+      `Invalid member name "${raw}". Must be lowercase, start with a letter or digit, and be 1-24 chars of a-z, 0-9, -, _.`,
+    );
+  }
+  if (
+    cleaned === "all" ||
+    cleaned === "everyone" ||
+    cleaned === "coordinator" ||
+    cleaned.startsWith("coordinator-")
+  ) {
+    throw new Error(`Reserved member name "${raw}" cannot be used for a worker.`);
+  }
+  return cleaned;
+}
+
+export function normalizeHandle(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, "")
+    .replace(/[^a-z0-9_-]/g, "-");
+  if (!cleaned) {
+    throw new Error(`Invalid swarm handle: "${raw}"`);
+  }
+  return cleaned;
+}
+
+export function isProtectedRepoPath(repoRelPath: string): boolean {
+  const norm = repoRelPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  const firstSegment = (norm.split("/")[0] ?? "").toLowerCase();
+  return PROTECTED_TOP_DIRS.has(firstSegment);
+}
+
+function resolveCanonicalAncestor(targetAbs: string): string {
+  let cursor = targetAbs;
+  const suffixParts: string[] = [];
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    suffixParts.unshift(relative(parent, cursor));
+    cursor = parent;
+  }
+  const realBase = existsSync(cursor) ? realpathSync(cursor) : cursor;
+  return suffixParts.length > 0 ? resolve(realBase, ...suffixParts) : realBase;
+}
+
+/**
+ * Resolves a path strictly inside canonicalWorkspaceRoot.
+ * Rejects NUL bytes, UNC paths, external drives, `..` traversal, symlink escapes,
+ * and protected internal directories (.git, .opencode, node_modules).
+ */
+export function resolveSafeWorkspacePath(canonicalWorkspaceRoot: string, rawPath: string): string {
+  if (!rawPath || rawPath.includes("\0")) {
+    throw new Error(`[SWARM SECURITY] Invalid file path.`);
+  }
+  const trimmed = rawPath.trim();
+  if (/^(\\\\|\/\/)/.test(trimmed)) {
+    throw new Error(`[SWARM SECURITY] UNC network paths are blocked: "${trimmed}"`);
+  }
+
+  const candidateAbs = isAbsolute(trimmed)
+    ? resolve(trimmed)
+    : resolve(canonicalWorkspaceRoot, trimmed);
+  const candidateReal = resolveCanonicalAncestor(candidateAbs);
+  const rel = relative(canonicalWorkspaceRoot, candidateReal);
+
+  if (rel === "" || rel === ".") {
+    return "";
+  }
+  if (rel.startsWith("..") || isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
+    throw new Error(
+      `[SWARM SECURITY] Path escapes workspace root: "${rawPath}" (outside "${canonicalWorkspaceRoot}").`,
+    );
+  }
+  const normalized = rel.replace(/\\/g, "/");
+  if (isProtectedRepoPath(normalized)) {
+    throw new Error(
+      `[SWARM SECURITY] Protected repository path cannot be modified by swarm members: "${normalized}"`,
+    );
+  }
+  return normalized;
+}
+
+export function validateAndNormalizeGlob(rawGlob: string): string {
+  if (!rawGlob || rawGlob.includes("\0")) {
+    throw new Error(`Invalid ownership glob: "${rawGlob}"`);
+  }
+  const norm = rawGlob.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!norm) {
+    throw new Error(`Empty ownership glob is not allowed.`);
+  }
+  if (norm.startsWith("/") || /^[a-zA-Z]:/.test(norm) || norm.startsWith("//")) {
+    throw new Error(`Ownership glob must be workspace-relative (got "${rawGlob}").`);
+  }
+  if (/[{}[\]]/.test(norm)) {
+    throw new Error(
+      `Unsupported glob syntax in "${rawGlob}" (braces '{}' and brackets '[]' are not expanded). ` +
+        `Pass separate entries in owned_globs instead (e.g. ["src/**/*.ts", "src/**/*.tsx"]).`,
+    );
+  }
+  const segments = norm.split("/");
+  if (segments.some((s) => s === "..")) {
+    throw new Error(`Ownership glob cannot contain parent traversal '..' (got "${rawGlob}").`);
+  }
+  if (isProtectedRepoPath(norm)) {
+    throw new Error(`Protected path cannot be claimed as an ownership glob: "${rawGlob}"`);
+  }
+  return norm.endsWith("/") ? `${norm}**` : norm;
+}
+
+export function globToRegExp(glob: string): RegExp {
+  const norm = validateAndNormalizeGlob(glob);
+  let regexStr = "^";
+  let i = 0;
+  while (i < norm.length) {
+    const ch = norm[i];
+    if (ch === "*") {
+      if (norm[i + 1] === "*") {
+        if (norm[i + 2] === "/") {
+          regexStr += "(?:.*/)?";
+          i += 3;
+          continue;
+        }
+        regexStr += ".*";
+        i += 2;
+        continue;
+      }
+      regexStr += "[^/]*";
+      i += 1;
+      continue;
+    }
+    if (ch === "?") {
+      regexStr += "[^/]";
+      i += 1;
+      continue;
+    }
+    regexStr += /[.+^${}()|[\]\\]/.test(ch) ? `\\${ch}` : ch;
+    i += 1;
+  }
+  regexStr += "$";
+  return new RegExp(regexStr, IS_WINDOWS ? "i" : "");
+}
+
+export function pathMatchesGlob(repoRelPath: string, glob: string): boolean {
+  const cleanPath = repoRelPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  return globToRegExp(glob).test(cleanPath);
+}
+
+function literalExtension(glob: string): string | null {
+  const lastSegment = glob.split("/").pop() ?? "";
+  if (!lastSegment || /[*?]$/.test(lastSegment)) return null;
+  const ext = extname(lastSegment);
+  if (!ext || /[*?]/.test(ext)) return null;
+  return IS_WINDOWS ? ext.toLowerCase() : ext;
+}
+
+export function globsPotentiallyOverlap(a: string, b: string): boolean {
+  const na = validateAndNormalizeGlob(a);
+  const nb = validateAndNormalizeGlob(b);
+  const ca = IS_WINDOWS ? na.toLowerCase() : na;
+  const cb = IS_WINDOWS ? nb.toLowerCase() : nb;
+  if (ca === cb) return true;
+
+  const extA = literalExtension(na);
+  const extB = literalExtension(nb);
+  if (extA && extB && extA !== extB) {
+    return false;
+  }
+
+  const prefixA = ca.split(/[*?]/)[0];
+  const prefixB = cb.split(/[*?]/)[0];
+  if (!prefixA || !prefixB) {
+    return true;
+  }
+  if (prefixA.startsWith(prefixB) || prefixB.startsWith(prefixA)) {
+    return true;
+  }
+  return (
+    pathMatchesGlob(na.replace(/[*?].*$/, "sample"), nb) ||
+    pathMatchesGlob(nb.replace(/[*?].*$/, "sample"), na)
+  );
+}
+
+export function extractTargetPaths(toolName: string, input: unknown): string[] {
+  if (!input || typeof input !== "object") return [];
+  const obj = input as Record<string, unknown>;
+  const paths = new Set<string>();
+
+  for (const key of ["path", "filePath", "file_path", "targetPath", "filename", "resource"]) {
+    if (typeof obj[key] === "string" && obj[key].trim()) {
+      paths.add(obj[key].trim());
+    }
+  }
+  for (const arrKey of ["paths", "resources"]) {
+    if (Array.isArray(obj[arrKey])) {
+      for (const p of obj[arrKey] as unknown[]) {
+        if (typeof p === "string" && p.trim()) paths.add(p.trim());
+      }
+    }
+  }
+  if (Array.isArray(obj.edits)) {
+    for (const edit of obj.edits) {
+      if (edit && typeof edit === "object") {
+        const e = edit as Record<string, unknown>;
+        for (const key of ["path", "filePath", "file_path"]) {
+          if (typeof e[key] === "string" && e[key].trim()) paths.add(e[key].trim());
+        }
+      }
+    }
+  }
+
+  if (toolName.includes("patch") || toolName === "edit") {
+    const patchText =
+      typeof obj.patch === "string"
+        ? obj.patch
+        : typeof obj.patchText === "string"
+          ? obj.patchText
+          : typeof obj.diff === "string"
+            ? obj.diff
+            : "";
+    if (patchText) {
+      const headerRe = /^(?:\*\*\* (?:Update|Add|Delete) File: |\+\+\+ b\/|--- a\/)(.+)$/gm;
+      let m: RegExpExecArray | null;
+      while ((m = headerRe.exec(patchText)) !== null) {
+        const candidate = m[1]?.trim();
+        if (candidate && candidate !== "/dev/null") paths.add(candidate);
+      }
+    }
+  }
+
+  return Array.from(paths);
+}
+
+/**
+ * Only tightens a permission effect (allow -> ask -> deny).
+ * Never weakens a user's or agent's pre-computed deny/ask rule.
+ */
+export function tightenEffect(current: unknown, proposed: PermissionEffect): PermissionEffect {
+  const rank: Record<PermissionEffect, number> = { allow: 0, ask: 1, deny: 2 };
+  const cur: PermissionEffect =
+    current === "deny" || current === "ask" || current === "allow" ? current : "allow";
+  return rank[proposed] > rank[cur] ? proposed : cur;
+}
