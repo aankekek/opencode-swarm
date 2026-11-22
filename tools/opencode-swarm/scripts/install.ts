@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripJsonComments } from "../src/uninstall.js";
 
-const SWARM_MATCH_RE = /(?:^|[\\/])swarm-runtime(?:$|[\\/])|local\.swarm-runtime/i;
+const SWARM_MATCH_RE = /(?:^|[\\/])(?:opencode-swarm|swarm-runtime)(?:$|[\\/])|local\.swarm-runtime/i;
 
 export function registerSwarmInGlobalConfig(
   configPath: string,

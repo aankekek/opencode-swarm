@@ -22,7 +22,7 @@ export interface UninstallEnvOptions {
   boardUrl?: string;
 }
 
-const SWARM_MATCH_RE = /(?:^|[\\/])swarm-runtime(?:$|[\\/])|local\.swarm-runtime/i;
+const SWARM_MATCH_RE = /(?:^|[\\/])(?:opencode-swarm|swarm-runtime)(?:$|[\\/])|local\.swarm-runtime/i;
 
 export function stripJsonComments(raw: string): string {
   const input = raw.replace(/^\uFEFF/, "");
@@ -501,7 +501,7 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
     runtimeDataDir,
     categories,
     preserved: [
-      "Source files: tools/swarm-runtime/{src,test,assets,docs,scripts,index.ts,package.json,tsconfig.json,vite.config.ts,bun.lock}",
+      "Source files: tools/opencode-swarm/{src,test,assets,docs,scripts,index.ts,package.json,tsconfig.json,vite.config.ts,bun.lock}",
       "Audit reports & docs: docs/issues/, README.md, .gitignore",
       "Existing backups in ~/.config/opencode/",
     ],

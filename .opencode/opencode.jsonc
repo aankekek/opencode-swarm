@@ -3,7 +3,7 @@
   "plugins": [
     {
       // Local plugin directory (resolved relative to this config file).
-      "package": "../tools/swarm-runtime",
+      "package": "../tools/opencode-swarm",
       "options": {
         // Watchdog timing
         "stallTimeoutMs": 180000,

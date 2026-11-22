@@ -20,14 +20,14 @@ Models and variants are **never** auto-selected. By default, workers inherit the
 ## Quick Start
 1. **One-step global install (recommended for OpenCode Desktop GUI + server):**
    ```bash
-   cd tools/swarm-runtime
+   cd tools/opencode-swarm
    bun run install:plugin
    ```
-   This installs dependencies, builds `dist/gui-experimental.cjs`, and registers `tools/swarm-runtime` in your global `~/.config/opencode/opencode.json` (which OpenCode Desktop requires to load the **Swarm Board** side tab, composer pill, titlebar pill, and **Settings → Swarm Board**).
+   This installs dependencies, builds `dist/gui-experimental.cjs`, and registers `tools/opencode-swarm` in your global `~/.config/opencode/opencode.json` (which OpenCode Desktop requires to load the **Swarm Board** side tab, composer pill, titlebar pill, and **Settings → Swarm Board**).
 2. *(Optional)* Project-only server registration in `.opencode/opencode.jsonc`:
    ```jsonc
    {
-     "plugins": [{ "package": "../tools/swarm-runtime", "options": { "overrideShellAllow": true, "boardServer": true } }]
+     "plugins": [{ "package": "../tools/opencode-swarm", "options": { "overrideShellAllow": true, "boardServer": true } }]
    }
    ```
 3. Fully quit and restart **OpenCode Desktop**, then start a swarm with `/swarm <your task>` (or list models/variants with `/swarm-models`).
@@ -36,7 +36,7 @@ Models and variants are **never** auto-selected. By default, workers inherit the
 
 ## Development & Tests
 ```bash
-cd tools/swarm-runtime
+cd tools/opencode-swarm
 bun install
 bun run typecheck
 bun test
@@ -46,8 +46,8 @@ bun test
 - **GUI Checklist:** Open **Settings → Swarm Board → Uninstall...** (or Command Palette → `Uninstall Swarm Plugin`) to review and confirm removal of all configs, runtime data, worktrees, build artifacts, and temp files.
 - **CLI Checklist:**
   ```bash
-  cd tools/swarm-runtime
+  cd tools/opencode-swarm
   bun run uninstall:dry-run   # preview exact paths to be removed
   bun run uninstall           # confirm and remove completely + verify
   ```
-- **Manual Checklist:** See [tools/swarm-runtime/docs/UNINSTALL.md](tools/swarm-runtime/docs/UNINSTALL.md).
+- **Manual Checklist:** See [tools/opencode-swarm/docs/UNINSTALL.md](tools/opencode-swarm/docs/UNINSTALL.md).
