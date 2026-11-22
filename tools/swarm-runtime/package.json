@@ -14,6 +14,7 @@
     "test": "bun test",
     "build:gui": "vite build",
     "dev:gui": "vite build --watch",
+    "install:plugin": "bun run scripts/install.ts",
     "uninstall": "bun run scripts/uninstall.ts",
     "uninstall:dry-run": "bun run scripts/uninstall.ts --dry-run"
   },

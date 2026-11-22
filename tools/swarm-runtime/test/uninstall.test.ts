@@ -11,6 +11,7 @@ import {
   stripJsonComments,
   verifyUninstall,
 } from "../src/uninstall.js";
+import { registerSwarmInGlobalConfig } from "../scripts/install.js";
 
 describe("Swarm Uninstall Checklist & Complete Removal", () => {
   test("stripJsonComments preserves URLs inside strings and removes JSONC comments + trailing commas", () => {
@@ -173,5 +174,27 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
     });
     expect(out).toContain("Swarm Plugin — Full Uninstall Checklist");
     expect(out).toContain("[dry-run]");
+  });
+
+  test("registerSwarmInGlobalConfig registers idempotently and preserves existing plugins", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-install-test-"));
+    try {
+      const cfgPath = join(root, ".config", "opencode", "opencode.json");
+      mkdirSync(dirname(cfgPath), { recursive: true });
+      writeFileSync(cfgPath, JSON.stringify({ plugins: ["@slkiser/opencode-quota"] }, null, 2), "utf8");
+
+      const first = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\swarm-runtime");
+      expect(first.changed).toBe(true);
+      const second = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\swarm-runtime");
+      expect(second.changed).toBe(false);
+
+      const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
+      expect(parsed.plugins.length).toBe(2);
+      expect(parsed.plugins[0]).toBe("@slkiser/opencode-quota");
+    } finally {
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {}
+    }
   });
 });

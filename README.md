@@ -16,20 +16,19 @@ Models and variants are **never** auto-selected. By default, workers inherit the
 4. **Config (`opencode.jsonc`):** Set `options.roleModels` (e.g. `"worker": "anthropic/claude-sonnet-4-6#high"`). A `"coordinator"` entry is applied by switching the coordinator's own session model when the swarm is first created.
 
 ## Quick Start
-1. Install runtime dependencies (mandatory before loading in OpenCode):
+1. **One-step global install (recommended for OpenCode Desktop GUI + server):**
    ```bash
    cd tools/swarm-runtime
-   bun install
-   bun run build:gui
+   bun run install:plugin
    ```
-2. Register the plugin in `.opencode/opencode.jsonc` using the OpenCode v2 `plugins` array:
+   This installs dependencies, builds `dist/gui-experimental.cjs`, and registers `tools/swarm-runtime` in your global `~/.config/opencode/opencode.json` (which OpenCode Desktop requires to load the **Swarm Board** side tab, composer pill, titlebar pill, and **Settings → Swarm Board**).
+2. *(Optional)* Project-only server registration in `.opencode/opencode.jsonc`:
    ```jsonc
    {
-     "plugins": [{ "package": "../tools/swarm-runtime", "options": { "overrideShellAllow": true } }]
+     "plugins": [{ "package": "../tools/swarm-runtime", "options": { "overrideShellAllow": true, "boardServer": true } }]
    }
    ```
-3. Start a swarm with `/swarm <your task>` (or list models/variants with `/swarm-models`).
-4. For the **OpenCode Desktop GUI** (titlebar **Swarm** pill, side-panel **Board / Members / Locks** tab, composer pill, bottom strip, and **Settings → Swarm Board**), restart OpenCode Desktop after `bun run build:gui`.
+3. Fully quit and restart **OpenCode Desktop**, then start a swarm with `/swarm <your task>` (or list models/variants with `/swarm-models`).
 
 > **Note:** `overrideShellAllow: true` (default in `.opencode/opencode.jsonc`) allows shell commands without repeated prompts while keeping `edit` and `external_directory` fenced.
 
