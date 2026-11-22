@@ -1,5 +1,7 @@
 # OpenCode Swarm (`opencode-swarm`)
 
+> **Note:** This project is 100% vibecoded — I really like how Swarm Mode works in Antigravity, so I recreated it for OpenCode v2. Expect rough edges and feel free to fork or open issues!
+
 A 1:1 recreation of **Antigravity Swarm Mode** for **OpenCode v2** (`@opencode/plugin@2.3.2`) with **manual model & variant selection**, real Git worktree/clone isolation, multi-channel board routing, stall monitoring, and a realtime Swarm Board Web UI.
 
 ## Core Tools (4 Primitives)
