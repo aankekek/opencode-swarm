@@ -1,0 +1,15 @@
+{
+  "plugins": [
+    {
+      "package": "../tools/swarm-runtime",
+      "options": {
+        "stallTimeoutMs": 90000,
+        "allowCoordinatorEdits": false,
+        "workerShellPolicy": "ask",
+        "verifierShellPolicy": "ask",
+        "debugHooks": true,
+        "debugEvents": true
+      }
+    }
+  ]
+}

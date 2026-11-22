@@ -1,0 +1,13 @@
+{
+  "name": "swarm-runtime",
+  "version": "0.3.0-draft",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.29"
+  }
+}
