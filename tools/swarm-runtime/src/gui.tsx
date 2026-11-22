@@ -157,10 +157,10 @@ export default Plugin.define({
 
     const currentDirectory = () => ctx.sessions.current()?.location?.directory ?? mountedDirectory();
     const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
-    const getCallOptions = () => {
+    const getCallOptions = (timeoutMs = 8000) => {
       const loc =
         ctx.sessions.current()?.location ?? (mountedDirectory() ? { directory: mountedDirectory()! } : undefined);
-      const signal = AbortSignal.timeout(8000);
+      const signal = AbortSignal.timeout(timeoutMs);
       return loc ? { location: loc, signal } : { signal };
     };
 
@@ -488,10 +488,10 @@ export default Plugin.define({
         <SwarmUninstallModal
           ctx={ctx}
           loadPlan={async () => {
-            return (await getRpc().previewUninstall({}, getCallOptions())) as UninstallPlan | null;
+            return (await getRpc().previewUninstall({}, getCallOptions(30_000))) as UninstallPlan | null;
           }}
           onExecute={async (categories: Partial<UninstallSelection>) => {
-            return (await getRpc().executeUninstall({ categories }, getCallOptions())) as UninstallResult | null;
+            return (await getRpc().executeUninstall({ categories }, getCallOptions(120_000))) as UninstallResult | null;
           }}
           onResetGuiStore={() => {
             store.set(DEFAULT_SWARM_SETTINGS);

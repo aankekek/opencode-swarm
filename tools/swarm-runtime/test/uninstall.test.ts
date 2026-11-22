@@ -135,7 +135,20 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       expect(byId.get("buildArtifacts")!.items.length).toBe(2);
       expect(byId.get("tempFiles")!.items.length).toBe(5);
 
-      const result = await executeUninstallPlan(plan, undefined, { env });
+      // P0-5: Omitted/empty selection must be a safe no-op
+      const noopRes = await executeUninstallPlan(plan, {}, { env });
+      expect(noopRes.removed.length).toBe(0);
+      expect(noopRes.edited.length).toBe(0);
+      expect(existsSync(runtimeDataDir)).toBe(true);
+
+      const fullSelection = {
+        pluginRegistration: true,
+        gitWorktreesAndBranches: true,
+        runtimeData: true,
+        buildArtifacts: true,
+        tempFiles: true,
+      };
+      const result = await executeUninstallPlan(plan, fullSelection, { env });
       expect(result.ok).toBe(true);
       expect(result.errors).toEqual([]);
       expect(result.verification.every((v) => v.passed)).toBe(true);
@@ -158,7 +171,7 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       expect(existsSync(join(pluginRoot, "package.json"))).toBe(true);
       expect(existsSync(keepTempPath)).toBe(true);
 
-      const postChecks = await verifyUninstall(plan, undefined, env);
+      const postChecks = await verifyUninstall(plan, fullSelection, env);
       expect(postChecks.every((c) => c.passed)).toBe(true);
     } finally {
       try {

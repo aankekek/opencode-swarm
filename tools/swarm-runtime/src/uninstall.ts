@@ -25,15 +25,16 @@ export interface UninstallEnvOptions {
 const SWARM_MATCH_RE = /(?:^|[\\/])swarm-runtime(?:$|[\\/])|local\.swarm-runtime/i;
 
 export function stripJsonComments(raw: string): string {
+  const input = raw.replace(/^\uFEFF/, "");
   let out = "";
   let inString = false;
   let escaped = false;
   let inLineComment = false;
   let inBlockComment = false;
 
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    const next = raw[i + 1];
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    const next = input[i + 1];
 
     if (inLineComment) {
       if (ch === "\n" || ch === "\r") {
@@ -359,8 +360,12 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
           detail: "Remove swarm-runtime entry from global plugins list (keep other plugins intact)",
         });
       }
-    } catch {
-      // Ignore unparseable config
+    } catch (err) {
+      regItems.push({
+        path: cfgPath,
+        kind: "edit-config",
+        detail: `Unreadable or unparseable config (${err instanceof Error ? err.message : String(err)})`,
+      });
     }
   }
 
@@ -377,8 +382,12 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
             : "Remove swarm-runtime entry from project config",
         });
       }
-    } catch {
-      // Ignore unparseable config
+    } catch (err) {
+      regItems.push({
+        path: cfgPath,
+        kind: "edit-config",
+        detail: `Unreadable or unparseable config (${err instanceof Error ? err.message : String(err)})`,
+      });
     }
   }
 
@@ -502,11 +511,11 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
 
 function normalizeSelection(selection?: Partial<UninstallSelection>): UninstallSelection {
   return {
-    pluginRegistration: selection?.pluginRegistration ?? true,
-    gitWorktreesAndBranches: selection?.gitWorktreesAndBranches ?? true,
-    runtimeData: selection?.runtimeData ?? true,
-    buildArtifacts: selection?.buildArtifacts ?? true,
-    tempFiles: selection?.tempFiles ?? true,
+    pluginRegistration: selection?.pluginRegistration === true,
+    gitWorktreesAndBranches: selection?.gitWorktreesAndBranches === true,
+    runtimeData: selection?.runtimeData === true,
+    buildArtifacts: selection?.buildArtifacts === true,
+    tempFiles: selection?.tempFiles === true,
   };
 }
 
@@ -528,19 +537,28 @@ export async function verifyUninstall(
       globalConfigDirs: env?.globalConfigDirs,
     });
     const lingering: string[] = [];
+    const unreadable: string[] = [];
     for (const cfgPath of [...globalFiles, ...projectFiles]) {
       try {
         const res = removeSwarmFromConfigContent(readFileSync(cfgPath, "utf8"));
         if (res.changed) lingering.push(cfgPath);
-      } catch {
-        // Ignore
+      } catch (err) {
+        unreadable.push(`${cfgPath} (${err instanceof Error ? err.message : String(err)})`);
       }
     }
+    const passed = lingering.length === 0 && unreadable.length === 0;
     checks.push({
       id: "config_clean",
       label: "No swarm-runtime config references",
-      passed: lingering.length === 0,
-      detail: lingering.length === 0 ? "All global and project configs clean" : `Still referenced in: ${lingering.join(", ")}`,
+      passed,
+      detail: passed
+        ? "All global and project configs clean"
+        : [
+            lingering.length > 0 ? `Still referenced in: ${lingering.join(", ")}` : "",
+            unreadable.length > 0 ? `Unreadable/unparseable: ${unreadable.join(", ")}` : "",
+          ]
+            .filter(Boolean)
+            .join("; "),
     });
   }
 
@@ -555,19 +573,32 @@ export async function verifyUninstall(
   }
 
   if (selection.gitWorktreesAndBranches) {
-    const worktrees = listSwarmWorktrees(workspaceRoot);
-    const branches = listSwarmBranches(workspaceRoot);
+    const hasGit = existsSync(join(workspaceRoot, ".git"));
+    const wtProbe = hasGit ? runGit(workspaceRoot, ["worktree", "list", "--porcelain"]) : "";
+    const brProbe = hasGit ? runGit(workspaceRoot, ["branch", "--list", "swarm/*"]) : "";
+    const worktrees = wtProbe === null ? [] : listSwarmWorktrees(workspaceRoot);
+    const branches = brProbe === null ? [] : listSwarmBranches(workspaceRoot);
     checks.push({
       id: "git_worktrees_clean",
       label: "No orphan swarm worktrees",
-      passed: worktrees.length === 0,
-      detail: worktrees.length === 0 ? "git worktree list clean" : `Remaining: ${worktrees.map((w) => w.path).join(", ")}`,
+      passed: wtProbe !== null && worktrees.length === 0,
+      detail:
+        wtProbe === null
+          ? "git worktree probe failed"
+          : worktrees.length === 0
+            ? "git worktree list clean"
+            : `Remaining: ${worktrees.map((w) => w.path).join(", ")}`,
     });
     checks.push({
       id: "git_branches_clean",
       label: "No swarm/* git branches",
-      passed: branches.length === 0,
-      detail: branches.length === 0 ? "git branch --list swarm/* empty" : `Remaining: ${branches.join(", ")}`,
+      passed: brProbe !== null && branches.length === 0,
+      detail:
+        brProbe === null
+          ? "git branch probe failed"
+          : branches.length === 0
+            ? "git branch --list swarm/* empty"
+            : `Remaining: ${branches.join(", ")}`,
     });
   }
 

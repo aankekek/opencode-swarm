@@ -151,8 +151,87 @@ export const swarmRuntimePlugin = Plugin.define({
     }
 
     // Waiter resolvers for swarm_wait(since, mentions_only)
-    const waiters = new Map<string, { resolve: (posts: BoardPostRow[]) => void; sinceSeq: number; mentionsOnly: boolean }>();
+    const waiters = new Map<
+      string,
+      {
+        resolve: (res: { posts: BoardPostRow[]; aborted?: boolean }) => void;
+        sinceSeq: number;
+        mentionsOnly: boolean;
+      }
+    >();
     const lastCoordinatorWakeSeq = new Map<string, number>();
+    const lastWakeSeq = new Map<string, number>();
+    const spawningMembers = new Set<string>();
+    const memberSwitchLocks = new Map<string, Promise<unknown>>();
+    const activeToolCounts = new Map<string, number>();
+    const quiesceResolvers = new Map<string, Array<() => void>>();
+    const pendingKillCleanup = new Map<string, () => void>();
+
+    function notifySessionQuiesced(sessionId: string) {
+      const resolvers = quiesceResolvers.get(sessionId);
+      if (resolvers) {
+        quiesceResolvers.delete(sessionId);
+        for (const fn of resolvers) fn();
+      }
+      const deferred = pendingKillCleanup.get(sessionId);
+      if (deferred) {
+        pendingKillCleanup.delete(sessionId);
+        try {
+          deferred();
+        } catch {
+          // Ignore deferred cleanup error
+        }
+      }
+    }
+
+    function incrementActiveTool(sessionId: string) {
+      activeToolCounts.set(sessionId, (activeToolCounts.get(sessionId) ?? 0) + 1);
+    }
+
+    function decrementActiveTool(sessionId: string) {
+      const cur = activeToolCounts.get(sessionId) ?? 0;
+      if (cur <= 1) {
+        activeToolCounts.delete(sessionId);
+        notifySessionQuiesced(sessionId);
+      } else {
+        activeToolCounts.set(sessionId, cur - 1);
+      }
+    }
+
+    function clearActiveTools(sessionId: string) {
+      if (activeToolCounts.has(sessionId) || pendingKillCleanup.has(sessionId) || quiesceResolvers.has(sessionId)) {
+        activeToolCounts.delete(sessionId);
+        notifySessionQuiesced(sessionId);
+      }
+    }
+
+    function waitForQuiesce(sessionId: string, timeoutMs = 400): Promise<boolean> {
+      if ((activeToolCounts.get(sessionId) ?? 0) === 0) return Promise.resolve(true);
+      return new Promise<boolean>((resolveWait) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          resolveWait((activeToolCounts.get(sessionId) ?? 0) === 0);
+        }, timeoutMs);
+        const list = quiesceResolvers.get(sessionId) ?? [];
+        list.push(() => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolveWait(true);
+        });
+        quiesceResolvers.set(sessionId, list);
+      });
+    }
+
+    function resolveWaiterAborted(memberId: string) {
+      const w = waiters.get(memberId);
+      if (w) {
+        waiters.delete(memberId);
+        w.resolve({ posts: [], aborted: true });
+      }
+    }
 
     async function getSessionModel(sessionId: string): Promise<ModelSelection | undefined> {
       try {
@@ -255,9 +334,13 @@ export const swarmRuntimePlugin = Plugin.define({
         if (matched.length > 0) {
           waiters.delete(member.id);
           db.setMemberState(member.id, "working");
-          db.advanceReadCursor(member.id, matched[matched.length - 1].swarm_seq);
+          const maxMatchedSeq = matched[matched.length - 1].swarm_seq;
+          lastWakeSeq.set(member.id, Math.max(lastWakeSeq.get(member.id) ?? 0, maxMatchedSeq));
+          if (!waiter.mentionsOnly) {
+            db.advanceReadCursor(member.id, maxMatchedSeq);
+          }
           emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-          waiter.resolve(matched);
+          waiter.resolve({ posts: matched });
           return;
         }
         // If the waiter did not match the trigger post (e.g. unsubscribed channel or not mentioned),
@@ -272,14 +355,15 @@ export const swarmRuntimePlugin = Plugin.define({
       }
 
       const fresh = db.getMemberById(member.id);
-      if (!fresh || fresh.state === "killed" || fresh.last_read_seq >= triggerPost.swarm_seq) {
+      const effectiveWakeSeq = Math.max(fresh?.last_read_seq ?? 0, lastWakeSeq.get(member.id) ?? 0);
+      if (!fresh || fresh.state === "killed" || fresh.state === "working" || effectiveWakeSeq >= triggerPost.swarm_seq) {
         return;
       }
 
       // Medium 7: channel-isolated fallback feed (no cross-channel leaks)
       const isGlobal = fresh.role === "monitor" || fresh.role === "narrator";
       const memberChannels = isGlobal ? "*" : db.getMemberChannels(fresh.swarm_id, fresh.id);
-      const { posts } = db.getPostsPage(fresh.swarm_id, fresh.last_read_seq, 25, memberChannels);
+      const { posts } = db.getPostsPage(fresh.swarm_id, effectiveWakeSeq, 25, memberChannels);
       if (posts.length === 0) return;
       const lastSeq = posts[posts.length - 1].swarm_seq;
 
@@ -296,7 +380,6 @@ export const swarmRuntimePlugin = Plugin.define({
       ].join("\n");
 
       db.setMemberState(fresh.id, "working");
-      db.advanceReadCursor(fresh.id, lastSeq);
       emitSwarmChanged({ swarmId: fresh.swarm_id, reason: "member_state", handle: fresh.name });
       try {
         await ctx.session.prompt({
@@ -304,8 +387,10 @@ export const swarmRuntimePlugin = Plugin.define({
           text: promptText,
           delivery: "queue",
         });
+        lastWakeSeq.set(fresh.id, Math.max(lastWakeSeq.get(fresh.id) ?? 0, lastSeq));
+        db.advanceReadCursor(fresh.id, lastSeq);
       } catch (err) {
-        // Reset state to waiting on prompt failure so member is not stuck in working
+        // Reset state to waiting on prompt failure so member is not stuck in working and can re-deliver
         db.setMemberState(fresh.id, "waiting", {
           error: err instanceof Error ? err.message : String(err),
         });
@@ -327,10 +412,8 @@ export const swarmRuntimePlugin = Plugin.define({
       const latestPost = triggerPost ?? db.getLatestPost(swarmId);
       if (!latestPost || latestPost.author_name === coord.name) return;
 
-      if (
-        coord.last_read_seq >= latestPost.swarm_seq ||
-        (lastCoordinatorWakeSeq.get(swarmId) ?? 0) >= latestPost.swarm_seq
-      ) {
+      const prevCoordinatorWakeSeq = lastCoordinatorWakeSeq.get(swarmId) ?? 0;
+      if (coord.last_read_seq >= latestPost.swarm_seq || prevCoordinatorWakeSeq >= latestPost.swarm_seq) {
         return;
       }
 
@@ -361,7 +444,6 @@ export const swarmRuntimePlugin = Plugin.define({
       const prevReadSeq = coord.last_read_seq;
       lastCoordinatorWakeSeq.set(swarmId, latestPost.swarm_seq);
       db.setMemberState(coord.id, "working");
-      db.advanceReadCursor(coord.id, latestPost.swarm_seq);
       emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
 
       const allPassOrNoVerifier =
@@ -381,7 +463,9 @@ export const swarmRuntimePlugin = Plugin.define({
           text: handoffText,
           delivery: "queue",
         });
+        db.advanceReadCursor(coord.id, latestPost.swarm_seq);
       } catch (err) {
+        lastCoordinatorWakeSeq.set(swarmId, prevCoordinatorWakeSeq);
         db.setMemberState(coord.id, "waiting", {
           error: err instanceof Error ? err.message : String(err),
         });
@@ -452,72 +536,86 @@ export const swarmRuntimePlugin = Plugin.define({
       variantInput?: string,
       opts?: { interruptAndRerunIfWorking?: boolean },
     ) {
-      const target = db.getMemberByName(swarmId, memberName);
-      if (!target) throw new Error(`Member "@${memberName}" not found in swarm "${swarmId}".`);
-      if (target.state === "killed") throw new Error(`Cannot switch model of killed member "@${memberName}".`);
-      const wasWorking = target.state === "working";
-      const wasPausedQuota = target.paused_quota === 1;
-      if (wasWorking && !opts?.interruptAndRerunIfWorking) {
-        throw new Error(`Member "@${memberName}" is currently working. Wait until it is waiting before switching models.`);
-      }
+      const lockKey = `${swarmId}:${memberName}`;
+      const prev = memberSwitchLocks.get(lockKey) ?? Promise.resolve();
+      const next = prev
+        .catch(() => {})
+        .then(async () => {
+          const target = db.getMemberByName(swarmId, memberName);
+          if (!target) throw new Error(`Member "@${memberName}" not found in swarm "${swarmId}".`);
+          if (target.state === "killed") throw new Error(`Cannot switch model of killed member "@${memberName}".`);
+          const wasWorking = target.state === "working";
+          const wasPausedQuota = target.paused_quota === 1;
+          if (wasWorking && !opts?.interruptAndRerunIfWorking) {
+            throw new Error(`Member "@${memberName}" is currently working. Wait until it is waiting before switching models.`);
+          }
 
-      const currentModel: ModelSelection | undefined =
-        target.model_provider && target.model_id
-          ? {
-              providerID: target.model_provider,
-              id: target.model_id,
-              ...(target.model_variant ? { variant: target.model_variant } : {}),
-            }
-          : await getSessionModel(target.session_id);
+          const currentModel: ModelSelection | undefined =
+            target.model_provider && target.model_id
+              ? {
+                  providerID: target.model_provider,
+                  id: target.model_id,
+                  ...(target.model_variant ? { variant: target.model_variant } : {}),
+                }
+              : await getSessionModel(target.session_id);
 
-      const resolved = await resolveAndValidateModel(ctx, modelInput, variantInput, currentModel);
-      if (!resolved) {
-        throw new Error(`No model or variant specified for "@${memberName}".`);
-      }
+          const resolved = await resolveAndValidateModel(ctx, modelInput, variantInput, currentModel);
+          if (!resolved) {
+            throw new Error(`No model or variant specified for "@${memberName}".`);
+          }
 
-      if (wasWorking && opts?.interruptAndRerunIfWorking) {
-        await ctx.session.interrupt({ sessionID: target.session_id }).catch(() => {});
-      }
+          if (wasWorking && opts?.interruptAndRerunIfWorking) {
+            await ctx.session.interrupt({ sessionID: target.session_id }).catch(() => {});
+          }
 
-      await ctx.session.switchModel({
-        sessionID: target.session_id,
-        model: {
-          providerID: resolved.providerID,
-          id: resolved.id,
-          ...(resolved.variant ? { variant: resolved.variant } : {}),
-        },
-      });
-      db.setMemberModel(target.id, resolved);
+          await ctx.session.switchModel({
+            sessionID: target.session_id,
+            model: {
+              providerID: resolved.providerID,
+              id: resolved.id,
+              ...(resolved.variant ? { variant: resolved.variant } : {}),
+            },
+          });
+          db.setMemberModel(target.id, resolved);
 
-      const shouldRerun = Boolean(opts?.interruptAndRerunIfWorking && (wasWorking || wasPausedQuota) && target.role !== "coordinator");
-      if (shouldRerun) {
-        const rerunPrompt = [
-          `[SWARM MODEL SWITCHED for @${target.name} — Swarm ${target.swarm_id}]`,
-          `Your model was changed to ${formatModelSpec(resolved)}.`,
-          `Immediately rerun/resume your current assignment and report via \`post_message\`:`,
-          ``,
-          target.brief || "Continue your assigned swarm task.",
-        ].join("\n");
-        db.setMemberState(target.id, "working");
-        await ctx.session.prompt({
-          sessionID: target.session_id,
-          text: rerunPrompt,
-          delivery: "queue",
+          const shouldRerun = Boolean(opts?.interruptAndRerunIfWorking && (wasWorking || wasPausedQuota) && target.role !== "coordinator");
+          if (shouldRerun) {
+            const rerunPrompt = [
+              `[SWARM MODEL SWITCHED for @${target.name} — Swarm ${target.swarm_id}]`,
+              `Your model was changed to ${formatModelSpec(resolved)}.`,
+              `Immediately rerun/resume your current assignment and report via \`post_message\`:`,
+              ``,
+              target.brief || "Continue your assigned swarm task.",
+            ].join("\n");
+            db.setMemberState(target.id, "working");
+            await ctx.session.prompt({
+              sessionID: target.session_id,
+              text: rerunPrompt,
+              delivery: "queue",
+            });
+          }
+
+          emitSwarmChanged({
+            swarmId: target.swarm_id,
+            reason: "member_model_changed",
+            handle: target.name,
+          });
+
+          return {
+            name: target.name,
+            model: formatModelSpec(resolved),
+            preserved_history: true,
+            rerun: shouldRerun,
+          };
         });
+      memberSwitchLocks.set(lockKey, next);
+      try {
+        return await next;
+      } finally {
+        if (memberSwitchLocks.get(lockKey) === next) {
+          memberSwitchLocks.delete(lockKey);
+        }
       }
-
-      emitSwarmChanged({
-        swarmId: target.swarm_id,
-        reason: "member_model_changed",
-        handle: target.name,
-      });
-
-      return {
-        name: target.name,
-        model: formatModelSpec(resolved),
-        preserved_history: true,
-        rerun: shouldRerun,
-      };
     }
 
     async function spawnSingleMember(args: {
@@ -535,153 +633,184 @@ export const swarmRuntimePlugin = Plugin.define({
       groupPrefix?: string | null;
     }) {
       const cleanName = validateMemberName(args.name);
-      const existing = db.getMemberByName(args.swarmId, cleanName);
-      if (existing) {
-        throw new Error(
-          `Member "@${cleanName}" already exists in swarm "${args.swarmId}" (state: ${existing.state}). Killed names cannot be reused.`,
-        );
+      const spawnKey = `${args.swarmId}:${cleanName}`;
+      if (spawningMembers.has(spawnKey)) {
+        throw new Error(`Member "@${cleanName}" is already being spawned in swarm "${args.swarmId}".`);
       }
+      spawningMembers.add(spawnKey);
 
-      const wsMode: WorkspaceMode = args.workspace ?? "inherit";
-      const provisioned = provisionMemberWorkspace({
-        mode: wsMode,
-        repoRoot: canonicalWorkspaceRoot,
-        dataDir,
-        swarmId: args.swarmId,
-        memberName: cleanName,
-      });
-
-      // Manual model + variant resolution: inherit caller/role default unless explicitly picked
-      const roleDefaultSpec = roleModels[args.role];
-      const roleDefault = roleDefaultSpec ? parseModelSpec(roleDefaultSpec) : undefined;
-      const callerModel: ModelSelection | undefined =
-        args.caller.model_provider && args.caller.model_id
-          ? {
-              providerID: args.caller.model_provider,
-              id: args.caller.model_id,
-              ...(args.caller.model_variant ? { variant: args.caller.model_variant } : {}),
-            }
-          : await getSessionModel(args.caller.session_id);
-
-      const fallbackModel =
-        roleDefault?.providerID && roleDefault?.id
-          ? (roleDefault as ModelSelection)
-          : callerModel;
-
-      const resolvedModel = await resolveAndValidateModel(ctx, args.model, args.variant, fallbackModel);
-
-      let childSessionId: string;
-      if (args.fork) {
-        if (args.caller.role !== "coordinator") {
-          throw new Error(`Only @coordinator may fork conversations.`);
-        }
-        if (args.fork === "coordinator") {
-          throw new Error(`Forking coordinator context is not permitted.`);
-        }
-        const forkTarget = db.getMemberByName(args.swarmId, args.fork);
-        if (!forkTarget) {
-          throw new Error(`Fork target "${args.fork}" not found in swarm "${args.swarmId}".`);
-        }
-        if (forkTarget.role === "coordinator") {
-          throw new Error(`Forking coordinator context is not permitted.`);
-        }
-        const forkFn = (ctx.session as unknown as { fork?: (args: { sessionID: string }) => Promise<{ id: string }> }).fork;
-        if (typeof forkFn !== "function") {
-          throw new Error(`ctx.session.fork is not available in this OpenCode runtime.`);
-        }
-        const forked = await forkFn({ sessionID: forkTarget.session_id });
-        childSessionId = forked.id;
-      } else {
-        const created = await ctx.session.create({
-          title: `[swarm:${args.swarmId}] @${cleanName}`,
-          location: { directory: provisioned.dir },
-          permissions: buildRolePermissions(args.role, options),
-          ...(resolvedModel
-            ? {
-                model: {
-                  providerID: resolvedModel.providerID,
-                  id: resolvedModel.id,
-                  ...(resolvedModel.variant ? { variant: resolvedModel.variant } : {}),
-                },
-              }
-            : {}),
-        });
-        childSessionId = created.id;
-      }
-
-      const channels = args.channels && args.channels.length > 0 ? args.channels : ["main"];
-      const latestPost = db.getLatestPost(args.swarmId);
-      const member = db.insertMember({
-        swarmId: args.swarmId,
-        name: cleanName,
-        sessionId: childSessionId,
-        role: args.role,
-        addedBy: args.caller.name,
-        groupPrefix: args.groupPrefix ?? null,
-        model: resolvedModel,
-        workspaceMode: wsMode,
-        workspaceDir: provisioned.dir,
-        workspaceBranch: provisioned.branch,
-        brief: args.brief,
-        state: "working",
-        lastReadSeq: latestPost?.swarm_seq ?? 0,
-        channels,
-      });
-
-      const ownedGlobs = args.role === "worker" ? (args.ownedGlobs ?? []) : [];
-      if (ownedGlobs.length > 0) {
-        const lockRes = db.claimLocksAtomic(args.swarmId, member.id, cleanName, ownedGlobs);
-        if (lockRes.conflicts.length > 0) {
-          db.setMemberState(member.id, "killed");
-          cleanupMemberWorkspace({
-            mode: wsMode,
-            dir: provisioned.dir,
-            branch: provisioned.branch,
-            repoRoot: canonicalWorkspaceRoot,
-          });
-          throw new Error(
-            `File-lock conflict for @${cleanName}: ${lockRes.conflicts
-              .map((c) => `${c.requested} overlaps ${c.existing} (@${c.owner})`)
-              .join("; ")}`,
-          );
-        }
-      }
-
-      const primaryChannel = channels[0] ?? "main";
-      await postToBoard(args.swarmId, args.caller.name, primaryChannel, `@${cleanName} ${args.brief}`, new Set([member.id]));
-      emitSwarmChanged({ swarmId: args.swarmId, reason: "member_spawned", handle: cleanName });
-
-      const openingPrompt = buildMemberOpeningPrompt({
-        swarmId: args.swarmId,
-        name: cleanName,
-        role: args.role,
-        brief: args.brief,
-        workspaceMode: wsMode,
-        workspaceDir: provisioned.dir,
-        ownedGlobs,
-        channels,
-      });
+      let provisioned: { mode: WorkspaceMode; dir: string; branch: string | null } | undefined;
+      let insertedMember: MemberRow | undefined;
+      let childSessionId: string | undefined;
 
       try {
+        const existing = db.getMemberByName(args.swarmId, cleanName);
+        if (existing) {
+          throw new Error(
+            `Member "@${cleanName}" already exists in swarm "${args.swarmId}" (state: ${existing.state}). Killed names cannot be reused.`,
+          );
+        }
+
+        const wsMode: WorkspaceMode = args.workspace ?? "inherit";
+        const ownedGlobs = args.role === "worker" ? (args.ownedGlobs ?? []) : [];
+        if (wsMode !== "inherit" && ownedGlobs.length > 0) {
+          throw new Error(
+            `owned_globs is only supported in workspace:"inherit" mode (got workspace:"${wsMode}" for @${cleanName}).`,
+          );
+        }
+
+        // Validate model & fork target BEFORE provisioning workspace/git branches
+        const roleDefaultSpec = roleModels[args.role];
+        const roleDefault = roleDefaultSpec ? parseModelSpec(roleDefaultSpec) : undefined;
+        const callerModel: ModelSelection | undefined =
+          args.caller.model_provider && args.caller.model_id
+            ? {
+                providerID: args.caller.model_provider,
+                id: args.caller.model_id,
+                ...(args.caller.model_variant ? { variant: args.caller.model_variant } : {}),
+              }
+            : await getSessionModel(args.caller.session_id);
+
+        const fallbackModel =
+          roleDefault?.providerID && roleDefault?.id
+            ? (roleDefault as ModelSelection)
+            : callerModel;
+
+        const resolvedModel = await resolveAndValidateModel(ctx, args.model, args.variant, fallbackModel);
+
+        if (args.fork) {
+          if (args.caller.role !== "coordinator") {
+            throw new Error(`Only @coordinator may fork conversations.`);
+          }
+          if (args.fork === "coordinator") {
+            throw new Error(`Forking coordinator context is not permitted.`);
+          }
+          const forkTarget = db.getMemberByName(args.swarmId, args.fork);
+          if (!forkTarget) {
+            throw new Error(`Fork target "${args.fork}" not found in swarm "${args.swarmId}".`);
+          }
+          if (forkTarget.role === "coordinator") {
+            throw new Error(`Forking coordinator context is not permitted.`);
+          }
+          const forkFn = (ctx.session as unknown as { fork?: (args: { sessionID: string }) => Promise<{ id: string }> }).fork;
+          if (typeof forkFn !== "function") {
+            throw new Error(`ctx.session.fork is not available in this OpenCode runtime.`);
+          }
+          provisioned = provisionMemberWorkspace({
+            mode: wsMode,
+            repoRoot: canonicalWorkspaceRoot,
+            dataDir,
+            swarmId: args.swarmId,
+            memberName: cleanName,
+          });
+          const forked = await forkFn({ sessionID: forkTarget.session_id });
+          childSessionId = forked.id;
+        } else {
+          provisioned = provisionMemberWorkspace({
+            mode: wsMode,
+            repoRoot: canonicalWorkspaceRoot,
+            dataDir,
+            swarmId: args.swarmId,
+            memberName: cleanName,
+          });
+          const created = await ctx.session.create({
+            title: `[swarm:${args.swarmId}] @${cleanName}`,
+            location: { directory: provisioned.dir },
+            permissions: buildRolePermissions(args.role, options),
+            ...(resolvedModel
+              ? {
+                  model: {
+                    providerID: resolvedModel.providerID,
+                    id: resolvedModel.id,
+                    ...(resolvedModel.variant ? { variant: resolvedModel.variant } : {}),
+                  },
+                }
+              : {}),
+          });
+          childSessionId = created.id;
+        }
+
+        const channels = args.channels && args.channels.length > 0 ? args.channels : ["main"];
+        const latestPost = db.getLatestPost(args.swarmId);
+        insertedMember = db.insertMember({
+          swarmId: args.swarmId,
+          name: cleanName,
+          sessionId: childSessionId,
+          role: args.role,
+          addedBy: args.caller.name,
+          groupPrefix: args.groupPrefix ?? null,
+          model: resolvedModel,
+          workspaceMode: wsMode,
+          workspaceDir: provisioned.dir,
+          workspaceBranch: provisioned.branch,
+          brief: args.brief,
+          state: "working",
+          lastReadSeq: latestPost?.swarm_seq ?? 0,
+          channels,
+        });
+
+        if (ownedGlobs.length > 0) {
+          const lockRes = db.claimLocksAtomic(args.swarmId, insertedMember.id, cleanName, ownedGlobs);
+          if (lockRes.conflicts.length > 0) {
+            throw new Error(
+              `File-lock conflict for @${cleanName}: ${lockRes.conflicts
+                .map((c) => `${c.requested} overlaps ${c.existing} (@${c.owner})`)
+                .join("; ")}`,
+            );
+          }
+        }
+
+        const primaryChannel = channels[0] ?? "main";
+        const spawnPost = await postToBoard(
+          args.swarmId,
+          args.caller.name,
+          primaryChannel,
+          `@${cleanName} ${args.brief}`,
+          new Set([insertedMember.id]),
+        );
+        lastWakeSeq.set(insertedMember.id, spawnPost.swarm_seq);
+        db.advanceReadCursor(insertedMember.id, spawnPost.swarm_seq);
+        emitSwarmChanged({ swarmId: args.swarmId, reason: "member_spawned", handle: cleanName });
+
+        const openingPrompt = buildMemberOpeningPrompt({
+          swarmId: args.swarmId,
+          name: cleanName,
+          role: args.role,
+          brief: args.brief,
+          workspaceMode: wsMode,
+          workspaceDir: provisioned.dir,
+          ownedGlobs,
+          channels,
+        });
+
         await ctx.session.prompt({
           sessionID: childSessionId,
           text: openingPrompt,
           delivery: "queue",
         });
-      } catch (err) {
-        await ctx.session.interrupt({ sessionID: childSessionId }).catch(() => {});
-        db.setMemberState(member.id, "killed");
-        db.releaseLocksForMember(member.id);
-        cleanupMemberWorkspace({
-          mode: wsMode,
-          dir: provisioned.dir,
-          branch: provisioned.branch,
-          repoRoot: canonicalWorkspaceRoot,
-        });
-        throw err;
-      }
 
-      return member;
+        return insertedMember;
+      } catch (err) {
+        if (childSessionId) {
+          await ctx.session.interrupt({ sessionID: childSessionId }).catch(() => {});
+        }
+        if (insertedMember) {
+          db.setMemberState(insertedMember.id, "killed");
+          db.releaseLocksForMember(insertedMember.id);
+        }
+        if (provisioned) {
+          cleanupMemberWorkspace({
+            mode: provisioned.mode,
+            dir: provisioned.dir,
+            branch: provisioned.branch,
+            repoRoot: canonicalWorkspaceRoot,
+            deleteBranch: true,
+          });
+        }
+        throw err;
+      } finally {
+        spawningMembers.delete(spawnKey);
+      }
     }
 
     // Start Swarm Board web server (if enabled)
@@ -718,6 +847,9 @@ export const swarmRuntimePlugin = Plugin.define({
         };
       }).rpc?.register?.(SWARM_RPC_DEF, {
         getBoardInfo: async () => {
+          if (dbClosed) {
+            return { url: "", token: "", swarmId: "", title: "Swarm Board", status: "idle", activeCount: 0 };
+          }
           const active = db.getActiveSwarms()[0];
           const members = active ? db.listMembers(active.id, false) : [];
           return {
@@ -730,6 +862,9 @@ export const swarmRuntimePlugin = Plugin.define({
           };
         },
         getSwarmSnapshot: async (args?: Record<string, unknown>) => {
+          if (dbClosed) {
+            return { swarm: null, boardUrl: "", head: 0, members: [], board_posts: [], file_locks: [] };
+          }
           const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
           const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
           let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
@@ -817,19 +952,29 @@ export const swarmRuntimePlugin = Plugin.define({
           };
         },
         listSwarms: async (args?: Record<string, unknown>) => {
+          if (dbClosed) return { swarms: [] };
           const limit = typeof args?.limit === "number" ? args.limit : 50;
           return { swarms: db.listSwarms(limit) };
         },
         completeSwarm: async (args?: Record<string, unknown>) => {
+          if (dbClosed) return { ok: false, error: "Swarm database is closed." };
           const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
           const summary = typeof args?.summary === "string" ? args.summary : undefined;
+          const callerSessionId = typeof args?.callerSessionId === "string" ? args.callerSessionId : undefined;
           const swarm = db.getSwarm(swarmId);
           if (!swarm) {
             return { ok: false, error: `Swarm '${swarmId}' not found.` };
           }
+          if (callerSessionId) {
+            const caller = db.getActiveMemberBySession(callerSessionId);
+            if (!caller || caller.swarm_id !== swarm.id || caller.role !== "coordinator") {
+              return { ok: false, error: "Only @coordinator may complete the swarm." };
+            }
+          }
           db.setSwarmStatus(swarm.id, "completing");
           const members = db.listMembers(swarm.id, false);
           for (const m of members) {
+            resolveWaiterAborted(m.id);
             try {
               await ctx.session.interrupt({ sessionID: m.session_id });
             } catch {
@@ -849,9 +994,11 @@ export const swarmRuntimePlugin = Plugin.define({
           return { ok: true };
         },
         killMember: async (args?: Record<string, unknown>) => {
+          if (dbClosed) return { ok: false, error: "Swarm database is closed." };
           const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
           const handle = typeof args?.handle === "string" ? args.handle : "";
           const reason = typeof args?.reason === "string" ? args.reason : undefined;
+          const callerSessionId = typeof args?.callerSessionId === "string" ? args.callerSessionId : undefined;
           const swarm = db.getSwarm(swarmId);
           if (!swarm) {
             return { ok: false, error: `Swarm '${swarmId}' not found.` };
@@ -862,23 +1009,55 @@ export const swarmRuntimePlugin = Plugin.define({
           if (!target) {
             return { ok: false, error: `Active member '${handle}' not found in swarm '${swarmId}'.` };
           }
+          if (target.role === "coordinator") {
+            return { ok: false, error: "Cannot kill @coordinator." };
+          }
+          if (callerSessionId) {
+            const caller = db.getActiveMemberBySession(callerSessionId);
+            if (!caller || caller.swarm_id !== swarm.id || (caller.role !== "coordinator" && target.added_by !== caller.name)) {
+              return { ok: false, error: `Only @coordinator or the member that added @${target.name} may kill it.` };
+            }
+          }
+          db.setMemberState(target.id, "killed");
+          resolveWaiterAborted(target.id);
           try {
             await ctx.session.interrupt({ sessionID: target.session_id });
           } catch {
             // Already idle
           }
-          db.setMemberState(target.id, "killed");
-          db.releaseLocksForMember(target.id);
-          cleanupMemberWorkspace({
-            mode: target.workspace_mode,
-            dir: target.workspace_dir,
-            branch: target.workspace_branch,
-            repoRoot: canonicalWorkspaceRoot,
-          });
+          const finishKillCleanup = () => {
+            db.releaseLocksForMember(target.id);
+            cleanupMemberWorkspace({
+              mode: target.workspace_mode,
+              dir: target.workspace_dir,
+              branch: target.workspace_branch,
+              repoRoot: canonicalWorkspaceRoot,
+            });
+          };
+          const quiesced = await waitForQuiesce(target.session_id, 400);
+          if (quiesced) {
+            finishKillCleanup();
+          } else {
+            pendingKillCleanup.set(target.session_id, finishKillCleanup);
+          }
           emitSwarmChanged({ swarmId: swarm.id, reason: "member_killed", handle: target.name, summary: reason });
           return { ok: true };
         },
         getRoleConfig: async (args?: Record<string, unknown>) => {
+          if (dbClosed) {
+            return {
+              swarmId: null,
+              swarmTitle: null,
+              swarmStatus: "idle",
+              roleModels: {
+                coordinator: roleModels.coordinator ?? "",
+                worker: roleModels.worker ?? "",
+                verifier: roleModels.verifier ?? "",
+                monitor: roleModels.monitor ?? "",
+              },
+              models: [],
+            };
+          }
           const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
           const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
           let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
@@ -1161,7 +1340,7 @@ export const swarmRuntimePlugin = Plugin.define({
           if (action === "status") {
             const caller = db.getLatestMemberBySession(toolCtx.sessionID);
             if (!caller) {
-              return toolJson({ ok: true, swarm: null, open_board: boardServer?.url ?? "" });
+              return toolJson({ ok: true, swarm: null, open_board: "" });
             }
             const swarm = db.getSwarm(caller.swarm_id);
             const members = db.listMembers(caller.swarm_id, true);
@@ -1169,7 +1348,7 @@ export const swarmRuntimePlugin = Plugin.define({
             return toolJson({
               ok: true,
               swarm,
-              open_board: boardServer?.url ?? "",
+              open_board: caller.role === "coordinator" ? (boardServer?.url ?? "") : "",
               members: members.map((m) => ({
                 name: m.name,
                 role: m.role,
@@ -1364,23 +1543,32 @@ export const swarmRuntimePlugin = Plugin.define({
                   error: `@${caller.name} can only kill helpers it added (not @${t.name}).`,
                 });
               }
+              db.setMemberState(t.id, "killed");
+              resolveWaiterAborted(t.id);
               try {
                 await ctx.session.interrupt({ sessionID: t.session_id });
               } catch {
                 // Already idle
               }
-              db.setMemberState(t.id, "killed");
-              db.releaseLocksForMember(t.id);
+              const finishKillCleanup = () => {
+                db.releaseLocksForMember(t.id);
+                cleanupMemberWorkspace({
+                  mode: t.workspace_mode,
+                  dir: t.workspace_dir,
+                  branch: t.workspace_branch,
+                  repoRoot: canonicalWorkspaceRoot,
+                });
+              };
+              const quiesced = await waitForQuiesce(t.session_id, 400);
+              if (quiesced) {
+                finishKillCleanup();
+              } else {
+                pendingKillCleanup.set(t.session_id, finishKillCleanup);
+              }
               emitSwarmChanged({
                 swarmId: t.swarm_id,
                 reason: "member_killed",
                 handle: t.name,
-              });
-              cleanupMemberWorkspace({
-                mode: t.workspace_mode,
-                dir: t.workspace_dir,
-                branch: t.workspace_branch,
-                repoRoot: canonicalWorkspaceRoot,
               });
               killed.push(t.name);
             }
@@ -1415,8 +1603,17 @@ export const swarmRuntimePlugin = Plugin.define({
                 const targetName = String(input.name ?? caller.name);
                 const target = db.getMemberByName(caller.swarm_id, targetName);
                 if (!target) return toolJson({ ok: false, error: `Member "${targetName}" not found.` });
-                if (op === "subscribe") db.subscribeMemberToChannel(caller.swarm_id, chName, target.id);
-                else db.unsubscribeMemberFromChannel(caller.swarm_id, chName, target.id);
+                if (op === "subscribe") {
+                  if (caller.role !== "coordinator") {
+                    return toolJson({ ok: false, error: "Only @coordinator may subscribe members to channels." });
+                  }
+                  db.subscribeMemberToChannel(caller.swarm_id, chName, target.id);
+                } else {
+                  if (caller.role !== "coordinator" && target.id !== caller.id) {
+                    return toolJson({ ok: false, error: `Only @coordinator or @${target.name} may unsubscribe @${target.name}.` });
+                  }
+                  db.unsubscribeMemberFromChannel(caller.swarm_id, chName, target.id);
+                }
                 return toolJson({ ok: true, member: target.name, channels: db.getMemberChannels(caller.swarm_id, target.id) });
               }
               return toolJson({ ok: false, error: `Unknown channel op "${op}".` });
@@ -1428,6 +1625,12 @@ export const swarmRuntimePlugin = Plugin.define({
           if (action === "claim") {
             if (caller.role !== "coordinator" && caller.role !== "worker") {
               return toolJson({ ok: false, error: `Member @${caller.name} with role '${caller.role}' cannot claim locks.` });
+            }
+            if (caller.workspace_mode !== "inherit") {
+              return toolJson({
+                ok: false,
+                error: `action:'claim' is only supported in workspace:'inherit' mode (got '${caller.workspace_mode}').`,
+              });
             }
             const globs = Array.isArray(input.globs) ? (input.globs as string[]) : [];
             if (globs.length === 0) return toolJson({ ok: false, error: "globs array is required." });
@@ -1454,6 +1657,7 @@ export const swarmRuntimePlugin = Plugin.define({
             db.setSwarmStatus(caller.swarm_id, "completing");
             const children = db.listMembers(caller.swarm_id, false).filter((m) => m.role !== "coordinator");
             for (const c of children) {
+              resolveWaiterAborted(c.id);
               try {
                 await ctx.session.interrupt({ sessionID: c.session_id });
               } catch {
@@ -1522,7 +1726,7 @@ export const swarmRuntimePlugin = Plugin.define({
           }
           try {
             const post = await postToBoard(caller.swarm_id, caller.name, input.channel ?? "main", input.text);
-            db.advanceReadCursor(caller.id, post.swarm_seq);
+            lastWakeSeq.set(caller.id, Math.max(lastWakeSeq.get(caller.id) ?? 0, post.swarm_seq));
             await maybeWakeIdleCoordinator(caller.swarm_id, post);
             return toolJson({ ok: true, seq: post.swarm_seq, channel: post.channel });
           } catch (err) {
@@ -1623,13 +1827,20 @@ export const swarmRuntimePlugin = Plugin.define({
           const caller = db.getActiveMemberBySession(toolCtx.sessionID);
           if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
           const input = (rawInput ?? {}) as { since?: number; mentions_only?: boolean };
-          const sinceSeq = typeof input.since === "number" ? input.since : caller.last_read_seq;
           const mentionsOnly = input.mentions_only ?? true;
+          const sinceSeq =
+            typeof input.since === "number"
+              ? input.since
+              : Math.max(caller.last_read_seq, mentionsOnly ? (lastWakeSeq.get(caller.id) ?? 0) : 0);
 
           // Race-free check: if matching posts already exist after sinceSeq, return immediately
           const immediate = checkPendingWakePosts(db, caller, sinceSeq, mentionsOnly);
           if (immediate.length > 0) {
-            db.advanceReadCursor(caller.id, immediate[immediate.length - 1].swarm_seq);
+            const maxSeq = immediate[immediate.length - 1].swarm_seq;
+            lastWakeSeq.set(caller.id, Math.max(lastWakeSeq.get(caller.id) ?? 0, maxSeq));
+            if (!mentionsOnly) {
+              db.advanceReadCursor(caller.id, maxSeq);
+            }
             return toolJson({
               woken: true,
               posts: immediate.map((p) => ({
@@ -1644,7 +1855,7 @@ export const swarmRuntimePlugin = Plugin.define({
           const prevWaiter = waiters.get(caller.id);
           if (prevWaiter) {
             waiters.delete(caller.id);
-            prevWaiter.resolve([]);
+            prevWaiter.resolve({ posts: [], aborted: true });
           }
 
           db.setMemberWait(caller.id, mentionsOnly ? "mentions" : "any", sinceSeq);
@@ -1653,28 +1864,34 @@ export const swarmRuntimePlugin = Plugin.define({
             void maybeWakeIdleCoordinator(caller.swarm_id);
           }
 
-          const wokenPosts = await new Promise<BoardPostRow[]>((resolveWait) => {
+          const waitResult = await new Promise<{ posts: BoardPostRow[]; aborted?: boolean }>((resolveWait) => {
             const onAbort = () => {
               waiters.delete(caller.id);
-              resolveWait([]);
+              resolveWait({ posts: [], aborted: true });
             };
             toolCtx.signal?.addEventListener("abort", onAbort, { once: true });
             waiters.set(caller.id, {
               sinceSeq,
               mentionsOnly,
-              resolve: (posts) => {
+              resolve: (res) => {
                 toolCtx.signal?.removeEventListener("abort", onAbort);
-                resolveWait(posts);
+                resolveWait(res);
               },
             });
           });
 
+          const wokenPosts = waitResult.posts;
           if (wokenPosts.length > 0) {
-            db.advanceReadCursor(caller.id, wokenPosts[wokenPosts.length - 1].swarm_seq);
+            const maxSeq = wokenPosts[wokenPosts.length - 1].swarm_seq;
+            lastWakeSeq.set(caller.id, Math.max(lastWakeSeq.get(caller.id) ?? 0, maxSeq));
+            if (!mentionsOnly) {
+              db.advanceReadCursor(caller.id, maxSeq);
+            }
           }
 
           return toolJson({
             woken: wokenPosts.length > 0,
+            ...(waitResult.aborted ? { aborted: true } : {}),
             posts: wokenPosts.map((p) => ({
               seq: p.swarm_seq,
               channel: p.channel,
@@ -1773,6 +1990,13 @@ export const swarmRuntimePlugin = Plugin.define({
         return;
       }
 
+      if (member.state === "killed") {
+        throw new Error(`[SWARM] Blocked '${toolName}': @${member.name} has been killed.`);
+      }
+      if (WRITE_TOOLS.has(toolName) || SHELL_TOOLS.has(toolName)) {
+        incrementActiveTool(event.sessionID);
+      }
+
       // SEC-H3: For read-only roles, deny write and shell tools or any unapproved tool
       const isReadOnlyRole = member.role === "verifier" || member.role === "monitor" || member.role === "narrator";
       const isKnownWrite = WRITE_TOOLS.has(toolName);
@@ -1857,6 +2081,7 @@ export const swarmRuntimePlugin = Plugin.define({
             if (
               action === "shell" &&
               overrideShell &&
+              event.effect !== "deny" &&
               verdict.decision === "allow" &&
               member.state !== "killed" &&
               member.state !== "stopped" &&
@@ -1916,71 +2141,108 @@ export const swarmRuntimePlugin = Plugin.define({
     // -----------------------------------------------------------------------
     const abortController = new AbortController();
     void (async () => {
-      try {
-        const stream = ctx.event.subscribe({ signal: abortController.signal });
-        for await (const rawEvent of stream) {
-          if (abortController.signal.aborted) break;
-          if (debugEvents) logDebug(eventDebugLogPath, { event: rawEvent });
+      let backoffMs = 250;
+      while (!abortController.signal.aborted) {
+        try {
+          const stream = ctx.event.subscribe({ signal: abortController.signal });
+          backoffMs = 250;
+          for await (const rawEvent of stream) {
+            if (abortController.signal.aborted) break;
+            try {
+              if (debugEvents) logDebug(eventDebugLogPath, { event: rawEvent });
 
-          const ev = rawEvent as unknown as { type?: string; data?: Record<string, unknown> };
-          const eventType = String(ev.type ?? "");
-          const data = ev.data ?? {};
-          const sessionId = typeof data.sessionID === "string" ? data.sessionID : undefined;
-          if (!sessionId) continue;
+              const ev = rawEvent as unknown as { type?: string; data?: Record<string, unknown> };
+              const eventType = String(ev.type ?? "");
+              const data = ev.data ?? {};
+              const sessionId = typeof data.sessionID === "string" ? data.sessionID : undefined;
+              if (!sessionId) continue;
 
-          const member = db.getActiveMemberBySession(sessionId);
-          if (!member) continue;
+              if (eventType === "session.tool.success" || eventType === "session.tool.failed") {
+                decrementActiveTool(sessionId);
+              } else if (
+                eventType === "session.idle" ||
+                eventType === "session.execution.succeeded" ||
+                eventType === "session.execution.interrupted" ||
+                eventType === "session.execution.failed" ||
+                eventType === "session.deleted" ||
+                (eventType === "session.status" &&
+                  (data.status as { type?: string } | undefined)?.type === "idle")
+              ) {
+                clearActiveTools(sessionId);
+              }
 
-          if (eventType === "session.status") {
-            const statusObj = data.status as { type?: string; message?: string } | undefined;
-            if (statusObj?.type === "idle") {
-              db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
-              emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-              await maybeWakeIdleCoordinator(member.swarm_id);
-            } else if (statusObj?.type === "busy") {
-              db.setMemberState(member.id, "working", { pausedQuota: false });
-              emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-            } else if (statusObj?.type === "retry") {
-              if (isQuotaOrRateLimitError(statusObj.message ?? data)) {
+              const member = db.getActiveMemberBySession(sessionId);
+              if (!member) continue;
+
+              if (eventType === "session.status") {
+                const statusObj = data.status as { type?: string; message?: string } | undefined;
+                if (statusObj?.type === "idle") {
+                  db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
+                  emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+                  await maybeWakeIdleCoordinator(member.swarm_id);
+                } else if (statusObj?.type === "busy") {
+                  db.setMemberState(member.id, "working", { pausedQuota: false });
+                  emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+                } else if (statusObj?.type === "retry") {
+                  if (isQuotaOrRateLimitError(statusObj.message ?? data)) {
+                    db.setMemberState(member.id, "waiting", {
+                      activity: null,
+                      error: "Quota/rate limit reached",
+                      pausedQuota: true,
+                    });
+                    emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+                  }
+                }
+              } else if (eventType === "session.execution.started") {
+                db.setMemberState(member.id, "working", { pausedQuota: false });
+                emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+              } else if (eventType === "session.idle" || eventType === "session.execution.succeeded") {
+                db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
+                emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+                await maybeWakeIdleCoordinator(member.swarm_id);
+              } else if (eventType === "session.execution.interrupted") {
+                db.setMemberState(member.id, "stopped", { activity: null });
+                emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+              } else if (eventType === "session.execution.failed") {
+                const isQuota = isQuotaOrRateLimitError(data.error ?? data);
                 db.setMemberState(member.id, "waiting", {
                   activity: null,
-                  error: "Quota/rate limit reached",
-                  pausedQuota: true,
+                  error: isQuota ? "Quota/rate limit reached" : String(data.error ?? "Execution failed"),
+                  pausedQuota: isQuota,
                 });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+              } else if (eventType === "session.step.started") {
+                db.incrementMemberSteps(member.id, "Thinking...");
+              } else if (eventType === "session.tool.called") {
+                const toolLabel = pendingCalls.get(String(data.id))?.tool ?? String(data.tool ?? "tool");
+                db.incrementMemberSteps(member.id, `Running ${toolLabel}`, "tool");
+              } else if (eventType === "session.deleted") {
+                db.setMemberState(member.id, "killed");
+                db.releaseLocksForMember(member.id);
+                emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
               }
+            } catch (evErr) {
+              console.warn("[swarm-runtime] Event handler error:", evErr);
             }
-          } else if (eventType === "session.execution.started") {
-            db.setMemberState(member.id, "working", { pausedQuota: false });
-            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-          } else if (eventType === "session.idle" || eventType === "session.execution.succeeded") {
-            db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
-            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-            await maybeWakeIdleCoordinator(member.swarm_id);
-          } else if (eventType === "session.execution.interrupted") {
-            db.setMemberState(member.id, "stopped", { activity: null });
-            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-          } else if (eventType === "session.execution.failed") {
-            const isQuota = isQuotaOrRateLimitError(data.error ?? data);
-            db.setMemberState(member.id, "waiting", {
-              activity: null,
-              error: isQuota ? "Quota/rate limit reached" : String(data.error ?? "Execution failed"),
-              pausedQuota: isQuota,
-            });
-            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-          } else if (eventType === "session.step.started") {
-            db.incrementMemberSteps(member.id, "Thinking...");
-          } else if (eventType === "session.tool.called") {
-            const toolLabel = pendingCalls.get(String(data.id))?.tool ?? String(data.tool ?? "tool");
-            db.incrementMemberSteps(member.id, `Running ${toolLabel}`, "tool");
-          } else if (eventType === "session.deleted") {
-            db.setMemberState(member.id, "killed");
-            db.releaseLocksForMember(member.id);
-            emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
           }
+          // Stream ended cleanly (e.g. test mock or graceful shutdown)
+          break;
+        } catch (err) {
+          if (abortController.signal.aborted) break;
+          console.warn("[swarm-runtime] Event stream error, resubscribing:", err);
+          await new Promise<void>((resolveDelay) => {
+            const t = setTimeout(resolveDelay, backoffMs);
+            abortController.signal.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(t);
+                resolveDelay();
+              },
+              { once: true },
+            );
+          });
+          backoffMs = Math.min(backoffMs * 2, 5000);
         }
-      } catch {
-        // Stream closed
       }
     })();
 
@@ -1999,6 +2261,11 @@ export const swarmRuntimePlugin = Plugin.define({
       pendingCalls.clear();
       waiters.clear();
       lastCoordinatorWakeSeq.clear();
+      lastWakeSeq.clear();
+      spawningMembers.clear();
+      activeToolCounts.clear();
+      quiesceResolvers.clear();
+      pendingKillCleanup.clear();
       if (rpcCleanup) {
         await rpcCleanup();
       }

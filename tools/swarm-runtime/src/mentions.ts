@@ -114,8 +114,16 @@ export function checkPendingWakePosts(
 ): BoardPostRow[] {
   const isGlobalRole = member.role === "coordinator" || member.role === "monitor" || member.role === "narrator";
   const channelsFilter = isGlobalRole ? "*" : db.getMemberChannels(member.swarm_id, member.id);
-  const { posts } = db.getPostsPage(member.swarm_id, sinceSeq, 100, channelsFilter);
-  const others = posts.filter((p) => p.author_name !== member.name);
+  const allPosts: BoardPostRow[] = [];
+  let cursor = sinceSeq;
+  for (let page = 0; page < 50; page++) {
+    const { posts, hasMore } = db.getPostsPage(member.swarm_id, cursor, 100, channelsFilter);
+    if (posts.length === 0) break;
+    allPosts.push(...posts);
+    cursor = posts[posts.length - 1].swarm_seq;
+    if (!hasMore) break;
+  }
+  const others = allPosts.filter((p) => p.author_name !== member.name);
 
   if (!mentionsOnly) {
     return others;
@@ -130,7 +138,7 @@ export function checkPendingWakePosts(
     const chMentions = JSON.parse(p.channel_mentions_json) as string[];
     if (chMentions.length > 0) {
       if (isGlobalRole) return true;
-      const myChannels = db.getMemberChannels(member.swarm_id, member.id);
+      const myChannels = Array.isArray(channelsFilter) ? channelsFilter : db.getMemberChannels(member.swarm_id, member.id);
       return chMentions.some((ch) => myChannels.includes(ch));
     }
     return false;

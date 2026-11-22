@@ -50,7 +50,7 @@ export function provisionMemberWorkspace(args: {
     mkdirSync(baseDir, { recursive: true });
     const wtDir = join(baseDir, args.memberName);
     if (existsSync(wtDir)) {
-      rmSync(wtDir, { recursive: true, force: true });
+      throw new Error(`Worktree directory "${wtDir}" already exists for @${args.memberName}.`);
     }
     runGit(["worktree", "add", "-b", branch, wtDir, "HEAD"], args.repoRoot);
     return { mode: "share", dir: wtDir, branch };
@@ -61,7 +61,7 @@ export function provisionMemberWorkspace(args: {
   mkdirSync(cloneBase, { recursive: true });
   const cloneDir = join(cloneBase, args.memberName);
   if (existsSync(cloneDir)) {
-    rmSync(cloneDir, { recursive: true, force: true });
+    throw new Error(`Clone directory "${cloneDir}" already exists for @${args.memberName}.`);
   }
   runGit(["clone", "--dissociate", "--no-checkout", args.repoRoot, cloneDir], args.repoRoot);
   runGit(["checkout", "-b", branch], cloneDir);
@@ -73,31 +73,55 @@ export function cleanupMemberWorkspace(args: {
   dir: string;
   branch: string | null;
   repoRoot: string;
-}) {
-  if (args.mode === "inherit") return;
-  try {
-    if (args.mode === "share" && isGitRepo(args.repoRoot)) {
+  deleteBranch?: boolean;
+}): { ok: boolean; error?: string } {
+  if (args.mode === "inherit") return { ok: true };
+  const errors: string[] = [];
+  if (args.mode === "share" && isGitRepo(args.repoRoot)) {
+    try {
+      runGit(["worktree", "remove", "--force", args.dir], args.repoRoot);
+    } catch {
+      // Fallback to directory removal
+    }
+    try {
+      if (existsSync(args.dir)) rmSync(args.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      runGit(["worktree", "prune", "--expire", "now"], args.repoRoot);
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
+    }
+    if (args.deleteBranch && args.branch) {
       try {
-        runGit(["worktree", "remove", "--force", args.dir], args.repoRoot);
+        runGit(["branch", "-D", args.branch], args.repoRoot);
       } catch {
-        // Fallback to directory removal
+        // Ignore if branch was never created
       }
-      try {
-        if (existsSync(args.dir)) rmSync(args.dir, { recursive: true, force: true });
-      } catch {
-        // Retry/ignore locked files on Windows
-      }
-      try {
-        runGit(["worktree", "prune", "--expire", "now"], args.repoRoot);
-      } catch {
-        // Ignore prune errors
-      }
-      return;
     }
     if (existsSync(args.dir)) {
-      rmSync(args.dir, { recursive: true, force: true });
+      errors.push(`Workspace directory still exists: ${args.dir}`);
     }
-  } catch {
-    // Best-effort cleanup on Windows file locks
+    if (errors.length > 0) {
+      console.warn(`[swarm-runtime] Workspace cleanup warning for ${args.dir}: ${errors.join("; ")}`);
+      return { ok: false, error: errors.join("; ") };
+    }
+    return { ok: true };
   }
+  try {
+    if (existsSync(args.dir)) {
+      rmSync(args.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  } catch (err) {
+    errors.push(err instanceof Error ? err.message : String(err));
+  }
+  if (existsSync(args.dir)) {
+    errors.push(`Workspace directory still exists: ${args.dir}`);
+  }
+  if (errors.length > 0) {
+    console.warn(`[swarm-runtime] Workspace cleanup warning for ${args.dir}: ${errors.join("; ")}`);
+    return { ok: false, error: errors.join("; ") };
+  }
+  return { ok: true };
 }

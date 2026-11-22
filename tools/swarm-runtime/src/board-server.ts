@@ -203,6 +203,9 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
       const reqUrl = new URL(req.url ?? "/", `http://127.0.0.1:${actualPort}`);
 
       if (req.method === "GET" && reqUrl.pathname === "/api/swarm") {
+        if (!hasValidBearer(req, token)) {
+          return sendJson(res, 401, { ok: false, error: "Unauthorized" });
+        }
         const swarmIdParam = reqUrl.searchParams.get("swarmId");
         const conversationIdParam = reqUrl.searchParams.get("conversationId");
         const etagParam = reqUrl.searchParams.get("etag");
@@ -220,16 +223,18 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
 
         const members = deps.db.listMembers(swarm.id, true);
         const channels = deps.db.listChannels(swarm.id);
-        const { posts, hasMore } = deps.db.getLatestPostsWindow(swarm.id, 500, "*");
+        const { posts: rawPosts, hasMore } = deps.db.getLatestPostsWindow(swarm.id, 500, "*");
         const latestPost = deps.db.getLatestPost(swarm.id);
         const head = latestPost ? latestPost.swarm_seq : 0;
 
         let unseen: number[] = [];
+        let posts = rawPosts;
         if (convMember && convMember.role !== "coordinator" && convMember.role !== "monitor" && convMember.role !== "narrator") {
           const allowedChannels = new Set(deps.db.getMemberChannels(swarm.id, convMember.id));
-          unseen = posts
+          unseen = rawPosts
             .filter((p) => p.channel !== "main" && !allowedChannels.has(p.channel))
             .map((p) => p.swarm_seq);
+          posts = rawPosts.filter((p) => p.channel === "main" || allowedChannels.has(p.channel));
         }
 
         const postCounts = new Map<string, number>();
@@ -350,6 +355,10 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
         if (reqUrl.pathname === "/api/member/model") {
           const swarmId = String(body.swarmId ?? "");
           const name = String(body.name ?? "");
+          const target = deps.db.getMemberByName(swarmId, name);
+          if (target?.role === "coordinator") {
+            return sendJson(res, 403, { ok: false, error: "Coordinator model cannot be switched via board HTTP endpoint." });
+          }
           const model = typeof body.model === "string" ? body.model : undefined;
           const variant = typeof body.variant === "string" ? body.variant : undefined;
           const result = await deps.switchMemberModel(swarmId, name, model, variant);

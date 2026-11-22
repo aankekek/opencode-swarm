@@ -130,7 +130,13 @@ describe("board-server", () => {
     }
     const handle = await startBoardServer(deps, 0);
     try {
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/swarm`);
+      // P0-1: Unauthenticated GET /api/swarm must return 401
+      const unauth = await fetch(`http://127.0.0.1:${handle.port}/api/swarm`);
+      expect(unauth.status).toBe(401);
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/swarm`, {
+        headers: { Authorization: `Bearer ${handle.token}` },
+      });
       expect(res.status).toBe(200);
       const data = (await res.json()) as {
         swarm: string;
@@ -147,7 +153,9 @@ describe("board-server", () => {
       expect(data.messages[data.messages.length - 1].seq).toBe(505);
 
       // K2: unchanged fast path must include member
-      const unchangedRes = await fetch(`http://127.0.0.1:${handle.port}/api/swarm?etag=${data.etag}`);
+      const unchangedRes = await fetch(`http://127.0.0.1:${handle.port}/api/swarm?etag=${data.etag}`, {
+        headers: { Authorization: `Bearer ${handle.token}` },
+      });
       const unchangedData = (await unchangedRes.json()) as { unchanged: boolean; member: string | null };
       expect(unchangedData.unchanged).toBe(true);
       expect("member" in unchangedData).toBe(true);

@@ -229,17 +229,24 @@ export const SWARM_RPC_DEF = {
       ),
     },
     completeSwarm: {
-      input: optionalObjectSchema<{ swarmId: string; summary?: string }>((v) =>
-        typeof v.swarmId === "string" ? null : "swarmId must be a string",
-      ),
+      input: optionalObjectSchema<{ swarmId: string; summary?: string; callerSessionId?: string }>((v) => {
+        if (typeof v.swarmId !== "string") return "swarmId must be a string";
+        if (v.callerSessionId !== undefined && typeof v.callerSessionId !== "string") {
+          return "callerSessionId must be a string";
+        }
+        return null;
+      }),
       output: standardSchema<{ ok: boolean; error?: string }>((v) =>
         isObject(v) && typeof v.ok === "boolean" ? null : "output must contain ok boolean",
       ),
     },
     killMember: {
-      input: optionalObjectSchema<{ swarmId: string; handle: string; reason?: string }>((v) => {
+      input: optionalObjectSchema<{ swarmId: string; handle: string; reason?: string; callerSessionId?: string }>((v) => {
         if (typeof v.swarmId !== "string") return "swarmId must be a string";
         if (typeof v.handle !== "string") return "handle must be a string";
+        if (v.callerSessionId !== undefined && typeof v.callerSessionId !== "string") {
+          return "callerSessionId must be a string";
+        }
         return null;
       }),
       output: standardSchema<{ ok: boolean; error?: string }>((v) =>

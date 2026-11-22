@@ -181,6 +181,7 @@ export class SwarmBoardDB {
     workspaceDir: string;
     model?: ModelSelection;
   }): { swarm: SwarmRow; coordinator: MemberRow } {
+    this.reconcileStaleSwarmsOnStartup();
     const result = this.withImmediateTransaction(() => {
       const existingActive = this.getActiveMemberBySession(args.coordinatorSessionId);
       if (existingActive) {
@@ -649,8 +650,8 @@ export class SwarmBoardDB {
         );
 
       this.db
-        .prepare(`UPDATE members SET last_post_seq = ?, last_read_seq = MAX(last_read_seq, ?), last_post_time = ? WHERE swarm_id = ? AND name = ?`)
-        .run(swarmSeq, swarmSeq, now, args.swarmId, args.authorName);
+        .prepare(`UPDATE members SET last_post_seq = ?, last_post_time = ? WHERE swarm_id = ? AND name = ?`)
+        .run(swarmSeq, now, args.swarmId, args.authorName);
 
       return this.db
         .prepare(`SELECT * FROM board_posts WHERE seq = ?`)
