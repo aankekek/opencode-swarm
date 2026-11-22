@@ -11,6 +11,8 @@ export interface SwarmPanelViewProps {
   onRefresh: () => void;
   onKillMember: (swarmId: string, handle: string) => Promise<void>;
   onCompleteSwarm: (swarmId: string) => Promise<void>;
+  onOpenSettings?: () => void;
+  rpcError?: () => string | undefined;
   server?: unknown;
 }
 
@@ -163,12 +165,30 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
         <Button size="small" variant="ghost" onClick={() => props.onRefresh()}>
           Refresh
         </Button>
+        <Show when={props.onOpenSettings}>
+          <Button size="small" variant="ghost" onClick={() => props.onOpenSettings?.()}>
+            Settings
+          </Button>
+        </Show>
         <Show when={props.snapshot()?.boardUrl}>
           <Button size="small" variant={webView() ? "contrast" : "ghost"} onClick={() => setWebView(!webView())}>
             Pixel-Bee Web View
           </Button>
         </Show>
       </div>
+
+      <Show when={!props.snapshot()}>
+        <div
+          style={{
+            padding: "8px 12px",
+            "font-size": "11px",
+            color: "var(--text-weak, #9ca3af)",
+            "border-bottom": "1px solid var(--border-weak-base, rgba(255, 255, 255, 0.06))",
+          }}
+        >
+          {props.rpcError?.() ?? "No swarm active in this workspace. Run /swarm <task> to start one."}
+        </div>
+      </Show>
 
       <Show
         when={!webView() || !props.snapshot()?.boardUrl}

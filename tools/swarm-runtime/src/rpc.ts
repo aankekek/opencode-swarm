@@ -1,3 +1,5 @@
+import type { Rpc } from "@opencode/plugin/rpc";
+
 export interface SwarmBoardInfo {
   url: string;
   token: string;
@@ -70,222 +72,111 @@ export interface SwarmListItem {
   post_count: number;
 }
 
-export interface SwarmChangedEvent {
+export type SwarmChangedEvent = {
   swarmId: string;
   reason: string;
   seq?: number;
   handle?: string;
   summary?: string;
+};
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function standardSchema<T>(validate: (value: unknown) => string | null) {
+  return {
+    "~standard": {
+      version: 1 as const,
+      vendor: "swarm-runtime",
+      validate(value: unknown): { value: T } | { issues: readonly { message: string }[] } {
+        const issue = validate(value);
+        return issue ? { issues: [{ message: issue }] } : { value: value as T };
+      },
+    },
+  };
+}
+
+function optionalObjectSchema<T>(validate: (value: Record<string, unknown>) => string | null) {
+  return {
+    "~standard": {
+      version: 1 as const,
+      vendor: "swarm-runtime",
+      validate(value: unknown): { value: T } | { issues: readonly { message: string }[] } {
+        const normalized = value === undefined ? {} : value;
+        if (!isObject(normalized)) {
+          return { issues: [{ message: "input must be an object" }] };
+        }
+        const issue = validate(normalized);
+        return issue ? { issues: [{ message: issue }] } : { value: normalized as T };
+      },
+    },
+  };
 }
 
 export const SWARM_RPC_DEF = {
   id: "local.swarm-runtime",
   methods: {
     getBoardInfo: {
-      input: { type: "object", properties: {} } as const,
-      output: {
-        type: "object",
-        properties: {
-          url: { type: "string" },
-          token: { type: "string" },
-          swarmId: { type: "string" },
-          title: { type: "string" },
-          status: { type: "string" },
-          activeCount: { type: "number" },
-        },
-        required: ["url", "token", "swarmId", "title", "status", "activeCount"],
-      } as const,
+      input: optionalObjectSchema<Record<string, never>>(() => null),
+      output: standardSchema<SwarmBoardInfo>((v) =>
+        isObject(v) && typeof v.url === "string" && typeof v.swarmId === "string"
+          ? null
+          : "output must be SwarmBoardInfo",
+      ),
     },
     getSwarmSnapshot: {
-      input: {
-        type: "object",
-        properties: {
-          sessionId: { type: "string" },
-          swarmId: { type: "string" },
-        },
-      } as const,
-      output: {
-        type: "object",
-        properties: {
-          swarm: {
-            type: ["object", "null"],
-            properties: {
-              id: { type: "string" },
-              title: { type: "string" },
-              objective: { type: ["string", "null"] },
-              status: { type: "string" },
-              created_at: { type: "number" },
-              updated_at: { type: "number" },
-            },
-            required: ["id", "title", "objective", "status", "created_at", "updated_at"],
-          },
-          boardUrl: { type: "string" },
-          head: { type: "number" },
-          members: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                id: { type: "string" },
-                handle: { type: "string" },
-                name: { type: "string" },
-                generation: { type: "number" },
-                role: { type: "string" },
-                model: { type: "string" },
-                variant: { type: ["string", "null"] },
-                state: { type: "string" },
-                paused_quota: { type: "boolean" },
-                track_status: { type: "string" },
-                session_id: { type: ["string", "null"] },
-                owned_globs: { type: "array", items: { type: "string" } },
-                workspace_mode: { type: "string" },
-                last_active_at: { type: ["number", "null"] },
-                activity: { type: ["string", "null"] },
-              },
-              required: [
-                "id",
-                "handle",
-                "name",
-                "generation",
-                "role",
-                "model",
-                "variant",
-                "state",
-                "paused_quota",
-                "track_status",
-                "session_id",
-                "owned_globs",
-                "workspace_mode",
-                "last_active_at",
-                "activity",
-              ],
-            },
-          },
-          board_posts: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                seq: { type: "number" },
-                channel: { type: "string" },
-                author: { type: "string" },
-                mentions: { type: "array", items: { type: "string" } },
-                channel_mentions: { type: "array", items: { type: "string" } },
-                is_all: { type: "boolean" },
-                body: { type: "string" },
-                created_at: { type: "number" },
-              },
-              required: [
-                "seq",
-                "channel",
-                "author",
-                "mentions",
-                "channel_mentions",
-                "is_all",
-                "body",
-                "created_at",
-              ],
-            },
-          },
-          file_locks: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                id: { type: "number" },
-                glob_pattern: { type: "string" },
-                owner_handle: { type: "string" },
-                owner_member_id: { type: "string" },
-                claimed_at: { type: "number" },
-              },
-              required: ["id", "glob_pattern", "owner_handle", "owner_member_id", "claimed_at"],
-            },
-          },
-        },
-        required: ["swarm", "boardUrl", "head", "members", "board_posts", "file_locks"],
-      } as const,
+      input: optionalObjectSchema<{ sessionId?: string; swarmId?: string }>((v) => {
+        if (v.sessionId !== undefined && typeof v.sessionId !== "string") {
+          return "sessionId must be a string";
+        }
+        if (v.swarmId !== undefined && typeof v.swarmId !== "string") {
+          return "swarmId must be a string";
+        }
+        return null;
+      }),
+      output: standardSchema<SwarmSnapshot>((v) =>
+        isObject(v) && Array.isArray(v.members) && Array.isArray(v.board_posts) && Array.isArray(v.file_locks)
+          ? null
+          : "output must be SwarmSnapshot",
+      ),
     },
     listSwarms: {
-      input: {
-        type: "object",
-        properties: {
-          limit: { type: "number" },
-        },
-      } as const,
-      output: {
-        type: "object",
-        properties: {
-          swarms: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                id: { type: "string" },
-                title: { type: "string" },
-                status: { type: "string" },
-                created_at: { type: "number" },
-                updated_at: { type: "number" },
-                member_count: { type: "number" },
-                post_count: { type: "number" },
-              },
-              required: ["id", "title", "status", "created_at", "updated_at", "member_count", "post_count"],
-            },
-          },
-        },
-        required: ["swarms"],
-      } as const,
+      input: optionalObjectSchema<{ limit?: number }>((v) =>
+        v.limit !== undefined && typeof v.limit !== "number" ? "limit must be a number" : null,
+      ),
+      output: standardSchema<{ swarms: SwarmListItem[] }>((v) =>
+        isObject(v) && Array.isArray(v.swarms) ? null : "output must contain swarms array",
+      ),
     },
     completeSwarm: {
-      input: {
-        type: "object",
-        properties: {
-          swarmId: { type: "string" },
-          summary: { type: "string" },
-        },
-        required: ["swarmId"],
-      } as const,
-      output: {
-        type: "object",
-        properties: {
-          ok: { type: "boolean" },
-          error: { type: "string" },
-        },
-        required: ["ok"],
-      } as const,
+      input: optionalObjectSchema<{ swarmId: string; summary?: string }>((v) =>
+        typeof v.swarmId === "string" ? null : "swarmId must be a string",
+      ),
+      output: standardSchema<{ ok: boolean; error?: string }>((v) =>
+        isObject(v) && typeof v.ok === "boolean" ? null : "output must contain ok boolean",
+      ),
     },
     killMember: {
-      input: {
-        type: "object",
-        properties: {
-          swarmId: { type: "string" },
-          handle: { type: "string" },
-          reason: { type: "string" },
-        },
-        required: ["swarmId", "handle"],
-      } as const,
-      output: {
-        type: "object",
-        properties: {
-          ok: { type: "boolean" },
-          error: { type: "string" },
-        },
-        required: ["ok"],
-      } as const,
+      input: optionalObjectSchema<{ swarmId: string; handle: string; reason?: string }>((v) => {
+        if (typeof v.swarmId !== "string") return "swarmId must be a string";
+        if (typeof v.handle !== "string") return "handle must be a string";
+        return null;
+      }),
+      output: standardSchema<{ ok: boolean; error?: string }>((v) =>
+        isObject(v) && typeof v.ok === "boolean" ? null : "output must contain ok boolean",
+      ),
     },
   },
   events: {
     changed: {
-      type: "object",
-      properties: {
-        swarmId: { type: "string" },
-        reason: { type: "string" },
-        seq: { type: "number" },
-        handle: { type: "string" },
-        summary: { type: "string" },
-      },
-      required: ["swarmId", "reason"],
-    } as const,
+      schema: standardSchema<SwarmChangedEvent>((v) =>
+        isObject(v) && typeof v.swarmId === "string" && typeof v.reason === "string"
+          ? null
+          : "event must contain swarmId and reason",
+      ),
+    },
   },
-} as const;
+} as const satisfies Rpc.PortableDefinition;
 
 export default SWARM_RPC_DEF;

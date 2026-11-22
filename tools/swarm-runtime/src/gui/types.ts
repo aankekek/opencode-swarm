@@ -4,9 +4,12 @@ import { Schema } from "effect";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type SwarmGuiContext = SetupContext<any>;
 
+export const SWARM_SETTINGS_PAGE_ID = "swarm-board";
+
 export const SwarmSettingsSchema = Schema.Struct({
   sidebarShow: Schema.Boolean,
   pillbarShow: Schema.Boolean,
+  showWhenIdle: Schema.Boolean,
   composerPill: Schema.Boolean,
   bottomStrip: Schema.Boolean,
   withSidePanel: Schema.Boolean,
@@ -18,6 +21,7 @@ export type SwarmSettings = typeof SwarmSettingsSchema.Type;
 export const DEFAULT_SWARM_SETTINGS: SwarmSettings = {
   sidebarShow: true,
   pillbarShow: true,
+  showWhenIdle: true,
   composerPill: true,
   bottomStrip: false,
   withSidePanel: false,

@@ -6,20 +6,23 @@ import {
   Plugin,
   SettingsPage,
   Slot,
+  Store,
   Style,
   TitlebarItem,
   type ComposerPillTone,
   type PanelTab,
+  type SettingEntry,
 } from "@opencode/plugin/gui";
 import { createEffect, createMemo, createSignal, lazy, onCleanup, Show, Suspense } from "solid-js";
+import SWARM_RPC_DEF from "../src/rpc.js";
 import { SWARM_GUI_STYLES } from "./gui/styles.js";
-import { SwarmSettingsView } from "./gui/SwarmSettingsView.js";
+import { SwarmSettingsView, type SwarmRpcStatus } from "./gui/SwarmSettingsView.js";
 import {
   DEFAULT_SWARM_SETTINGS,
   normalizeSwarmList,
   normalizeSwarmSnapshot,
+  SWARM_SETTINGS_PAGE_ID,
   SwarmSettingsSchema,
-  unwrapRpcOutput,
   type SwarmSettings,
   type SwarmSnapshot,
   type SwarmSummary,
@@ -27,24 +30,89 @@ import {
 
 const SwarmPanelView = lazy(() => import("./gui/SwarmPanelView.js"));
 
-export default Plugin.define({
-  setup(ctx) {
-    const store = ctx.storage.store("swarm.settings", {
-      schema: SwarmSettingsSchema,
-      initial: DEFAULT_SWARM_SETTINGS,
-    });
+const SETTINGS_ENTRIES: readonly SettingEntry[] = [
+  {
+    id: SWARM_SETTINGS_PAGE_ID,
+    title: "Swarm Board",
+    description: "Configure Swarm Board side tab, pills, bottom strip, and event toasts",
+    keywords: "swarm board agents coordinator verifier",
+  },
+  {
+    id: "swarm-board.sidebarShow",
+    title: "Show Swarm side tab",
+    description: "Display the Swarm Board panel in the session side pane",
+    keywords: "swarm sidebar panel tab",
+  },
+  {
+    id: "swarm-board.pillbarShow",
+    title: "Show titlebar status pill",
+    description: "Show live active, waiting, and post counts in the window titlebar",
+    keywords: "swarm titlebar pill status",
+  },
+  {
+    id: "swarm-board.showWhenIdle",
+    title: "Show titlebar pill when idle",
+    description: "Keep a subtle Swarm: Idle pill in the titlebar when no swarm is active",
+    keywords: "swarm titlebar idle",
+  },
+  {
+    id: "swarm-board.composerPill",
+    title: "Show composer pill",
+    description: "Show active handles and verifier status above the message composer",
+    keywords: "swarm composer pill",
+  },
+  {
+    id: "swarm-board.bottomStrip",
+    title: "Show bottom summary strip",
+    description: "Display a compact one-line swarm summary bar at the bottom of the window",
+    keywords: "swarm bottom strip status bar",
+  },
+  {
+    id: "swarm-board.withSidePanel",
+    title: "Keep bottom strip when side panel is open",
+    description: "Show the bottom summary strip even while the Swarm side panel is visible",
+    keywords: "swarm bottom strip side panel",
+  },
+  {
+    id: "swarm-board.toastEnabled",
+    title: "Event toasts",
+    description: "Show toast alerts for quota pauses, @verifier PASS/FAIL, @monitor stall nudges, and swarm completion",
+    keywords: "swarm toast notifications",
+  },
+];
 
-    const settings = () => store.value ?? DEFAULT_SWARM_SETTINGS;
+export default Plugin.define({
+  stores: {
+    settings: Store.global(SwarmSettingsSchema, DEFAULT_SWARM_SETTINGS),
+  },
+  setup(ctx) {
+    const store =
+      ctx.stores?.settings ??
+      ctx.storage.store("swarm.settings", {
+        schema: SwarmSettingsSchema,
+        initial: DEFAULT_SWARM_SETTINGS,
+      });
+
+    const settings = (): SwarmSettings => store.value ?? DEFAULT_SWARM_SETTINGS;
     const updateSetting = <K extends keyof SwarmSettings>(key: K, value: SwarmSettings[K]) => {
       store.set({ ...settings(), [key]: value });
     };
 
-    ctx.add(Style, () => SWARM_GUI_STYLES);
+    const safeAdd = <T,>(registry: Parameters<typeof ctx.add<T>>[0], item: T | (() => T | undefined)) => {
+      try {
+        return ctx.add(registry, item as never);
+      } catch (err) {
+        console.warn(`[swarm-runtime] OpenCode did not accept a GUI item:`, err);
+        return () => {};
+      }
+    };
+
+    safeAdd(Style, SWARM_GUI_STYLES);
 
     const [swarms, setSwarms] = createSignal<SwarmSummary[]>([]);
     const [selectedSwarmId, setSelectedSwarmId] = createSignal<string | null>(null);
     const [snapshot, setSnapshot] = createSignal<SwarmSnapshot | null>(null);
-    const [wantedSessions, setWantedSessions] = createSignal<Set<string>>(new Set());
+    const [rpcStatus, setRpcStatus] = createSignal<SwarmRpcStatus>({ state: "connected" });
 
     let lastPausedQuota = false;
     let lastVerifierStatus = "";
@@ -52,25 +120,10 @@ export default Plugin.define({
     let lastCompletedId = "";
     let lastMonitorPostId: string | number | null = null;
 
-    const markWanted = (sessionKey: string, wanted: boolean) => {
-      setWantedSessions((prev) => {
-        const next = new Set(prev);
-        if (wanted) next.add(sessionKey);
-        else next.delete(sessionKey);
-        return next;
-      });
-    };
-
-    const callSwarmRpc = async <T,>(method: string, input: Record<string, unknown> = {}): Promise<T | null> => {
-      const session = ctx.sessions.current();
-      if (!session) return null;
-      const res = await session.server.client.rpc.call({
-        rpcID: "local.swarm-runtime",
-        method,
-        location: session.location,
-        input: input as never,
-      });
-      return unwrapRpcOutput<T>(res);
+    const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
+    const getCallOptions = () => {
+      const location = ctx.sessions.current()?.location;
+      return location ? { location } : {};
     };
 
     const maybeNotify = (snap: SwarmSnapshot) => {
@@ -125,27 +178,34 @@ export default Plugin.define({
 
     const refresh = async () => {
       try {
-        const rawList = await callSwarmRpc<unknown>("listSwarms");
+        const rpc = getRpc();
+        const opts = getCallOptions();
+        const rawList = await rpc.listSwarms({}, opts);
         const list = normalizeSwarmList(rawList);
-        if (list.length > 0) {
-          setSwarms(list);
-          if (!selectedSwarmId()) {
-            setSelectedSwarmId(list[0].id);
-          }
+        setSwarms(list);
+        if (list.length > 0 && !selectedSwarmId()) {
+          setSelectedSwarmId(list[0].id);
         }
         const targetId = selectedSwarmId();
         const sessionId = ctx.sessions.current()?.id;
-        const rawSnap = await callSwarmRpc<unknown>(
-          "getSwarmSnapshot",
-          targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {}
+        const rawSnap = await rpc.getSwarmSnapshot(
+          targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {},
+          opts
         );
         const snap = normalizeSwarmSnapshot(rawSnap);
+        setSnapshot(snap);
+        setRpcStatus({ state: "connected" });
         if (snap) {
-          setSnapshot(snap);
           maybeNotify(snap);
         }
-      } catch {
-        // Ignore transient RPC errors during startup or when no swarm is active
+      } catch (err) {
+        const isUnavailable =
+          typeof err === "object" && err !== null && "type" in err && (err as { type?: string }).type === "rpc.unavailable";
+        setRpcStatus(
+          isUnavailable
+            ? { state: "unavailable" }
+            : { state: "error", message: err instanceof Error ? err.message : String(err) }
+        );
       }
     };
 
@@ -155,17 +215,25 @@ export default Plugin.define({
       void refresh();
     });
 
-    const unlisten = (ctx as unknown as { events?: { on?: (event: string, fn: () => void) => () => void } }).events?.on?.(
-      "rpc.local.swarm-runtime.changed",
-      () => {
-        void refresh();
-      }
-    );
+    const eventAbort = new AbortController();
+    try {
+      getRpc().events.on(
+        "changed",
+        () => {
+          void refresh();
+        },
+        { signal: eventAbort.signal }
+      );
+    } catch {
+      // Ignore if event subscription is unavailable at startup
+    }
+
     const pollTimer = setInterval(() => {
       void refresh();
     }, 4000);
+
     onCleanup(() => {
-      unlisten?.();
+      eventAbort.abort();
       clearInterval(pollTimer);
     });
 
@@ -203,25 +271,46 @@ export default Plugin.define({
         ctx.layout.hide(key, session);
         return;
       }
-      markWanted(session.key, true);
       ctx.layout.open(key, session);
     };
 
-    ctx.add(SettingsPage, () => ({
-      id: "swarm-board",
+    const openSwarmSettings = () => {
+      ctx.layout.settings(SWARM_SETTINGS_PAGE_ID);
+    };
+
+    safeAdd(SettingsPage, () => ({
+      id: SWARM_SETTINGS_PAGE_ID,
       title: "Swarm Board",
-      render: () => <SwarmSettingsView ctx={ctx} settings={settings} updateSetting={updateSetting} />,
+      icon: "dot-grid" as const,
+      entries: SETTINGS_ENTRIES,
+      render: ({ target }) => (
+        <SwarmSettingsView
+          ctx={ctx}
+          settings={settings}
+          updateSetting={updateSetting}
+          rpcStatus={rpcStatus}
+          activeSwarmCount={() => swarms().length}
+          onOpenPanel={() => openSwarmPanel(false)}
+          onRefresh={() => void refresh()}
+          target={target}
+        />
+      ),
     }));
 
-    ctx.add(TitlebarItem, () => {
+    safeAdd(TitlebarItem, () => {
       if (!settings().pillbarShow) return undefined;
+      const snap = snapshot();
+      if (!snap && !settings().showWhenIdle) return undefined;
       const session = ctx.sessions.current();
       const pressed = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
       const c = counts();
       const warn = c.paused || c.stalled ? " ⚠" : "";
       return {
         id: "swarm-open",
-        label: `Swarm: ${c.active} active · ${c.waiting} waiting · ${c.posts} posts${warn}`,
+        icon: c.paused || c.stalled ? ("warning" as const) : ("dot-grid" as const),
+        label: snap
+          ? `Swarm: ${c.active} active · ${c.waiting} waiting · ${c.posts} posts${warn}`
+          : "Swarm: Idle",
         title: c.paused
           ? "Swarm paused on quota — click to open Swarm Board"
           : c.stalled
@@ -232,74 +321,79 @@ export default Plugin.define({
       };
     });
 
-    ctx.add(ComposerPill, () => {
-      if (!settings().composerPill) return undefined;
-      const snap = snapshot();
-      if (!snap) return undefined;
-      const c = counts();
-      const activeHandles = snap.members
-        .filter((m) => ["working", "active"].includes(m.state.toLowerCase()))
-        .map((m) => `@${m.handle.replace(/^@/, "")}`);
-      const verifier = (snap.verifierStatus ?? "").toUpperCase();
-      let tone: ComposerPillTone = "success";
-      if (c.paused || verifier === "FAIL") tone = "danger";
-      else if (c.stalled) tone = "warning";
-      const label =
-        activeHandles.length > 0
-          ? `${activeHandles.slice(0, 3).join(", ")}${activeHandles.length > 3 ? ` +${activeHandles.length - 3}` : ""}`
-          : verifier
-            ? `Verifier: ${verifier}`
-            : `Swarm: ${snap.status}`;
-      return {
-        id: "swarm-composer-pill",
-        show: () => ({
+    safeAdd(ComposerPill, {
+      id: "swarm-composer-pill",
+      show() {
+        if (!settings().composerPill) return undefined;
+        const snap = snapshot();
+        if (!snap) return undefined;
+        const c = counts();
+        const activeHandles = snap.members
+          .filter((m) => ["working", "active"].includes(m.state.toLowerCase()))
+          .map((m) => `@${m.handle.replace(/^@/, "")}`);
+        const verifier = (snap.verifierStatus ?? "").toUpperCase();
+        let tone: ComposerPillTone = "success";
+        if (c.paused || verifier === "FAIL") tone = "danger";
+        else if (c.stalled) tone = "warning";
+        const label =
+          activeHandles.length > 0
+            ? `${activeHandles.slice(0, 3).join(", ")}${activeHandles.length > 3 ? ` +${activeHandles.length - 3}` : ""}`
+            : verifier
+              ? `Verifier: ${verifier}`
+              : `Swarm: ${snap.status}`;
+        return {
+          icon: "dot-grid" as const,
           label,
           tone,
           run: () => openSwarmPanel(false),
-        }),
-      };
+        };
+      },
     });
 
-    ctx.add(Slot, () => {
-      if (!settings().bottomStrip) return undefined;
-      const session = ctx.sessions.current();
-      const sideVisible = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
-      if (sideVisible && !settings().withSidePanel) return undefined;
-      const c = counts();
-      const snap = snapshot();
-      return {
-        at: "window.bottom" as const,
-        render: () => (
-          <div
-            class="swarm-gui-bottom-strip"
-            style={{ cursor: "pointer" }}
-            onClick={() => openSwarmPanel(true)}
-          >
-            <span>
-              Swarm: {snap?.title ?? "Idle"} · {c.active} active · {c.waiting} waiting · {c.posts} posts
-            </span>
-            <Show when={c.paused || c.stalled}>
-              <span>{c.paused ? "Paused on quota" : "Stalled"}</span>
-            </Show>
-          </div>
-        ),
-      };
+    safeAdd(Slot, {
+      at: "window.bottom" as const,
+      render: () => {
+        const shouldShow = () => {
+          if (!settings().bottomStrip) return false;
+          const session = ctx.sessions.current();
+          const sideVisible = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
+          return !sideVisible || settings().withSidePanel;
+        };
+        return (
+          <Show when={shouldShow()}>
+            <div
+              class="swarm-gui-bottom-strip"
+              style={{ cursor: "pointer" }}
+              onClick={() => openSwarmPanel(true)}
+            >
+              <span>
+                Swarm: {snapshot()?.title ?? "Idle"} · {counts().active} active · {counts().waiting} waiting ·{" "}
+                {counts().posts} posts
+              </span>
+              <Show when={counts().paused || counts().stalled}>
+                <span>{counts().paused ? "Paused on quota" : "Stalled"}</span>
+              </Show>
+            </div>
+          </Show>
+        );
+      },
     });
 
-    ctx.add(MenuItem, () => {
+    safeAdd(MenuItem, () => {
       const session = ctx.sessions.current();
       const opened = session ? ctx.layout.state(`${ctx.id}:swarm`, session) !== "closed" : false;
       return {
         menu: "session.panel" as const,
         id: "open-swarm",
         title: "Swarm",
+        icon: "dot-grid" as const,
         description: "Open live Swarm Board",
         opened,
         run: () => openSwarmPanel(false),
       };
     });
 
-    ctx.add(Command, () => ({
+    safeAdd(Command, () => ({
       id: "open",
       title: "Open Swarm Board",
       description: "Open the live Antigravity-style Swarm Board side panel",
@@ -310,57 +404,66 @@ export default Plugin.define({
       run: () => openSwarmPanel(false),
     }));
 
+    safeAdd(Command, () => ({
+      id: "settings",
+      title: "Swarm Board Settings",
+      description: "Configure Swarm Board surfaces and notifications",
+      group: "Swarm",
+      section: "general" as const,
+      run: () => openSwarmSettings(),
+    }));
+
     const swarmTab: PanelTab = {
       id: "swarm",
       title: "Swarm",
-      closable: "hover",
+      pinned: true,
     };
 
-    ctx.add(Panel, () => {
-      if (!settings().sidebarShow) return undefined;
-      return {
-        id: "board",
-        region: "side" as const,
-        width: 480,
-        mobile: {
-          title: "Swarm",
-          order: 50,
-          kind: "tab" as const,
-          cached: true,
-        },
-        list({ session, open }) {
-          if (open.includes("swarm") || wantedSessions().has(session.key)) {
-            return [swarmTab];
-          }
-          return [];
-        },
-        close({ session }) {
-          markWanted(session.key, false);
-        },
-        render(props) {
-          return (
-            <Suspense fallback={<div style={{ padding: "12px" }}>Loading Swarm Board...</div>}>
-              <SwarmPanelView
-                ctx={ctx}
-                snapshot={snapshot}
-                swarms={swarms}
-                selectedSwarmId={selectedSwarmId}
-                onSelectSwarm={(id) => setSelectedSwarmId(id)}
-                onRefresh={() => void refresh()}
-                onKillMember={async (swarmId, handle) => {
-                  await callSwarmRpc("killMember", { swarmId, handle });
-                  await refresh();
-                }}
-                onCompleteSwarm={async (swarmId) => {
-                  await callSwarmRpc("completeSwarm", { swarmId });
-                  await refresh();
-                }}
-                server={props.session.server}
-              />
-            </Suspense>
-          );
-        },
-      };
+    safeAdd(Panel, {
+      id: "board",
+      region: "side" as const,
+      width: 480,
+      mobile: {
+        title: "Swarm",
+        order: 50,
+        kind: "tab" as const,
+        cached: true,
+      },
+      list() {
+        return settings().sidebarShow ? [swarmTab] : [];
+      },
+      render(props) {
+        return (
+          <Suspense fallback={<div style={{ padding: "12px" }}>Loading Swarm Board...</div>}>
+            <SwarmPanelView
+              ctx={ctx}
+              snapshot={snapshot}
+              swarms={swarms}
+              selectedSwarmId={selectedSwarmId}
+              onSelectSwarm={(id) => setSelectedSwarmId(id)}
+              onRefresh={() => void refresh()}
+              onOpenSettings={openSwarmSettings}
+              rpcError={() => {
+                const s = rpcStatus();
+                if (s.state === "unavailable") {
+                  return "Server plugin (local.swarm-runtime) is not loaded for this workspace.";
+                }
+                if (s.state === "error") return s.message;
+                return undefined;
+              }}
+              onKillMember={async (swarmId, handle) => {
+                await getRpc().killMember({ swarmId, handle }, getCallOptions());
+                await refresh();
+              }}
+              onCompleteSwarm={async (swarmId) => {
+                await getRpc().completeSwarm({ swarmId }, getCallOptions());
+                await refresh();
+              }}
+              server={props.session.server}
+            />
+          </Suspense>
+        );
+      },
     });
   },
 });

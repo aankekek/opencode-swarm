@@ -197,7 +197,7 @@ export const swarmRuntimePlugin = Plugin.define({
     let rpcReg: RpcReg | undefined;
     const emitSwarmChanged = (event: SwarmChangedEvent) => {
       try {
-        rpcReg?.events?.emit?.("changed", event);
+        void Promise.resolve(rpcReg?.events?.emit?.("changed", event)).catch(() => {});
       } catch {
         // Ignore if host runtime does not expose events.emit
       }
@@ -558,13 +558,19 @@ export const swarmRuntimePlugin = Plugin.define({
           const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
           let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
           if (!swarm && sessionIdArg) {
-            const member = db.getActiveMemberBySession(sessionIdArg);
+            const member = db.getActiveMemberBySession(sessionIdArg) ?? db.getLatestMemberBySession(sessionIdArg);
             if (member) {
               swarm = db.getSwarm(member.swarm_id);
             }
           }
           if (!swarm && !swarmIdArg) {
             swarm = db.getActiveSwarms()[0];
+          }
+          if (!swarm && !swarmIdArg) {
+            const latestSummary = db.listSwarms(1)[0];
+            if (latestSummary) {
+              swarm = db.getSwarm(latestSummary.id);
+            }
           }
           if (!swarm) {
             return {
@@ -700,8 +706,8 @@ export const swarmRuntimePlugin = Plugin.define({
       if (rpcReg && typeof rpcReg === "object" && "dispose" in rpcReg && typeof rpcReg.dispose === "function") {
         rpcCleanup = () => rpcReg!.dispose!();
       }
-    } catch {
-      // Ignore if host runtime does not expose ctx.rpc.register
+    } catch (err) {
+      console.warn("[swarm-runtime] Failed to register RPC domain:", err);
     }
 
     // -----------------------------------------------------------------------
