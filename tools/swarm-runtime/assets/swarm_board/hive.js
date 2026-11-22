@@ -505,7 +505,7 @@
       const nowHtml = live
         ? `<div class="o2-mnow o2-mact ${esc(live.kind)}" data-testid="swarm-member-activity" title="${esc(liveTip(live))}">${liveText(live)}</div>`
         : (bodyLine ? `<div class="o2-mnow">${esc(bodyLine)}</div>` : '');
-      const openAttr = `data-open-member="${esc(x.rawName || n)}"`;
+      const openAttr = `data-open-member="${esc(x.rawName || n)}" title="Click or double-click to open member session tab"`;
       const cls = `o2-mrow bees ${st} ${hasIssue?'issue':''} ${x.killed?'retired':''} ${isCoord?'coord':''}`;
 
       return `<article class="${cls}" ${openAttr} data-mhay="${esc(hay)}">
@@ -767,18 +767,32 @@
     el.querySelectorAll('[data-o2t]').forEach(b => b.onclick = (e) => {
       e.stopPropagation(); state['o2t:' + b.dataset.o2t] = b.getAttribute('aria-expanded') !== 'true'; sync();
     });
-    el.querySelectorAll('[data-o2who]').forEach(b => b.onclick = (e) => {
-      e.stopPropagation(); const n = b.dataset.o2who; state.o2who = (n && state.o2who !== n) ? n : null; sync();
+    el.querySelectorAll('[data-o2who]').forEach(b => {
+      b.onclick = (e) => {
+        e.stopPropagation(); const n = b.dataset.o2who; state.o2who = (n && state.o2who !== n) ? n : null; sync();
+      };
+      b.ondblclick = (e) => {
+        e.stopPropagation(); const n = b.dataset.o2who; if (n && hooks.member) hooks.member(n);
+      };
+    });
+    el.querySelectorAll('.o2-lead').forEach(b => {
+      b.ondblclick = (e) => {
+        e.stopPropagation(); if (hooks.member) hooks.member('coordinator');
+      };
     });
     el.querySelectorAll('[data-o2]').forEach(b => b.onclick = (e) => {
       e.stopPropagation(); const k = 'o2' + b.dataset.o2; state[k] = !state[k]; sync();
     });
     const om = $('#o2More', el);
     if (om) om.onclick = () => { if (hooks.members) hooks.members(); };
-    el.querySelectorAll('[data-open-member]').forEach(b => b.onclick = (e) => {
-      const btn = e.target.closest('button');
-      if (btn && btn !== b) return;
-      if (hooks.member) hooks.member(b.dataset.openMember);
+    el.querySelectorAll('[data-open-member]').forEach(b => {
+      const openHandler = (e) => {
+        const btn = e.target.closest('button');
+        if (btn && btn !== b) return;
+        if (hooks.member) hooks.member(b.dataset.openMember);
+      };
+      b.onclick = openHandler;
+      b.ondblclick = openHandler;
     });
     el.querySelectorAll('.o2-msin').forEach(inp => {
       const apply = () => {

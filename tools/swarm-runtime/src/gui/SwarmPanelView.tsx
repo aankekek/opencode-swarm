@@ -95,11 +95,16 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
       if (origin && event.origin !== origin) return;
       const data = event.data as { type?: string; sessionID?: string } | null;
       if (data?.type === "swarm:open_session" && typeof data.sessionID === "string" && data.sessionID) {
-        if (!props.server) {
+        const rawServer = props.server;
+        const serverId =
+          typeof rawServer === "string"
+            ? rawServer
+            : (rawServer as { id?: string } | undefined)?.id ?? props.ctx.sessions.current()?.server.id;
+        if (!serverId) {
           props.ctx.toast.show({ title: "No server context for member session" });
           return;
         }
-        props.ctx.tabs.open({ server: props.server as never, id: data.sessionID }, { focus: true });
+        props.ctx.tabs.open({ server: serverId, id: data.sessionID }, { focus: true });
       }
     };
     window.addEventListener("message", onMessage);

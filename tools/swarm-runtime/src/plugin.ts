@@ -332,11 +332,14 @@ export const swarmRuntimePlugin = Plugin.define({
       memberName: string,
       modelInput?: string,
       variantInput?: string,
+      opts?: { interruptAndRerunIfWorking?: boolean },
     ) {
       const target = db.getMemberByName(swarmId, memberName);
       if (!target) throw new Error(`Member "@${memberName}" not found in swarm "${swarmId}".`);
       if (target.state === "killed") throw new Error(`Cannot switch model of killed member "@${memberName}".`);
-      if (target.state === "working") {
+      const wasWorking = target.state === "working";
+      const wasPausedQuota = target.paused_quota === 1;
+      if (wasWorking && !opts?.interruptAndRerunIfWorking) {
         throw new Error(`Member "@${memberName}" is currently working. Wait until it is waiting before switching models.`);
       }
 
@@ -354,6 +357,10 @@ export const swarmRuntimePlugin = Plugin.define({
         throw new Error(`No model or variant specified for "@${memberName}".`);
       }
 
+      if (wasWorking && opts?.interruptAndRerunIfWorking) {
+        await ctx.session.interrupt({ sessionID: target.session_id }).catch(() => {});
+      }
+
       await ctx.session.switchModel({
         sessionID: target.session_id,
         model: {
@@ -363,6 +370,24 @@ export const swarmRuntimePlugin = Plugin.define({
         },
       });
       db.setMemberModel(target.id, resolved);
+
+      const shouldRerun = Boolean(opts?.interruptAndRerunIfWorking && (wasWorking || wasPausedQuota) && target.role !== "coordinator");
+      if (shouldRerun) {
+        const rerunPrompt = [
+          `[SWARM MODEL SWITCHED for @${target.name} — Swarm ${target.swarm_id}]`,
+          `Your model was changed to ${formatModelSpec(resolved)}.`,
+          `Immediately rerun/resume your current assignment and report via \`post_message\`:`,
+          ``,
+          target.brief || "Continue your assigned swarm task.",
+        ].join("\n");
+        db.setMemberState(target.id, "working");
+        await ctx.session.prompt({
+          sessionID: target.session_id,
+          text: rerunPrompt,
+          delivery: "queue",
+        });
+      }
+
       emitSwarmChanged({
         swarmId: target.swarm_id,
         reason: "member_model_changed",
@@ -373,6 +398,7 @@ export const swarmRuntimePlugin = Plugin.define({
         name: target.name,
         model: formatModelSpec(resolved),
         preserved_history: true,
+        rerun: shouldRerun,
       };
     }
 
@@ -449,7 +475,6 @@ export const swarmRuntimePlugin = Plugin.define({
         childSessionId = forked.id;
       } else {
         const created = await ctx.session.create({
-          parentID: args.caller.session_id,
           title: `[swarm:${args.swarmId}] @${cleanName}`,
           location: { directory: provisioned.dir },
           permissions: buildRolePermissions(args.role, options),
@@ -549,7 +574,8 @@ export const swarmRuntimePlugin = Plugin.define({
           {
             db,
             getAvailableModels: () => listAvailableModels(ctx, { all: false }),
-            switchMemberModel: switchMemberModelInPlace,
+            switchMemberModel: (swarmId, memberName, model, variant) =>
+              switchMemberModelInPlace(swarmId, memberName, model, variant, { interruptAndRerunIfWorking: true }),
             setRoleModelDefault: (role, spec) => {
               roleModels[role] = spec;
             },
@@ -732,6 +758,158 @@ export const swarmRuntimePlugin = Plugin.define({
           });
           emitSwarmChanged({ swarmId: swarm.id, reason: "member_killed", handle: target.name, summary: reason });
           return { ok: true };
+        },
+        getRoleConfig: async (args?: Record<string, unknown>) => {
+          const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
+          const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
+          let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
+          if (!swarm && sessionIdArg) {
+            const member = db.getActiveMemberBySession(sessionIdArg) ?? db.getLatestMemberBySession(sessionIdArg);
+            if (member) {
+              swarm = db.getSwarm(member.swarm_id);
+            }
+          }
+          if (!swarm && !swarmIdArg) {
+            swarm = db.getActiveSwarms()[0];
+          }
+          if (!swarm && !swarmIdArg) {
+            const latestSummary = db.listSwarms(1)[0];
+            if (latestSummary) swarm = db.getSwarm(latestSummary.id);
+          }
+
+          const catalog = await listAvailableModels(ctx, { all: false });
+          const defaultSpec = catalog.defaultModel
+            ? `${catalog.defaultModel.providerID}/${catalog.defaultModel.modelID}`
+            : catalog.models[0]
+              ? `${catalog.models[0].providerID}/${catalog.models[0].id}`
+              : "";
+          const liveMembers = swarm ? db.listMembers(swarm.id, false) : [];
+          const pickRoleModel = (role: "coordinator" | "worker" | "verifier" | "monitor") => {
+            const member = liveMembers.find((m) => m.role === role);
+            if (member?.model_provider && member?.model_id) {
+              return formatModelSpec({
+                providerID: member.model_provider,
+                id: member.model_id,
+                ...(member.model_variant ? { variant: member.model_variant } : {}),
+              });
+            }
+            return roleModels[role] ?? defaultSpec;
+          };
+
+          return {
+            swarmId: swarm?.id ?? null,
+            swarmTitle: swarm?.title ?? null,
+            swarmStatus: swarm?.status ?? "idle",
+            roleModels: {
+              coordinator: pickRoleModel("coordinator"),
+              worker: pickRoleModel("worker"),
+              verifier: pickRoleModel("verifier"),
+              monitor: pickRoleModel("monitor"),
+            },
+            models: catalog.models.map((m) => ({
+              providerID: m.providerID,
+              id: m.id,
+              variants: m.variants,
+            })),
+          };
+        },
+        setRoleModel: async (args?: Record<string, unknown>) => {
+          const roleArg = typeof args?.role === "string" ? args.role.trim().toLowerCase() : "";
+          const modelArg = typeof args?.model === "string" ? args.model.trim() : "";
+          const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
+          const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
+
+          if (!["coordinator", "worker", "verifier", "monitor"].includes(roleArg)) {
+            return {
+              ok: false,
+              role: roleArg,
+              model: modelArg,
+              switchedMembers: [],
+              rerunMembers: [],
+              error: `Unsupported role "${roleArg}".`,
+            };
+          }
+
+          let resolved: ModelSelection | undefined;
+          try {
+            resolved = await resolveAndValidateModel(ctx, modelArg, undefined, undefined);
+          } catch (err) {
+            return {
+              ok: false,
+              role: roleArg,
+              model: modelArg,
+              switchedMembers: [],
+              rerunMembers: [],
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+          if (!resolved) {
+            return {
+              ok: false,
+              role: roleArg,
+              model: modelArg,
+              switchedMembers: [],
+              rerunMembers: [],
+              error: "Model must be specified.",
+            };
+          }
+
+          const spec = formatModelSpec(resolved);
+          roleModels[roleArg as MemberRole] = spec;
+
+          let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
+          if (!swarm && sessionIdArg) {
+            const member = db.getActiveMemberBySession(sessionIdArg);
+            if (member) swarm = db.getSwarm(member.swarm_id);
+          }
+          if (!swarm && !swarmIdArg) {
+            swarm = db.getActiveSwarms()[0];
+          }
+
+          const switchedMembers: string[] = [];
+          const rerunMembers: string[] = [];
+          if (swarm) {
+            const liveRoleMembers = db
+              .listMembers(swarm.id, false)
+              .filter((m) => m.role === roleArg);
+            for (const m of liveRoleMembers) {
+              const res = await switchMemberModelInPlace(swarm.id, m.name, spec, undefined, {
+                interruptAndRerunIfWorking: true,
+              });
+              switchedMembers.push(m.name);
+              if (res.rerun) {
+                rerunMembers.push(m.name);
+              }
+            }
+          }
+
+          if (roleArg === "coordinator" && switchedMembers.length === 0 && sessionIdArg) {
+            await ctx.session
+              .switchModel({
+                sessionID: sessionIdArg,
+                model: {
+                  providerID: resolved.providerID,
+                  id: resolved.id,
+                  ...(resolved.variant ? { variant: resolved.variant } : {}),
+                },
+              })
+              .catch(() => {});
+          }
+
+          emitSwarmChanged({
+            swarmId: swarm?.id ?? "",
+            reason: "role_model_changed",
+            handle: roleArg,
+            summary: spec,
+          });
+
+          return {
+            ok: true,
+            role: roleArg,
+            model: spec,
+            switchedMembers,
+            rerunMembers,
+          };
         },
       }) ?? undefined;
       if (rpcReg && typeof rpcReg === "object" && "dispose" in rpcReg && typeof rpcReg.dispose === "function") {

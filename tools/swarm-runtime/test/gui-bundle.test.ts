@@ -51,6 +51,13 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("toastEnabled");
     expect(code).toContain("pinned");
 
+    // Composer pill, overlay & bee branding
+    expect(code).toContain("🐝 Swarm: Buzzing");
+    expect(code).toContain("🐝 Swarm: Dozing");
+    expect(code).toContain("🐝 Swarm Control");
+    expect(code).toContain("getRoleConfig");
+    expect(code).toContain("setRoleModel");
+
     // Pixel-Bee Web View is default and only side-tab body
     expect(code).toContain("swarm-gui-iframe");
     expect(code).toContain("swarm:theme");

@@ -29,12 +29,21 @@ function createHarness(repoDir: string, dbPath: string) {
             status: "active",
             variants: [{ id: "low" }, { id: "high" }],
           },
+          {
+            providerID: "openai",
+            id: "gpt-5.4",
+            enabled: true,
+            status: "active",
+            variants: [{ id: "medium" }, { id: "high" }],
+          },
         ];
       },
       async default() {
         return { providerID: "anthropic", modelID: "claude-sonnet-4-6" };
       },
     },
+    _interrupted: [] as string[],
+    _switched: [] as Array<{ sessionID: string; model: any }>,
     tool: {
       async transform(fn: Function) {
         fn({
@@ -57,9 +66,10 @@ function createHarness(repoDir: string, dbPath: string) {
       },
     },
     rpc: {
-      async register(_def: unknown, _handlers: unknown) {
+      async register(_def: unknown, handlers: Record<string, any>) {
         const events: Array<{ event: string; payload: any }> = [];
         (ctx as any)._rpcEvents = events;
+        (ctx as any)._rpcHandlers = handlers;
         return {
           events: {
             async emit(event: string, payload: any) {
@@ -84,9 +94,13 @@ function createHarness(repoDir: string, dbPath: string) {
       async prompt(input: { sessionID: string; text: string }) {
         prompts.push({ sessionID: input.sessionID, text: input.text });
       },
-      async interrupt() {},
+      async interrupt({ sessionID }: { sessionID: string }) {
+        (ctx as any)._interrupted.push(sessionID);
+      },
       async synthetic() {},
-      async switchModel() {},
+      async switchModel(input: { sessionID: string; model: any }) {
+        (ctx as any)._switched.push(input);
+      },
       async hook() {},
     },
     event: {
@@ -220,6 +234,67 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
 
       const rpcEvents = (ctx as any)._rpcEvents as Array<{ event: string; payload: any }>;
       expect(rpcEvents.some((e) => e.payload?.reason === "swarm_created")).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("setRoleModel interrupts working worker, switches model, and reruns task mid-swarm", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-role-switch-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts } = createHarness(repoDir, dbPath);
+    let capturedCreateInput: any = null;
+    const origCreate = ctx.session.create;
+    ctx.session.create = async (input: any) => {
+      capturedCreateInput = input;
+      return await origCreate(input);
+    };
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      const addRes = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "coder", brief: "Implement feature Z" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(addRes.ok).toBe(true);
+      const coderSess = addRes.spawned[0].session_id as string;
+
+      // Worker session must omit parentID so built-in subagent pill does not appear
+      expect(capturedCreateInput.parentID).toBeUndefined();
+
+      const handlers = (ctx as any)._rpcHandlers;
+      const roleCfg = await handlers.getRoleConfig({ sessionId: "sess_coord" });
+      expect(roleCfg.models.length).toBe(2);
+
+      const promptsBefore = prompts.filter((p) => p.sessionID === coderSess).length;
+      const switchRes = await handlers.setRoleModel({
+        role: "worker",
+        model: "openai/gpt-5.4#high",
+        sessionId: "sess_coord",
+      });
+
+      expect(switchRes.ok).toBe(true);
+      expect(switchRes.model).toBe("openai/gpt-5.4#high");
+      expect(switchRes.switchedMembers).toContain("coder");
+      expect(switchRes.rerunMembers).toContain("coder");
+      expect((ctx as any)._interrupted).toContain(coderSess);
+      expect((ctx as any)._switched.some((s: any) => s.sessionID === coderSess && s.model.id === "gpt-5.4")).toBe(true);
+
+      const promptsAfter = prompts.filter((p) => p.sessionID === coderSess);
+      expect(promptsAfter.length).toBe(promptsBefore + 1);
+      expect(promptsAfter[promptsAfter.length - 1].text).toContain("SWARM MODEL SWITCHED");
+      expect(promptsAfter[promptsAfter.length - 1].text).toContain("Implement feature Z");
     } finally {
       await cleanup();
       try {

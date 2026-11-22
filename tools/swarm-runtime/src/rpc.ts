@@ -80,6 +80,35 @@ export type SwarmChangedEvent = {
   summary?: string;
 };
 
+export interface SwarmModelCatalogItem {
+  providerID: string;
+  id: string;
+  name?: string;
+  variants: string[];
+}
+
+export interface SwarmRoleConfig {
+  swarmId: string | null;
+  swarmTitle: string | null;
+  swarmStatus: string;
+  roleModels: {
+    coordinator: string;
+    worker: string;
+    verifier: string;
+    monitor: string;
+  };
+  models: SwarmModelCatalogItem[];
+}
+
+export interface SetRoleModelResult {
+  ok: boolean;
+  role: string;
+  model: string;
+  switchedMembers: string[];
+  rerunMembers: string[];
+  error?: string;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -165,6 +194,32 @@ export const SWARM_RPC_DEF = {
       }),
       output: standardSchema<{ ok: boolean; error?: string }>((v) =>
         isObject(v) && typeof v.ok === "boolean" ? null : "output must contain ok boolean",
+      ),
+    },
+    getRoleConfig: {
+      input: optionalObjectSchema<{ sessionId?: string; swarmId?: string }>((v) => {
+        if (v.sessionId !== undefined && typeof v.sessionId !== "string") {
+          return "sessionId must be a string";
+        }
+        if (v.swarmId !== undefined && typeof v.swarmId !== "string") {
+          return "swarmId must be a string";
+        }
+        return null;
+      }),
+      output: standardSchema<SwarmRoleConfig>((v) =>
+        isObject(v) && isObject(v.roleModels) && Array.isArray(v.models) ? null : "output must be SwarmRoleConfig",
+      ),
+    },
+    setRoleModel: {
+      input: optionalObjectSchema<{ role: string; model: string; swarmId?: string; sessionId?: string }>((v) => {
+        if (typeof v.role !== "string") return "role must be a string";
+        if (typeof v.model !== "string") return "model must be a string";
+        if (v.swarmId !== undefined && typeof v.swarmId !== "string") return "swarmId must be a string";
+        if (v.sessionId !== undefined && typeof v.sessionId !== "string") return "sessionId must be a string";
+        return null;
+      }),
+      output: standardSchema<SetRoleModelResult>((v) =>
+        isObject(v) && typeof v.ok === "boolean" ? null : "output must be SetRoleModelResult",
       ),
     },
   },

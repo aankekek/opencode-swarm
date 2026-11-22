@@ -14,8 +14,9 @@ import {
   type SettingEntry,
 } from "@opencode/plugin/gui";
 import { createEffect, createMemo, createSignal, lazy, onCleanup, Show, Suspense } from "solid-js";
-import SWARM_RPC_DEF from "../src/rpc.js";
+import SWARM_RPC_DEF, { type SetRoleModelResult, type SwarmRoleConfig } from "../src/rpc.js";
 import { SWARM_GUI_STYLES } from "./gui/styles.js";
+import { SwarmControlOverlay, type SwarmControlRole } from "./gui/SwarmControlOverlay.js";
 import { SwarmSettingsView, type SwarmRpcStatus } from "./gui/SwarmSettingsView.js";
 import {
   DEFAULT_SWARM_SETTINGS,
@@ -353,6 +354,50 @@ export default Plugin.define({
       ctx.layout.settings(SWARM_SETTINGS_PAGE_ID);
     };
 
+    const isBuzzing = createMemo(() => {
+      const snap = snapshot();
+      const c = counts();
+      return Boolean(
+        snap && (c.active > 0 || (snap.status === "running" && snap.members.some((m) => m.state.toLowerCase() === "working")))
+      );
+    });
+
+    const openSwarmOverlay = () => {
+      ctx.dialogs.open((dialog) => (
+        <SwarmControlOverlay
+          ctx={ctx}
+          snapshot={snapshot}
+          counts={counts}
+          isBuzzing={isBuzzing}
+          loadRoleConfig={async () => {
+            const targetId = selectedSwarmId();
+            const sessionId = ctx.sessions.current()?.id;
+            return (await getRpc().getRoleConfig(
+              targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {},
+              getCallOptions()
+            )) as SwarmRoleConfig | null;
+          }}
+          onSetRoleModel={async (role: SwarmControlRole, modelSpec: string) => {
+            const targetId = selectedSwarmId();
+            const sessionId = ctx.sessions.current()?.id;
+            const res = (await getRpc().setRoleModel(
+              {
+                role,
+                model: modelSpec,
+                ...(targetId ? { swarmId: targetId } : {}),
+                ...(sessionId ? { sessionId } : {}),
+              },
+              getCallOptions()
+            )) as SetRoleModelResult | null;
+            void refresh();
+            return res;
+          }}
+          onOpenBoard={() => openSwarmPanel(false)}
+          onClose={() => dialog.close()}
+        />
+      ));
+    };
+
     safeAdd(SettingsPage, () => ({
       id: SWARM_SETTINGS_PAGE_ID,
       title: "Swarm Board",
@@ -380,12 +425,14 @@ export default Plugin.define({
       const pressed = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
       const c = counts();
       const warn = c.paused || c.stalled ? " ⚠" : "";
+      const buzzing = isBuzzing();
       return {
         id: "swarm-open",
-        icon: c.paused || c.stalled ? ("warning" as const) : ("dot-grid" as const),
-        label: snap
-          ? `Swarm: ${c.active} active · ${c.waiting} waiting · ${c.posts} posts${warn}`
-          : "Swarm: Idle",
+        label: buzzing
+          ? `🐝 Swarm: Buzzing (${c.active} active · ${c.posts} posts)${warn}`
+          : snap
+            ? `🐝 Swarm: Dozing (${c.posts} posts)${warn}`
+            : "🐝 Swarm: Dozing",
         title: c.paused
           ? "Swarm paused on quota — click to open Swarm Board"
           : c.stalled
@@ -404,26 +451,17 @@ export default Plugin.define({
         }
         if (!settings().composerPill) return undefined;
         const snap = snapshot();
-        if (!snap) return undefined;
+        if (!snap && !settings().showWhenIdle) return undefined;
         const c = counts();
-        const activeHandles = snap.members
-          .filter((m) => ["working", "active"].includes(m.state.toLowerCase()))
-          .map((m) => `@${m.handle.replace(/^@/, "")}`);
-        const verifier = (snap.verifierStatus ?? "").toUpperCase();
-        let tone: ComposerPillTone = "success";
+        const verifier = (snap?.verifierStatus ?? "").toUpperCase();
+        let tone: ComposerPillTone | undefined;
         if (c.paused || verifier === "FAIL") tone = "danger";
         else if (c.stalled) tone = "warning";
-        const label =
-          activeHandles.length > 0
-            ? `${activeHandles.slice(0, 3).join(", ")}${activeHandles.length > 3 ? ` +${activeHandles.length - 3}` : ""}`
-            : verifier
-              ? `Verifier: ${verifier}`
-              : `Swarm: ${snap.status}`;
         return {
-          icon: "dot-grid" as const,
-          label,
-          tone,
-          run: () => openSwarmPanel(false),
+          label: isBuzzing() ? "🐝 Swarm: Buzzing" : "🐝 Swarm: Dozing",
+          ...(tone ? { tone } : {}),
+          title: "Click to configure Swarm role models or open Board",
+          run: () => openSwarmOverlay(),
         };
       },
     });
