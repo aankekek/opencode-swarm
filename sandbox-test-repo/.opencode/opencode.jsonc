@@ -1,7 +1,7 @@
 {
   "plugins": [
     {
-      "package": "../tools/swarm-runtime",
+      "package": "../../tools/swarm-runtime",
       "options": {
         "stallTimeoutMs": 180000,
         "monitorIntervalMs": 30000,

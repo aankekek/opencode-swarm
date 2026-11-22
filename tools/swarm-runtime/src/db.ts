@@ -296,6 +296,40 @@ export class SwarmBoardDB {
       .all() as unknown as SwarmRow[];
   }
 
+  listSwarms(limit = 50): Array<{
+    id: string;
+    title: string;
+    status: SwarmStatus;
+    created_at: number;
+    updated_at: number;
+    member_count: number;
+    post_count: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT
+           s.id,
+           s.title,
+           s.status,
+           s.created_at,
+           s.updated_at,
+           (SELECT COUNT(*) FROM members m WHERE m.swarm_id = s.id) AS member_count,
+           (SELECT COUNT(*) FROM board_posts p WHERE p.swarm_id = s.id) AS post_count
+         FROM swarms s
+         ORDER BY s.updated_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as unknown as Array<{
+        id: string;
+        title: string;
+        status: SwarmStatus;
+        created_at: number;
+        updated_at: number;
+        member_count: number;
+        post_count: number;
+      }>;
+  }
+
   setSwarmTitle(swarmId: string, title: string) {
     this.db.prepare(`UPDATE swarms SET title = ?, updated_at = ? WHERE id = ?`).run(title, Date.now(), swarmId);
     this.syncMembersJson(swarmId);

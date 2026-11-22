@@ -1,13 +1,23 @@
-# OpenCode Desktop v2 Native Tab Integration
+# OpenCode Desktop GUI Integration (`swarm-runtime`)
 
-`tools/swarm-runtime` exports `./gui-experimental` (`dist/gui-experimental.cjs`) built with `@opencode/plugin/gui/vite`.
+The `swarm-runtime` plugin provides a native SolidJS OpenCode Desktop GUI (`dist/gui-experimental.cjs`) built with `@opencode/plugin/gui`, `ctx.ui.*`, `solid-js`, and `effect` (`Schema` for `ctx.storage.store`).
 
-## How to Open the Swarm Board in OpenCode v2
-1. **Titlebar Pill:** Click **Swarm** in the OpenCode Desktop v2 titlebar.
-2. **Side Panel `+` Menu:** Click `+` before the side panel tabs -> **Swarm**.
-3. **Keyboard Shortcut / Slash Command:** Press `Ctrl+Shift+S` (`Cmd+Shift+S` on macOS) or run `/swarm-board`.
+## Surfaces
 
-## Features
-- **Authenticated RPC Bridge (`src/rpc.ts`):** Queries `local.swarm-runtime` `getBoardInfo` for the live `127.0.0.1` board URL + per-start bearer token.
-- **Full Antigravity Pixel-Bee UI:** Embeds the 5-tab Swarm Board (Overview, Board, Members with manual Model + Variant pickers, Graph with Replay & GIF89a export, Raw).
-- **Click-to-Open Worker Session:** Clicking a worker in the Swarm Board posts `swarm:open_session` to the parent OpenCode window, which verifies the origin and opens/focuses that worker's session tab via `ctx.tabs.open(..., { focus: true })`.
+- **Swarm Side Tab (`Panel`, `region: "side"`)**: Lazy-loaded via Solid `lazy()`. Includes a swarm history switcher (`listSwarms`), Refresh button, optional Pixel-Bee Web View (`boardUrl` iframe), and three native `ctx.ui.Tabs` sub-tabs:
+  - **Board**: Chronological `board_posts`, author badge, highlighted `@mentions`, timestamps, `@handle` filter, and auto-scroll toggle.
+  - **Members**: Roster (`@coordinator`, workers, `@verifier`) with state dot/tag, model + variant, track status, owned globs, click-to-open session (`ctx.tabs.open`), and confirmed Kill Member / Complete Swarm actions (`ctx.dialogs.open` + `ctx.ui.Dialog`).
+  - **Locks / Graph**: Active `file_locks` table (`glob` -> `@owner`) and mention/handoff flow list.
+- **Titlebar Pill (`TitlebarItem`)**: Displays `Swarm: N active · M waiting · P posts` (plus warning indicator when `paused_quota` or `stalled`). Clicking toggles/focuses the Swarm side tab.
+- **Composer Pill (`ComposerPill`)**: Compact pill above the message box showing active handles or verifier status with `tone: "success" | "warning" | "danger"`.
+- **Bottom Strip (`Slot` at `"window.bottom"`)**: Optional one-line summary bar, hidden when the side panel is visible unless `withSidePanel` is enabled.
+- **Settings (`SettingsPage` `"Swarm Board"`)**: Persists `sidebarShow`, `pillbarShow`, `composerPill`, `bottomStrip`, `withSidePanel`, and `toastEnabled` in `ctx.storage.store`.
+- **Commands & Menu**: `Open Swarm Board` (`mod+shift+s`, `/swarm-board`) and `session.panel` menu item.
+
+## Development
+
+```bash
+bun run build:gui
+bun run dev:gui
+bun test test/gui-bundle.test.ts
+```

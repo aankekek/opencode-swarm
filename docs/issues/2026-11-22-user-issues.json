@@ -1,0 +1,723 @@
+{
+  "meta": {
+    "generated": "2026-11-22",
+    "swarm_id": "sw_74738f60",
+    "swarm_title": "Issues",
+    "project": "tools/swarm-runtime + repo root config",
+    "host": "OpenCode CLI 2.2.6 / Desktop 2.3.2 (Windows)",
+    "baseline": {
+      "install": "398 packages",
+      "typecheck": "clean",
+      "tests": "22 pass / 0 fail",
+      "gui_build": "4.01 kB"
+    },
+    "verifier": "12/12 top claims PASS (board #12)",
+    "counts": {
+      "blockers": 7,
+      "majors": 29,
+      "minors": 20
+    },
+    "note": "Minors are the consolidated list; full per-searcher reports are in 2026-11-22-user-issues.md."
+  },
+  "findings": [
+    {
+      "id": "ISS-B1",
+      "severity": "blocker",
+      "area": "gui",
+      "title": "GUI tab never loads for a local-directory plugin",
+      "user_sees": "No Swarm titlebar pill, panel tab, Ctrl+Shift+S, or /swarm-board; /api/plugin reports only server; /api/plugin/gui returns 404 PluginNotFoundError.",
+      "location": [
+        ".opencode/opencode.jsonc:3-6",
+        "tools/swarm-runtime/package.json:6-10",
+        "src/gui.tsx:61-66",
+        "src/plugin.ts:504-527"
+      ],
+      "fix": "Ship as a named package (or root gui-experimental.cjs + rpc export); verify features:{server,gui,rpc} and /api/plugin/gui; restart Desktop.",
+      "source": "onboarding B2 / board root",
+      "verified": true
+    },
+    {
+      "id": "ISS-B2",
+      "severity": "blocker",
+      "area": "install",
+      "title": "Clean clone cannot load the plugin before bun install",
+      "user_sees": "After clone, tools and commands are absent and the failure is silent; plugin entry imports @opencode/plugin at runtime while node_modules is gitignored.",
+      "location": [
+        "README.md:18-24",
+        "src/plugin.ts:1",
+        ".gitignore:1"
+      ],
+      "fix": "Add mandatory install as Quick Start step 1; log a loud startup error if entry cannot import.",
+      "source": "onboarding B1",
+      "verified": true
+    },
+    {
+      "id": "ISS-B3",
+      "severity": "blocker",
+      "area": "board",
+      "title": "Board is not conversation-scoped and hides completed swarms",
+      "user_sees": "conversationId ignored, always getActiveSwarms()[0]; after complete the board says 'No swarm'; with two active swarms it shows the older one; ?swarmId ignored by UI.",
+      "location": [
+        "src/board-server.ts:176-184",
+        "src/plugin.ts:510",
+        "src/gui.tsx:107",
+        "assets/swarm_board/app.js:371-374"
+      ],
+      "fix": "Resolve by conversationId over all statuses, include swarmId in open_board/iframe, and order/limit active swarms.",
+      "source": "board B1+B2 / workflow M13+M15",
+      "verified": true
+    },
+    {
+      "id": "ISS-B4",
+      "severity": "blocker",
+      "area": "board",
+      "title": "3 of 5 advertised tabs are unreachable",
+      "user_sees": "Overview, Graph, Raw are hidden; only Board and Members render. Forcing Graph shows replay/GIF works.",
+      "location": [
+        "assets/swarm_board/app.js:2101-2115",
+        "src/board-server.ts:220-274"
+      ],
+      "fix": "Port the main.mjs snapshot wrapper (view.exists/json, graphTab, rawTab, raw, member) or remove the tabs and 5-tab claim; add a contract test.",
+      "source": "board B3",
+      "verified": true
+    },
+    {
+      "id": "ISS-B5",
+      "severity": "blocker",
+      "area": "lifecycle",
+      "title": "Reload/restart mid-swarm bricks the coordinator",
+      "user_sees": "Workers stop, board says interrupted, and the main chat rejects edits/writes forever; complete says 'not part of an active swarm'; only a new chat escapes.",
+      "location": [
+        "src/db.ts:251-287",
+        "src/plugin.ts:77-93",
+        "src/plugin.ts:181-186"
+      ],
+      "fix": "Skip reconcile when owner_pid === process.pid; persist coordinator session IDs and clear/restore their permissions during reconcile.",
+      "source": "workflow B1",
+      "verified": true
+    },
+    {
+      "id": "ISS-B6",
+      "severity": "blocker",
+      "area": "workspace",
+      "title": "Isolated work is lost on complete/kill",
+      "user_sees": "branch mode creates the branch inside the clone then deletes the clone; share mode drops uncommitted changes via worktree remove --force.",
+      "location": [
+        "src/workspace.ts:59-102",
+        "src/plugin.ts:833-868",
+        "src/plugin.ts:738-781"
+      ],
+      "fix": "Commit/merge or refuse cleanup when dirty; create branch work in the base repo or report the branch + merge command.",
+      "source": "workflow B2",
+      "verified": true
+    },
+    {
+      "id": "ISS-B7",
+      "severity": "blocker",
+      "area": "config",
+      "title": "Shipped roleModels pin opencode-go and are unvalidated",
+      "user_sees": "On a machine without opencode-go, first add fails or creates an unusable session; coordinator silently switches model; typos in worker/verifier defaults pass into session.create.",
+      "location": [
+        ".opencode/opencode.jsonc:22-30",
+        "src/plugin.ts:363-380",
+        "src/models.ts:134-137"
+      ],
+      "fix": "Unpin defaults (documented inheritance) or validate every role default and fail with a clear error before spawning.",
+      "source": "onboarding B4 / workflow M3",
+      "verified": true
+    },
+    {
+      "id": "ISS-M1",
+      "severity": "major",
+      "area": "docs",
+      "title": "README never says how to start a swarm",
+      "user_sees": "Tools exist but the coordinator protocol is only injected by /swarm; users may get a coordinator that does the work itself.",
+      "location": [
+        "README.md:1-24",
+        "src/plugin.ts:1051-1063",
+        "src/prompts.ts:3-11"
+      ],
+      "fix": "Add Quick Start: /swarm <task>; /swarm-models lists models.",
+      "source": "onboarding M1",
+      "verified": true
+    },
+    {
+      "id": "ISS-M2",
+      "severity": "major",
+      "area": "permissions",
+      "title": "Edit ownership and coordinator edit deny are undocumented",
+      "user_sees": "Basic add with name+brief creates a worker that cannot edit; coordinator edits fail while the swarm runs.",
+      "location": [
+        ".opencode/opencode.jsonc:13",
+        "src/policy.ts:128-133",
+        "src/policy.ts:179-200",
+        "src/plugin.ts:556"
+      ],
+      "fix": "Document allowCoordinatorEdits, owned_globs/claim, workspace:share; or make basic add usable by default.",
+      "source": "onboarding M2 / workflow M10",
+      "verified": true
+    },
+    {
+      "id": "ISS-M3",
+      "severity": "major",
+      "area": "feature",
+      "title": "fork is advertised but always fails",
+      "user_sees": "swarm add fork:... always errors because ctx.session.fork is absent from the v2 adapter.",
+      "location": [
+        "README.md:6",
+        "src/plugin.ts:552",
+        "src/plugin.ts:397-400"
+      ],
+      "fix": "Remove fork from schema/docs or implement via session.create(parentID)+replay.",
+      "source": "onboarding M3 / workflow m2",
+      "verified": true
+    },
+    {
+      "id": "ISS-M4",
+      "severity": "major",
+      "area": "docs",
+      "title": "GUI-only features documented as universal; restart buried",
+      "user_sees": "CLI users get unknown /swarm-board; Desktop users see no tab even after opencode reload.",
+      "location": [
+        "docs/opencode-tab-integration.md:3-11",
+        "src/gui.tsx:61-66"
+      ],
+      "fix": "Label as Desktop-GUI-only, document restart, provide browser-board fallback.",
+      "source": "onboarding M4",
+      "verified": true
+    },
+    {
+      "id": "ISS-M5",
+      "severity": "major",
+      "area": "host",
+      "title": "Host version requirement ambiguous; opencode not on PATH",
+      "user_sees": "CLI 2.2.6 lacks GUI/RPC; Desktop embeds 2.3.2; documented opencode commands fail in a fresh Windows shell.",
+      "location": [
+        "README.md:3",
+        "package.json:17",
+        "environment"
+      ],
+      "fix": "State CLI >=2.2.6 (core) / Desktop 2.3.2+ (GUI, restart); document full path or PATH setup.",
+      "source": "onboarding M5+M6",
+      "verified": true
+    },
+    {
+      "id": "ISS-M6",
+      "severity": "major",
+      "area": "onboarding",
+      "title": "Provider/auth/region/training prerequisites undocumented",
+      "user_sees": "swarm models can be empty or add fails without auth; contributor models imply consent that is never explained.",
+      "location": [
+        "README.md",
+        "opencode.jsonc:22-30"
+      ],
+      "fix": "Add Prerequisites: auth login, Console region, Muse training opt-in.",
+      "source": "onboarding M7",
+      "verified": true
+    },
+    {
+      "id": "ISS-M7",
+      "severity": "major",
+      "area": "workspace",
+      "title": "Isolation claims overstated; share/branch only see committed HEAD",
+      "user_sees": "Default is inherit; share/branch ignore uncommitted files; users expect current work.",
+      "location": [
+        "README.md:3,6",
+        "src/plugin.ts:354",
+        "src/workspace.ts:60-77"
+      ],
+      "fix": "Document default and require commit/copy before isolation modes; soften claim.",
+      "source": "onboarding M9",
+      "verified": true
+    },
+    {
+      "id": "ISS-M8",
+      "severity": "major",
+      "area": "board",
+      "title": "Board URL/token/port failure modes undocumented",
+      "user_sees": "Fixed port conflict silently removes the board (open_board:''); bookmarks die on restart; bare host loads GET but POSTs 401.",
+      "location": [
+        "src/plugin.ts:485-501",
+        "src/plugin.ts:589-703",
+        "src/board-server.ts:362"
+      ],
+      "fix": "Document ephemeral port/token; surface a visible warning on server failure; add swarmId to URL.",
+      "source": "onboarding M10 / workflow M15",
+      "verified": true
+    },
+    {
+      "id": "ISS-M9",
+      "severity": "major",
+      "area": "docs",
+      "title": "Model examples are stale and absent from catalog",
+      "user_sees": "Copying anthropic/openai/glm-4.6 examples fails validation or is ignored.",
+      "location": [
+        "README.md:16",
+        ".opencode/opencode.jsonc:33-36",
+        "sandbox-test-repo/.opencode/opencode.jsonc:14-17"
+      ],
+      "fix": "Replace with placeholders pointing to swarm models.",
+      "source": "onboarding M11",
+      "verified": true
+    },
+    {
+      "id": "ISS-M10",
+      "severity": "major",
+      "area": "security",
+      "title": "Verifier read-only and worker locks bypassed by shell allow",
+      "user_sees": "Verifier can sed -i/git checkout; parallel inherit workers overwrite each other via shell despite owned_globs.",
+      "location": [
+        ".opencode/opencode.jsonc:14-16",
+        "src/policy.ts:33-38",
+        "src/policy.ts:145-151",
+        "src/plugin.ts:1204-1215"
+      ],
+      "fix": "Default verifier/worker shell to ask/deny; run verifier in read-only worktree; block shell-writes in inherit.",
+      "source": "onboarding M12 / workflow M14",
+      "verified": true
+    },
+    {
+      "id": "ISS-M11",
+      "severity": "major",
+      "area": "board",
+      "title": "Feed freezes after 500 posts",
+      "user_sees": "Tab count shows 505 but feed ends at #500; newest posts never appear.",
+      "location": [
+        "src/board-server.ts:188",
+        "src/db.ts:624-646",
+        "test/board-server.test.ts:111-144"
+      ],
+      "fix": "Return newest page or beforeSeq paging; load older on scroll; surface hasMore.",
+      "source": "board M4",
+      "verified": true
+    },
+    {
+      "id": "ISS-M12",
+      "severity": "major",
+      "area": "board",
+      "title": "Members model/variant pickers absent",
+      "user_sees": "No selects/buttons on Members; POST endpoints have no client caller.",
+      "location": [
+        "docs/opencode-tab-integration.md:12",
+        "assets/swarm_board/hive.js:465",
+        "src/board-server.ts:283-305"
+      ],
+      "fix": "Render per-member model+variant selects and wire POST /api/member/model; or remove the claim.",
+      "source": "board M7",
+      "verified": true
+    },
+    {
+      "id": "ISS-M13",
+      "severity": "major",
+      "area": "board",
+      "title": "Unread divider never appears",
+      "user_sees": "No 'New' divider and no (you) chips because state.me is never returned.",
+      "location": [
+        "assets/swarm_board/app.js:693",
+        "assets/swarm_board/app.js:381",
+        "src/board-server.ts:228-251"
+      ],
+      "fix": "Return member for conversationId and include it in etag.",
+      "source": "board M5",
+      "verified": true
+    },
+    {
+      "id": "ISS-M14",
+      "severity": "major",
+      "area": "board",
+      "title": "Duplicate #main channel tab",
+      "user_sees": "Channel strip shows All, #main, #main.",
+      "location": [
+        "src/board-server.ts:187",
+        "assets/swarm_board/app.js:523-531"
+      ],
+      "fix": "Filter main server-side or in renderChannels.",
+      "source": "board M6",
+      "verified": true
+    },
+    {
+      "id": "ISS-M15",
+      "severity": "major",
+      "area": "workflow",
+      "title": "New members get two queued prompts",
+      "user_sees": "First turn is only the board wake-up, the role/opening rules arrive second; duplicated tokens/work, or worker waits forever.",
+      "location": [
+        "src/plugin.ts:461",
+        "src/plugin.ts:193-243",
+        "src/plugin.ts:463-478"
+      ],
+      "fix": "Do not wake a just-created member; post after opening prompt or merge into one prompt.",
+      "source": "workflow M1",
+      "verified": true
+    },
+    {
+      "id": "ISS-M16",
+      "severity": "major",
+      "area": "models",
+      "title": "Invalid variants accepted when a model has no variants",
+      "user_sees": "minimax#thinking / kimi#high returns ok; the provider ignores or fails later.",
+      "location": [
+        "src/models.ts:159-172"
+      ],
+      "fix": "Reject a requested variant when the model's variants list is empty.",
+      "source": "workflow M2",
+      "verified": true
+    },
+    {
+      "id": "ISS-M17",
+      "severity": "major",
+      "area": "permissions",
+      "title": "Unregistered sessions hard-denied in permission.evaluate",
+      "user_sees": "A second chat/tab in the same project gets denied for every edit/shell while a swarm runs.",
+      "location": [
+        "src/plugin.ts:1177-1181",
+        "src/plugin.ts:1119-1125"
+      ],
+      "fix": "Enforce only for swarm-owned sessions/targets; allow unrelated sessions.",
+      "source": "workflow M4",
+      "verified": true
+    },
+    {
+      "id": "ISS-M18",
+      "severity": "major",
+      "area": "lifecycle",
+      "title": "Killed names cannot be reused; working members cannot switch model",
+      "user_sees": "kill then add same name fails; model switch refuses while working; no recovery path under the same name.",
+      "location": [
+        "src/plugin.ts:346-352",
+        "src/db.ts:99",
+        "src/plugin.ts:297-299"
+      ],
+      "fix": "Implement generations or update killed rows; allow interrupt-then-switch; suggest a free name.",
+      "source": "workflow M5",
+      "verified": true
+    },
+    {
+      "id": "ISS-M19",
+      "severity": "major",
+      "area": "lifecycle",
+      "title": "Partial shard spawns leave phantom members",
+      "user_sees": "A failed shard leaves earlier shards live, killed rows, and orphan sessions/worktrees; retry collides.",
+      "location": [
+        "src/plugin.ts:650-706",
+        "src/plugin.ts:441-458",
+        "src/plugin.ts:704-706"
+      ],
+      "fix": "Pre-validate all shards, insert atomically, roll back on failure; support per-shard globs.",
+      "source": "workflow M6",
+      "verified": true
+    },
+    {
+      "id": "ISS-M20",
+      "severity": "major",
+      "area": "quota",
+      "title": "Quota-paused workers are never retried or woken",
+      "user_sees": "A 429 silently stops the worker; mentions do nothing; status shows paused but no recovery hint.",
+      "location": [
+        "src/plugin.ts:275-277",
+        "src/plugin.ts:1287-1293",
+        "src/db.ts:536-547"
+      ],
+      "fix": "Retry with backoff after the window, add resume/retry, or wake on next mention with a fresh attempt.",
+      "source": "workflow M7",
+      "verified": true
+    },
+    {
+      "id": "ISS-M21",
+      "severity": "major",
+      "area": "diagnostics",
+      "title": "Wake/prompt failures are swallowed",
+      "user_sees": "post_message returns ok but the worker never responds; status hides last_error.",
+      "location": [
+        "src/plugin.ts:278-282",
+        "src/plugin.ts:236-242",
+        "src/plugin.ts:604-619"
+      ],
+      "fix": "Return wake failures in post_message and include last_error in status/read_board status.",
+      "source": "workflow M8",
+      "verified": true
+    },
+    {
+      "id": "ISS-M22",
+      "severity": "major",
+      "area": "workflow",
+      "title": "/swarm injects JSON.stringify(prompt)",
+      "user_sees": "The user request arrives quoted/escaped with \\n and attachments as JSON, not real files.",
+      "location": [
+        "src/plugin.ts:1056"
+      ],
+      "fix": "Use invocation.prompt.text and forward files/agents/skills.",
+      "source": "workflow M9",
+      "verified": true
+    },
+    {
+      "id": "ISS-M23",
+      "severity": "major",
+      "area": "locks",
+      "title": "No lock-release action",
+      "user_sees": "Finished worker globs stay claimed; another worker is refused; only kill releases (and deletes its workspace).",
+      "location": [
+        "src/plugin.ts:541-543",
+        "src/plugin.ts:818-831",
+        "src/db.ts:663-669"
+      ],
+      "fix": "Add swarm{action:'release',globs} and auto-release on [done]/complete.",
+      "source": "workflow M11",
+      "verified": true
+    },
+    {
+      "id": "ISS-M24",
+      "severity": "major",
+      "area": "lifecycle",
+      "title": "Tools disagree after completion; add silently starts a new swarm",
+      "user_sees": "status/read_board show the completed swarm, post_message/swarm_wait reject, add creates a new swarm.",
+      "location": [
+        "src/plugin.ts:592-596",
+        "src/plugin.ts:917-919",
+        "src/plugin.ts:623-624"
+      ],
+      "fix": "Unify on active membership; return swarm:null/completed error; require explicit new/title.",
+      "source": "workflow M12",
+      "verified": true
+    },
+    {
+      "id": "ISS-M25",
+      "severity": "major",
+      "area": "multi-swarm",
+      "title": "Two active swarms allowed; board binds to active[0]",
+      "user_sees": "Second chat's swarm is invisible or the board shows the older one; monitor handles both.",
+      "location": [
+        "src/db.ts:293-297",
+        "src/board-server.ts:179-180",
+        "src/plugin.ts:509-520"
+      ],
+      "fix": "One active swarm per workspace, or explicit swarmId scoping everywhere.",
+      "source": "workflow M13",
+      "verified": true
+    },
+    {
+      "id": "ISS-M26",
+      "severity": "major",
+      "area": "monitor",
+      "title": "Stall monitor suppressed by one working member; stops after 3 nudges",
+      "user_sees": "One long-running worker hides a stalled coordinator; after 3 unanswered nudges monitoring goes silent.",
+      "location": [
+        "src/monitor.ts:28-46"
+      ],
+      "fix": "Evaluate members independently; reset nudge counter on a time window.",
+      "source": "workflow M16",
+      "verified": true
+    },
+    {
+      "id": "ISS-M27",
+      "severity": "major",
+      "area": "board",
+      "title": "Killed/completed sessions point at deleted worktrees",
+      "user_sees": "Clicking a dead member opens a session whose cwd is gone; file tools fail with ENOENT.",
+      "location": [
+        "src/plugin.ts:765-779",
+        "src/plugin.ts:833-852",
+        "src/board-server.ts:186"
+      ],
+      "fix": "Archive/remove child sessions on kill, or keep worktrees until acknowledged; mark dead sessions non-clickable.",
+      "source": "workflow M17",
+      "verified": true
+    },
+    {
+      "id": "ISS-M28",
+      "severity": "major",
+      "area": "sandbox",
+      "title": "sandbox-test-repo is misconfigured and not a Git repo",
+      "user_sees": "Opening the sandbox loads no plugin; share/branch target the parent repo.",
+      "location": [
+        "sandbox-test-repo/.opencode/opencode.jsonc:4",
+        "sandbox-test-repo/"
+      ],
+      "fix": "Use ../../tools/swarm-runtime (or a package) and git init the sandbox.",
+      "source": "onboarding B3+M8",
+      "verified": true
+    },
+    {
+      "id": "ISS-M29",
+      "severity": "major",
+      "area": "board",
+      "title": "Board server failure is silent",
+      "user_sees": "Port conflict or startup failure leaves open_board empty with only a console warning.",
+      "location": [
+        "src/plugin.ts:485-501"
+      ],
+      "fix": "Surface a visible warning/toast and a retry action.",
+      "source": "workflow m5 / onboarding M10",
+      "verified": true
+    }
+  ],
+  "minors": [
+    {
+      "id": "ISS-m1",
+      "title": "CSP blocks Google Fonts",
+      "location": [
+        "assets/swarm_board/index.html:14",
+        "src/board-server.ts:40-48"
+      ],
+      "fix": "Set media=all from JS or self-host fonts."
+    },
+    {
+      "id": "ISS-m2",
+      "title": "Raw tab always empty",
+      "location": [
+        "assets/swarm_board/app.js:1886",
+        "src/board-server.ts"
+      ],
+      "fix": "Send raw:{members,board,view} or remove tab."
+    },
+    {
+      "id": "ISS-m3",
+      "title": "Standalone member click is a no-op",
+      "location": [
+        "src/board-server.ts:150-157",
+        "assets/swarm_board/app.js:280-292"
+      ],
+      "fix": "Define toggleConversation only when embedded; toast a hint otherwise."
+    },
+    {
+      "id": "ISS-m4",
+      "title": "postMessage uses '*' and checks origin only",
+      "location": [
+        "src/board-server.ts:154",
+        "src/gui.tsx:127-139"
+      ],
+      "fix": "Verify event.source and use the app origin."
+    },
+    {
+      "id": "ISS-m5",
+      "title": "Empty-state copy wrong in embedded GUI",
+      "location": [
+        "assets/swarm_board/app.js:346-353"
+      ],
+      "fix": "Propagate conversationId/embedded flag and adjust copy."
+    },
+    {
+      "id": "ISS-m6",
+      "title": "Killed members counted/visible as live",
+      "location": [
+        "src/board-server.ts:228-251",
+        "assets/swarm_board/app.js:463,736"
+      ],
+      "fix": "Add killed flag or filter server-side."
+    },
+    {
+      "id": "ISS-m7",
+      "title": "Poll errors show 'Reconnecting' forever",
+      "location": [
+        "assets/swarm_board/app.js:364-396"
+      ],
+      "fix": "Surface status/error and retry; distinguish server errors."
+    },
+    {
+      "id": "ISS-m8",
+      "title": "Every poll recomputes graph+catalog before etag",
+      "location": [
+        "src/board-server.ts:188-276"
+      ],
+      "fix": "Cheap etag first or cache per head."
+    },
+    {
+      "id": "ISS-m9",
+      "title": "Phantom @mentions from package paths",
+      "location": [
+        "src/mentions.ts:31"
+      ],
+      "fix": "Require a member boundary or resolve against roster."
+    },
+    {
+      "id": "ISS-m10",
+      "title": "Members rows are mouse-only",
+      "location": [
+        "assets/swarm_board/hive.js"
+      ],
+      "fix": "role=listitem/button, tabindex, Enter/Space, accessible name."
+    },
+    {
+      "id": "ISS-m11",
+      "title": "Legacy Antigravity sidecar assets shipped and served",
+      "location": [
+        "assets/swarm_board/main.mjs:19",
+        "assets/swarm_board/sidecar.json"
+      ],
+      "fix": "Label legacy or remove; main.mjs imports sidecar_sdk not in deps."
+    },
+    {
+      "id": "ISS-m12",
+      "title": "opencode plugin list has no health status",
+      "location": [
+        "environment"
+      ],
+      "fix": "Document /api/plugin health check or add a status command."
+    },
+    {
+      "id": "ISS-m13",
+      "title": "PowerShell prints red tsc banner on success",
+      "location": [
+        "package.json:12"
+      ],
+      "fix": "Ignore/document or wrap output."
+    },
+    {
+      "id": "ISS-m14",
+      "title": "No LICENSE",
+      "location": [
+        "repo root"
+      ],
+      "fix": "Add a license."
+    },
+    {
+      "id": "ISS-m15",
+      "title": "Audit line references stale after fixes",
+      "location": [
+        "docs/issues/2026-11-22-swarm-runtime-audit.md"
+      ],
+      "fix": "Cite symbols or refresh line numbers."
+    },
+    {
+      "id": "ISS-m16",
+      "title": "Worker prompt says it may spawn helpers, policy denies it",
+      "location": [
+        "src/prompts.ts:55",
+        "src/plugin.ts:626-628"
+      ],
+      "fix": "Remove the line or allow owner-scoped helpers."
+    },
+    {
+      "id": "ISS-m17",
+      "title": "[done] substring can mark the author done",
+      "location": [
+        "src/plugin.ts:891"
+      ],
+      "fix": "Only honor a leading [done] or mark_done=true."
+    },
+    {
+      "id": "ISS-m18",
+      "title": "/swarm-models overclaims manual assignment",
+      "location": [
+        "src/plugin.ts:1066-1080"
+      ],
+      "fix": "Print role defaults and default model, or fix copy."
+    },
+    {
+      "id": "ISS-m19",
+      "title": "Windows raw git errors on repo with no commits",
+      "location": [
+        "src/workspace.ts:55,66-67"
+      ],
+      "fix": "Detect empty repo and return a clear message."
+    },
+    {
+      "id": "ISS-m20",
+      "title": "localhost may fail on IPv6-first Windows",
+      "location": [
+        "src/board-server.ts:92-100"
+      ],
+      "fix": "Listen on localhost or normalize URLs to 127.0.0.1."
+    }
+  ]
+}

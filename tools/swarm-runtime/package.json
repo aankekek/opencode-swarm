@@ -6,12 +6,14 @@
   "exports": {
     ".": "./index.ts",
     "./server": "./index.ts",
+    "./rpc": "./src/rpc.ts",
     "./gui-experimental": "./dist/gui-experimental.cjs"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "build:gui": "vite build"
+    "build:gui": "vite build",
+    "dev:gui": "vite build --watch"
   },
   "dependencies": {
     "@opencode/plugin": "2.3.2"

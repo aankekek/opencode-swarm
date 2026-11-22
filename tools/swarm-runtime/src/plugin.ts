@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { startBoardServer, type BoardServerHandle } from "./board-server.js";
-import { SWARM_RPC_DEF } from "./rpc.js";
+import { SWARM_RPC_DEF, type SwarmChangedEvent } from "./rpc.js";
 import { openSqliteDatabase, SwarmBoardDB } from "./db.js";
 import { checkPendingWakePosts, parseMentionsFromText, resolveWakeTargets } from "./mentions.js";
 import { formatModelSpec, listAvailableModels, parseModelSpec, resolveAndValidateModel } from "./models.js";
@@ -190,6 +190,19 @@ export const swarmRuntimePlugin = Plugin.define({
       return { swarmId: created.swarm.id, coordinator: created.coordinator };
     }
 
+    type RpcReg = {
+      dispose?: () => Promise<void> | void;
+      events?: { emit?: (event: string, payload: unknown) => void };
+    };
+    let rpcReg: RpcReg | undefined;
+    const emitSwarmChanged = (event: SwarmChangedEvent) => {
+      try {
+        rpcReg?.events?.emit?.("changed", event);
+      } catch {
+        // Ignore if host runtime does not expose events.emit
+      }
+    };
+
     async function wakeMember(member: MemberRow, triggerPost: BoardPostRow) {
       // If member is parked on swarm_wait in-process, resolve its waiter directly
       const waiter = waiters.get(member.id);
@@ -242,7 +255,13 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     }
 
-    async function postToBoard(swarmId: string, authorName: string, channel: string, text: string): Promise<BoardPostRow> {
+    async function postToBoard(
+      swarmId: string,
+      authorName: string,
+      channel: string,
+      text: string,
+      excludeMemberIds?: Set<string>,
+    ): Promise<BoardPostRow> {
       const ch = db.getChannel(swarmId, channel);
       if (!ch) throw new Error(`Unknown channel "#${channel}".`);
       if (ch.archived) throw new Error(`Channel "#${channel}" is archived.`);
@@ -268,6 +287,12 @@ export const swarmRuntimePlugin = Plugin.define({
         channelMentions: parsed.channelMentions,
         isAll: parsed.isAll,
         body: text,
+      });
+      emitSwarmChanged({
+        swarmId,
+        reason: "board_post",
+        seq: post.swarm_seq,
+        handle: authorName,
       });
 
       const targets = resolveWakeTargets(db, swarmId, authorName, channel, parsed);
@@ -321,6 +346,11 @@ export const swarmRuntimePlugin = Plugin.define({
         },
       });
       db.setMemberModel(target.id, resolved);
+      emitSwarmChanged({
+        swarmId: target.swarm_id,
+        reason: "member_model_changed",
+        handle: target.name,
+      });
 
       return {
         name: target.name,
@@ -458,7 +488,7 @@ export const swarmRuntimePlugin = Plugin.define({
       }
 
       const primaryChannel = channels[0] ?? "main";
-      await postToBoard(args.swarmId, args.caller.name, primaryChannel, `@${cleanName} ${args.brief}`);
+      await postToBoard(args.swarmId, args.caller.name, primaryChannel, `@${cleanName} ${args.brief}`, new Set([member.id]));
 
       const openingPrompt = buildMemberOpeningPrompt({
         swarmId: args.swarmId,
@@ -503,8 +533,13 @@ export const swarmRuntimePlugin = Plugin.define({
 
     let rpcCleanup: (() => Promise<void> | void) | undefined;
     try {
-      const rpcReg = await (ctx as unknown as {
-        rpc?: { register?: (def: unknown, handlers: Record<string, () => Promise<unknown>>) => Promise<{ dispose?: () => Promise<void> | void } | void> };
+      rpcReg = await (ctx as unknown as {
+        rpc?: {
+          register?: (
+            def: unknown,
+            handlers: Record<string, (args?: Record<string, unknown>) => Promise<unknown>>,
+          ) => Promise<RpcReg | void>;
+        };
       }).rpc?.register?.(SWARM_RPC_DEF, {
         getBoardInfo: async () => {
           const active = db.getActiveSwarms()[0];
@@ -518,9 +553,152 @@ export const swarmRuntimePlugin = Plugin.define({
             activeCount: members.length,
           };
         },
-      });
+        getSwarmSnapshot: async (args?: Record<string, unknown>) => {
+          const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
+          const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
+          let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
+          if (!swarm && sessionIdArg) {
+            const member = db.getActiveMemberBySession(sessionIdArg);
+            if (member) {
+              swarm = db.getSwarm(member.swarm_id);
+            }
+          }
+          if (!swarm && !swarmIdArg) {
+            swarm = db.getActiveSwarms()[0];
+          }
+          if (!swarm) {
+            return {
+              swarm: null,
+              boardUrl: boardServer?.url ?? "",
+              head: 0,
+              members: [],
+              board_posts: [],
+              file_locks: [],
+            };
+          }
+          const rawLocks = db.listLocks(swarm.id);
+          const globsByMember = new Map<string, string[]>();
+          for (const l of rawLocks) {
+            const arr = globsByMember.get(l.owner_member_id) ?? [];
+            arr.push(l.glob_pattern);
+            globsByMember.set(l.owner_member_id, arr);
+          }
+          const members = db.listMembers(swarm.id, true).map((m) => ({
+            id: m.id,
+            handle: m.name,
+            name: m.name,
+            generation: m.generation,
+            role: m.role,
+            model: m.model_provider && m.model_id ? `${m.model_provider}/${m.model_id}` : "",
+            variant: m.model_variant ?? null,
+            state: m.state,
+            paused_quota: Boolean(m.paused_quota),
+            track_status: m.track_status,
+            session_id: m.session_id ?? null,
+            owned_globs: globsByMember.get(m.id) ?? [],
+            workspace_mode: m.workspace_mode,
+            last_active_at: m.last_active_at ?? null,
+            activity: m.activity ?? null,
+          }));
+          const board_posts = db.getPostsPage(swarm.id, 0, 500, "*").posts.map((p) => ({
+            seq: p.swarm_seq,
+            channel: p.channel,
+            author: p.author_name,
+            mentions: JSON.parse(p.mentions_json || "[]") as string[],
+            channel_mentions: JSON.parse(p.channel_mentions_json || "[]") as string[],
+            is_all: Boolean(p.is_all),
+            body: p.body,
+            created_at: p.created_at,
+          }));
+          const latest = db.getLatestPost(swarm.id);
+          const file_locks = rawLocks.map((l) => ({
+            id: l.id,
+            glob_pattern: l.glob_pattern,
+            owner_handle: l.owner_name,
+            owner_member_id: l.owner_member_id,
+            claimed_at: l.claimed_at,
+          }));
+          return {
+            swarm: {
+              id: swarm.id,
+              title: swarm.title,
+              objective: swarm.objective ?? null,
+              status: swarm.status,
+              created_at: swarm.created_at,
+              updated_at: swarm.updated_at,
+            },
+            boardUrl: boardServer?.url ?? "",
+            head: latest?.swarm_seq ?? 0,
+            members,
+            board_posts,
+            file_locks,
+          };
+        },
+        listSwarms: async (args?: Record<string, unknown>) => {
+          const limit = typeof args?.limit === "number" ? args.limit : 50;
+          return { swarms: db.listSwarms(limit) };
+        },
+        completeSwarm: async (args?: Record<string, unknown>) => {
+          const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
+          const summary = typeof args?.summary === "string" ? args.summary : undefined;
+          const swarm = db.getSwarm(swarmId);
+          if (!swarm) {
+            return { ok: false, error: `Swarm '${swarmId}' not found.` };
+          }
+          db.setSwarmStatus(swarm.id, "completing");
+          const members = db.listMembers(swarm.id, false);
+          for (const m of members) {
+            try {
+              await ctx.session.interrupt({ sessionID: m.session_id });
+            } catch {
+              // Ignore
+            }
+            db.setMemberState(m.id, "killed");
+            cleanupMemberWorkspace({
+              mode: m.workspace_mode,
+              dir: m.workspace_dir,
+              branch: m.workspace_branch,
+              repoRoot: canonicalWorkspaceRoot,
+            });
+          }
+          db.releaseAllLocksForSwarm(swarm.id);
+          db.setSwarmStatus(swarm.id, "completed");
+          emitSwarmChanged({ swarmId: swarm.id, reason: "swarm_completed", summary });
+          return { ok: true };
+        },
+        killMember: async (args?: Record<string, unknown>) => {
+          const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
+          const handle = typeof args?.handle === "string" ? args.handle : "";
+          const reason = typeof args?.reason === "string" ? args.reason : undefined;
+          const swarm = db.getSwarm(swarmId);
+          if (!swarm) {
+            return { ok: false, error: `Swarm '${swarmId}' not found.` };
+          }
+          const target = db
+            .listMembers(swarm.id, false)
+            .find((m) => m.name === handle);
+          if (!target) {
+            return { ok: false, error: `Active member '${handle}' not found in swarm '${swarmId}'.` };
+          }
+          try {
+            await ctx.session.interrupt({ sessionID: target.session_id });
+          } catch {
+            // Already idle
+          }
+          db.setMemberState(target.id, "killed");
+          db.releaseLocksForMember(target.id);
+          cleanupMemberWorkspace({
+            mode: target.workspace_mode,
+            dir: target.workspace_dir,
+            branch: target.workspace_branch,
+            repoRoot: canonicalWorkspaceRoot,
+          });
+          emitSwarmChanged({ swarmId: swarm.id, reason: "member_killed", handle: target.name, summary: reason });
+          return { ok: true };
+        },
+      }) ?? undefined;
       if (rpcReg && typeof rpcReg === "object" && "dispose" in rpcReg && typeof rpcReg.dispose === "function") {
-        rpcCleanup = () => rpcReg.dispose!();
+        rpcCleanup = () => rpcReg!.dispose!();
       }
     } catch {
       // Ignore if host runtime does not expose ctx.rpc.register
@@ -769,6 +947,11 @@ export const swarmRuntimePlugin = Plugin.define({
               }
               db.setMemberState(t.id, "killed");
               db.releaseLocksForMember(t.id);
+              emitSwarmChanged({
+                swarmId: t.swarm_id,
+                reason: "member_killed",
+                handle: t.name,
+              });
               cleanupMemberWorkspace({
                 mode: t.workspace_mode,
                 dir: t.workspace_dir,
@@ -823,6 +1006,13 @@ export const swarmRuntimePlugin = Plugin.define({
             if (globs.length === 0) return toolJson({ ok: false, error: "globs array is required." });
             try {
               const res = db.claimLocksAtomic(caller.swarm_id, caller.id, caller.name, globs);
+              if (res.claimed.length > 0) {
+                emitSwarmChanged({
+                  swarmId: caller.swarm_id,
+                  reason: "lock_changed",
+                  handle: caller.name,
+                });
+              }
               if (res.conflicts.length > 0) return toolJson({ ok: false, conflicts: res.conflicts });
               return toolJson({ ok: true, claimed: res.claimed });
             } catch (err) {
@@ -853,6 +1043,10 @@ export const swarmRuntimePlugin = Plugin.define({
             db.setMemberState(caller.id, "killed");
             db.releaseAllLocksForSwarm(caller.swarm_id);
             db.setSwarmStatus(caller.swarm_id, "completed");
+            emitSwarmChanged({
+              swarmId: caller.swarm_id,
+              reason: "swarm_completed",
+            });
 
             // SEC-H7: Clear/restore coordinator session permissions
             try {
@@ -1053,7 +1247,13 @@ export const swarmRuntimePlugin = Plugin.define({
         name: "swarm",
         description: "Start a 1:1 Antigravity-style parallel swarm with manual model/variant control.",
         async execute(invocation) {
-          const text = JSON.stringify(invocation.prompt ?? "");
+          const rawPrompt = invocation.prompt as unknown;
+          const text =
+            typeof rawPrompt === "string"
+              ? rawPrompt
+              : rawPrompt && typeof rawPrompt === "object" && "text" in rawPrompt
+                ? String((rawPrompt as { text?: unknown }).text ?? "")
+                : JSON.stringify(rawPrompt ?? "");
           await ctx.session.prompt({
             sessionID: invocation.sessionID,
             text: `${COORDINATOR_PROTOCOL}\n\nUser request:\n${text}`,

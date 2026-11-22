@@ -15,6 +15,24 @@ Models and variants are **never** auto-selected. By default, workers inherit the
 3. **Swarm Board Web UI:** Open the `open_board` URL -> **Members** tab -> use the **Model** and **Variant** dropdowns to switch any waiting member live.
 4. **Config (`opencode.jsonc`):** Set `options.roleModels` (e.g. `"worker": "anthropic/claude-sonnet-4-6#high"`). A `"coordinator"` entry is applied by switching the coordinator's own session model when the swarm is first created.
 
+## Quick Start
+1. Install runtime dependencies (mandatory before loading in OpenCode):
+   ```bash
+   cd tools/swarm-runtime
+   bun install
+   bun run build:gui
+   ```
+2. Register the plugin in `.opencode/opencode.jsonc` using the OpenCode v2 `plugins` array:
+   ```jsonc
+   {
+     "plugins": [{ "package": "../tools/swarm-runtime", "options": { "overrideShellAllow": true } }]
+   }
+   ```
+3. Start a swarm with `/swarm <your task>` (or list models/variants with `/swarm-models`).
+4. For the **OpenCode Desktop GUI** (titlebar **Swarm** pill, side-panel **Board / Members / Locks** tab, composer pill, bottom strip, and **Settings → Swarm Board**), restart OpenCode Desktop after `bun run build:gui`.
+
+> **Note:** `overrideShellAllow: true` (default in `.opencode/opencode.jsonc`) allows shell commands without repeated prompts while keeping `edit` and `external_directory` fenced.
+
 ## Development & Tests
 ```bash
 cd tools/swarm-runtime

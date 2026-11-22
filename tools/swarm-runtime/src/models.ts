@@ -164,10 +164,15 @@ export async function resolveAndValidateModel(
         `Model "${resolved.providerID}/${resolved.id}" not found. Call swarm{action:"models"} to list available models.`,
       );
     }
-    if (resolved.variant && match.variants.length > 0 && !match.variants.includes(resolved.variant)) {
-      throw new Error(
-        `Variant "${resolved.variant}" is not supported by ${match.spec}. Available variants: ${match.variants.join(", ")}.`,
-      );
+    if (resolved.variant) {
+      if (match.variants.length === 0) {
+        throw new Error(`Model "${match.spec}" does not support variants.`);
+      }
+      if (!match.variants.includes(resolved.variant)) {
+        throw new Error(
+          `Variant "${resolved.variant}" is not supported by ${match.spec}. Available variants: ${match.variants.join(", ")}.`,
+        );
+      }
     }
   }
 

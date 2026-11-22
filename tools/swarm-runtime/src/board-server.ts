@@ -175,9 +175,15 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
 
       if (req.method === "GET" && reqUrl.pathname === "/api/swarm") {
         const swarmIdParam = reqUrl.searchParams.get("swarmId");
+        const conversationIdParam = reqUrl.searchParams.get("conversationId");
         const etagParam = reqUrl.searchParams.get("etag");
         const activeSwarms = deps.db.getActiveSwarms();
-        const swarm = swarmIdParam ? deps.db.getSwarm(swarmIdParam) : activeSwarms[0];
+        const convMember = conversationIdParam ? deps.db.getLatestMemberBySession(conversationIdParam) : undefined;
+        const swarm = swarmIdParam
+          ? deps.db.getSwarm(swarmIdParam)
+          : convMember
+            ? deps.db.getSwarm(convMember.swarm_id)
+            : activeSwarms[0] ?? deps.db.listSwarms(1)[0];
 
         if (!swarm) {
           return sendJson(res, 200, { swarm: null });
@@ -218,13 +224,19 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
         const planJson = readJsonFileSafe(join(swarmDir, "plan.json"));
 
         const payload = {
+          conversationId: conversationIdParam ?? "",
+          member: convMember?.name ?? null,
           swarm: swarm.id,
           id: swarm.id,
           title: swarm.title,
           objective: swarm.objective,
           status: swarm.status,
           head,
-          channels,
+          graphTab: true,
+          rawTab: true,
+          builtinOverview: true,
+          systemAttention: [],
+          channels: channels.filter((c) => c.name !== "main"),
           members: members.map((m) => ({
             id: m.id,
             name: m.name,
@@ -232,6 +244,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
             addedBy: m.added_by,
             status: m.state,
             state: m.state,
+            killed: m.state === "killed",
             conversation_id: m.session_id,
             local: true,
             pausedQuota: m.paused_quota === 1,
