@@ -156,6 +156,7 @@ export const swarmRuntimePlugin = Plugin.define({
         workspaceDir: canonicalWorkspaceRoot,
         model,
       });
+      emitSwarmChanged({ swarmId: created.swarm.id, reason: "swarm_created", summary: title });
       const changedModel =
         !!model &&
         !!sessionModel &&
@@ -505,6 +506,7 @@ export const swarmRuntimePlugin = Plugin.define({
 
       const primaryChannel = channels[0] ?? "main";
       await postToBoard(args.swarmId, args.caller.name, primaryChannel, `@${cleanName} ${args.brief}`, new Set([member.id]));
+      emitSwarmChanged({ swarmId: args.swarmId, reason: "member_spawned", handle: cleanName });
 
       const openingPrompt = buildMemberOpeningPrompt({
         swarmId: args.swarmId,
@@ -799,6 +801,7 @@ export const swarmRuntimePlugin = Plugin.define({
               return toolJson({ ok: false, error: "Only @coordinator may change the swarm title." });
             }
             db.setSwarmTitle(swarmId, title);
+            emitSwarmChanged({ swarmId, reason: "swarm_updated", summary: title });
             return toolJson({ ok: true, swarm_id: swarmId, title, open_board: boardServer?.url ?? "" });
           }
 
@@ -1028,6 +1031,9 @@ export const swarmRuntimePlugin = Plugin.define({
               });
               killed.push(t.name);
             }
+            if (killed.length > 0) {
+              emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_killed" });
+            }
             return toolJson({ ok: true, killed });
           }
 
@@ -1111,6 +1117,7 @@ export const swarmRuntimePlugin = Plugin.define({
             db.setMemberState(caller.id, "killed");
             db.releaseAllLocksForSwarm(caller.swarm_id);
             db.setSwarmStatus(caller.swarm_id, "completed");
+            emitSwarmChanged({ swarmId: caller.swarm_id, reason: "swarm_completed" });
             emitSwarmChanged({
               swarmId: caller.swarm_id,
               reason: "swarm_completed",
@@ -1329,6 +1336,12 @@ export const swarmRuntimePlugin = Plugin.define({
               : rawPrompt && typeof rawPrompt === "object" && "text" in rawPrompt
                 ? String((rawPrompt as { text?: unknown }).text ?? "")
                 : JSON.stringify(rawPrompt ?? "");
+          const cleanTitle = text.trim().split(/\r?\n/)[0]?.slice(0, 64) || "Swarm";
+          try {
+            await ensureCoordinator(invocation.sessionID, cleanTitle);
+          } catch {
+            // Ignore if session already belongs to an active swarm or cannot initialize yet
+          }
           await ctx.session.prompt({
             sessionID: invocation.sessionID,
             text: `${COORDINATOR_PROTOCOL}\n\nUser request:\n${text}`,

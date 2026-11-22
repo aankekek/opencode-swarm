@@ -111,7 +111,10 @@ export default Plugin.define({
 
     const [swarms, setSwarms] = createSignal<SwarmSummary[]>([]);
     const [selectedSwarmId, setSelectedSwarmId] = createSignal<string | null>(null);
+    const [userPinnedSwarmId, setUserPinnedSwarmId] = createSignal<string | null>(null);
     const [snapshot, setSnapshot] = createSignal<SwarmSnapshot | null>(null);
+    const [boardUrl, setBoardUrl] = createSignal<string>("");
+    const [mountedDirectory, setMountedDirectory] = createSignal<string | undefined>(undefined);
     const [rpcStatus, setRpcStatus] = createSignal<SwarmRpcStatus>({ state: "connected" });
 
     let lastPausedQuota = false;
@@ -119,11 +122,17 @@ export default Plugin.define({
     let lastStalled = false;
     let lastCompletedId = "";
     let lastMonitorPostId: string | number | null = null;
+    let refreshSeq = 0;
+    let lastKnownRunningId: string | null = null;
+    let lastDir: string | undefined;
 
+    const currentDirectory = () => ctx.sessions.current()?.location?.directory ?? mountedDirectory();
     const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
     const getCallOptions = () => {
-      const location = ctx.sessions.current()?.location;
-      return location ? { location } : {};
+      const loc =
+        ctx.sessions.current()?.location ?? (mountedDirectory() ? { directory: mountedDirectory()! } : undefined);
+      const signal = AbortSignal.timeout(8000);
+      return loc ? { location: loc, signal } : { signal };
     };
 
     const maybeNotify = (snap: SwarmSnapshot) => {
@@ -176,22 +185,49 @@ export default Plugin.define({
       }
     };
 
-    const refresh = async () => {
+    const refresh = async (forceFollowActive = false) => {
+      const mySeq = ++refreshSeq;
       try {
         const rpc = getRpc();
         const opts = getCallOptions();
         const rawList = await rpc.listSwarms({}, opts);
+        if (mySeq !== refreshSeq) return;
         const list = normalizeSwarmList(rawList);
         setSwarms(list);
-        if (list.length > 0 && !selectedSwarmId()) {
-          setSelectedSwarmId(list[0].id);
+
+        const running = list.find((s) => s.status === "running" || s.status === "completing") ?? null;
+        if (running && (running.id !== lastKnownRunningId || forceFollowActive)) {
+          lastKnownRunningId = running.id;
+          setUserPinnedSwarmId(null);
+          setSelectedSwarmId(running.id);
+        } else if (!running) {
+          lastKnownRunningId = null;
         }
+
+        const currentSelected = selectedSwarmId();
+        if (currentSelected && !list.some((s) => s.id === currentSelected)) {
+          setSelectedSwarmId(null);
+          setUserPinnedSwarmId(null);
+        }
+        if (!selectedSwarmId() || (running && !userPinnedSwarmId() && selectedSwarmId() !== running.id)) {
+          setSelectedSwarmId(running?.id ?? list[0]?.id ?? null);
+        }
+
         const targetId = selectedSwarmId();
         const sessionId = ctx.sessions.current()?.id;
         const rawSnap = await rpc.getSwarmSnapshot(
           targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {},
           opts
         );
+        if (mySeq !== refreshSeq) return;
+        if (
+          rawSnap &&
+          typeof rawSnap === "object" &&
+          typeof (rawSnap as { boardUrl?: unknown }).boardUrl === "string" &&
+          (rawSnap as { boardUrl: string }).boardUrl
+        ) {
+          setBoardUrl((rawSnap as { boardUrl: string }).boardUrl);
+        }
         const snap = normalizeSwarmSnapshot(rawSnap);
         setSnapshot(snap);
         setRpcStatus({ state: "connected" });
@@ -199,6 +235,7 @@ export default Plugin.define({
           maybeNotify(snap);
         }
       } catch (err) {
+        if (mySeq !== refreshSeq) return;
         const isUnavailable =
           typeof err === "object" && err !== null && "type" in err && (err as { type?: string }).type === "rpc.unavailable";
         setRpcStatus(
@@ -210,30 +247,68 @@ export default Plugin.define({
     };
 
     createEffect(() => {
-      selectedSwarmId();
+      const dir = currentDirectory();
       void ctx.sessions.current()?.id;
+      void ctx.sessions.current()?.pending;
+      selectedSwarmId();
+      if (dir !== lastDir) {
+        lastDir = dir;
+        lastKnownRunningId = null;
+        setUserPinnedSwarmId(null);
+        setSelectedSwarmId(null);
+        setSnapshot(null);
+        setSwarms([]);
+      }
       void refresh();
     });
 
-    const eventAbort = new AbortController();
-    try {
-      getRpc().events.on(
-        "changed",
-        () => {
+    let subscribedClient: unknown = null;
+    let eventAbort: AbortController | undefined;
+    const ensureEventSubscription = () => {
+      if (subscribedClient === ctx.client) return;
+      eventAbort?.abort();
+      subscribedClient = ctx.client;
+      eventAbort = new AbortController();
+      try {
+        ctx.client.rpc(SWARM_RPC_DEF).events.on(
+          "changed",
+          () => {
+            void refresh();
+          },
+          { signal: eventAbort.signal }
+        );
+      } catch {
+        // Ignore if event subscription is unavailable at startup
+      }
+    };
+    ensureEventSubscription();
+
+    createEffect(() => {
+      try {
+        const serversApi = ctx.servers;
+        if (!serversApi) return;
+        const builtin = serversApi
+          .list()
+          .map((id) => serversApi.get(id))
+          .find((s) => s?.builtin);
+        const data = builtin?.data as { on?: (event: string, fn: () => void) => () => void } | undefined;
+        if (!data || typeof data.on !== "function") return;
+        const unsub = data.on("session.tool.success", () => {
           void refresh();
-        },
-        { signal: eventAbort.signal }
-      );
-    } catch {
-      // Ignore if event subscription is unavailable at startup
-    }
+        });
+        onCleanup(() => unsub());
+      } catch {
+        // Ignore if builtin server data events are unavailable
+      }
+    });
 
     const pollTimer = setInterval(() => {
+      ensureEventSubscription();
       void refresh();
-    }, 4000);
+    }, 2000);
 
     onCleanup(() => {
-      eventAbort.abort();
+      eventAbort?.abort();
       clearInterval(pollTimer);
     });
 
@@ -323,7 +398,10 @@ export default Plugin.define({
 
     safeAdd(ComposerPill, {
       id: "swarm-composer-pill",
-      show() {
+      show(input) {
+        if (input.session.directory) {
+          setMountedDirectory(input.session.directory);
+        }
         if (!settings().composerPill) return undefined;
         const snap = snapshot();
         if (!snap) return undefined;
@@ -433,16 +511,23 @@ export default Plugin.define({
         return settings().sidebarShow ? [swarmTab] : [];
       },
       render(props) {
+        if (props.session.directory) {
+          setMountedDirectory(props.session.directory);
+        }
         return (
           <Suspense fallback={<div style={{ padding: "12px" }}>Loading Swarm Board...</div>}>
             <SwarmPanelView
               ctx={ctx}
               snapshot={snapshot}
+              boardUrl={boardUrl}
               swarms={swarms}
               selectedSwarmId={selectedSwarmId}
               sessionId={() => props.session.id}
-              onSelectSwarm={(id) => setSelectedSwarmId(id)}
-              onRefresh={() => void refresh()}
+              onSelectSwarm={(id) => {
+                setUserPinnedSwarmId(id);
+                setSelectedSwarmId(id);
+              }}
+              onRefresh={() => void refresh(true)}
               onOpenSettings={openSwarmSettings}
               rpcError={() => {
                 const s = rpcStatus();

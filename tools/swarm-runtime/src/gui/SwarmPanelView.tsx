@@ -5,6 +5,7 @@ import type { SwarmGuiContext, SwarmSnapshot, SwarmSummary } from "./types.js";
 export interface SwarmPanelViewProps {
   ctx: SwarmGuiContext;
   snapshot: () => SwarmSnapshot | null;
+  boardUrl?: () => string;
   swarms: () => SwarmSummary[];
   selectedSwarmId: () => string | null;
   sessionId?: () => string | undefined;
@@ -21,7 +22,7 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
   const [reloadNonce, setReloadNonce] = createSignal(0);
   let iframeRef: HTMLIFrameElement | undefined;
 
-  const boardBaseUrl = createMemo(() => props.snapshot()?.boardUrl ?? "");
+  const boardBaseUrl = createMemo(() => props.snapshot()?.boardUrl || props.boardUrl?.() || "");
   const activeSwarmId = createMemo(() => props.selectedSwarmId() ?? props.snapshot()?.swarmId ?? "");
 
   const iframeSrc = createMemo(() => {

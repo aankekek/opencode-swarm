@@ -45,7 +45,31 @@ function createHarness(repoDir: string, dbPath: string) {
       },
       async hook() {},
     },
-    command: { async transform() {} },
+    command: {
+      async transform(fn: Function) {
+        const cmds = new Map<string, any>();
+        fn({
+          add(def: any) {
+            cmds.set(def.name, def);
+          },
+        });
+        (ctx as any)._cmds = cmds;
+      },
+    },
+    rpc: {
+      async register(_def: unknown, _handlers: unknown) {
+        const events: Array<{ event: string; payload: any }> = [];
+        (ctx as any)._rpcEvents = events;
+        return {
+          events: {
+            async emit(event: string, payload: any) {
+              events.push({ event, payload });
+            },
+          },
+          dispose() {},
+        };
+      },
+    },
     permission: { async hook() {} },
     session: {
       async create(input: any) {
@@ -157,6 +181,45 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       expect(mainRead.posts.some((p: any) => p.text === "main msg for w2")).toBe(true);
       const devRead = JSON.parse((await readTool.execute({ channel: "dev" }, { sessionID: w2Sess })).content);
       expect(devRead.posts.some((p: any) => p.text === "dev msg for w2")).toBe(true);
+
+      // Verify RPC events were emitted for lifecycle transitions
+      const rpcEvents = (ctx as any)._rpcEvents as Array<{ event: string; payload: any }>;
+      expect(rpcEvents.some((e) => e.payload?.reason === "swarm_created")).toBe(true);
+      expect(rpcEvents.some((e) => e.payload?.reason === "member_spawned")).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("/swarm slash command immediately initializes swarm and emits swarm_created", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-cmd-init-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmCmd = (ctx as any)._cmds.get("swarm");
+      expect(swarmCmd).toBeDefined();
+      await swarmCmd.execute({
+        sessionID: "sess_coord",
+        prompt: { text: "Build feature X\nwith tests" },
+        delivery: "queue",
+      });
+
+      const swarmTool = tools.get("swarm");
+      const statusRes = JSON.parse((await swarmTool.execute({ action: "status" }, { sessionID: "sess_coord" })).content);
+      expect(statusRes.ok).toBe(true);
+      expect(statusRes.swarm?.status).toBe("running");
+      expect(statusRes.swarm?.title).toBe("Build feature X");
+
+      const rpcEvents = (ctx as any)._rpcEvents as Array<{ event: string; payload: any }>;
+      expect(rpcEvents.some((e) => e.payload?.reason === "swarm_created")).toBe(true);
     } finally {
       await cleanup();
       try {

@@ -55,6 +55,7 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("swarm-gui-iframe");
     expect(code).toContain("swarm:theme");
     expect(code).toContain("swarm:open_session");
+    expect(code).toContain("session.tool.success");
     expect(code).not.toContain("Pixel-Bee Web View");
 
     // Zero bundled host modules
