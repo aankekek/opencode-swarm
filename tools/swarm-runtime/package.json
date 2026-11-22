@@ -5,17 +5,23 @@
   "type": "module",
   "exports": {
     ".": "./index.ts",
-    "./server": "./index.ts"
+    "./server": "./index.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "build:gui": "vite build"
   },
   "dependencies": {
     "@opencode/plugin": "2.3.2"
   },
   "devDependencies": {
+    "@opencode/theme": "2.3.2",
     "@types/node": "^22.0.0",
-    "typescript": "^5.8.0"
+    "solid-js": "1.9.17",
+    "typescript": "^5.8.0",
+    "vite": "7.3.7",
+    "vite-plugin-solid": "2.11.10"
   }
 }

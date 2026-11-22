@@ -63,6 +63,29 @@ export function formatModelSpec(ref?: Partial<ModelSelection> | null): string {
   return ref.variant ? `${ref.providerID}/${ref.id}#${ref.variant}` : `${ref.providerID}/${ref.id}`;
 }
 
+/**
+ * The host returns `{ location, data: [...] }` in v2; older builds returned a bare
+ * array or `{ models: [...] }`. Normalize all of them.
+ */
+function extractModelArray(raw: unknown): any[] {
+  if (Array.isArray(raw)) return raw;
+  const r = raw as any;
+  if (!r || typeof r !== "object") return [];
+  if (Array.isArray(r.data)) return r.data;
+  if (Array.isArray(r.models)) return r.models;
+  if (r.models && Array.isArray(r.models.data)) return r.models.data;
+  return [];
+}
+
+function extractDefaultModel(raw: unknown): { providerID: string; modelID: string } | undefined {
+  const r = raw as any;
+  if (!r || typeof r !== "object") return undefined;
+  const candidate = r.data && typeof r.data === "object" ? r.data : r;
+  const providerID = candidate.providerID;
+  const modelID = candidate.modelID ?? candidate.id;
+  return providerID && modelID ? { providerID, modelID } : undefined;
+}
+
 export async function listAvailableModels(
   ctx: Pick<Context, "model">,
   opts?: { all?: boolean },
@@ -75,30 +98,25 @@ export async function listAvailableModels(
     ctx.model.default().catch(() => undefined),
   ]);
 
-  const rawModels: any[] = Array.isArray(rawList)
-    ? rawList
-    : ((rawList as unknown as { models?: any[] })?.models ?? []);
+  const rawModels = extractModelArray(rawList);
 
   const filtered = opts?.all
     ? rawModels
-    : rawModels.filter((m: any) => m.enabled && m.status !== "deprecated");
-  const models: AvailableModelEntry[] = filtered.map((m: any) => ({
-    spec: `${m.providerID}/${m.id}`,
-    providerID: m.providerID,
-    id: m.id,
-    enabled: m.enabled,
-    status: m.status,
-    variants: (m.variants ?? []).map((v: any) => v.id),
-    limit: m.limit ? { context: m.limit.context, output: m.limit.output } : undefined,
-  }));
+    : rawModels.filter((m: any) => m.enabled !== false && m.status !== "deprecated");
+  const models: AvailableModelEntry[] = filtered.map((m: any) => {
+    const id = m.modelID ?? m.id;
+    return {
+      spec: `${m.providerID}/${id}`,
+      providerID: m.providerID,
+      id,
+      enabled: m.enabled,
+      status: m.status,
+      variants: (m.variants ?? []).map((v: any) => v.id),
+      limit: m.limit ? { context: m.limit.context, output: m.limit.output } : undefined,
+    };
+  });
 
-  const d = rawDefault as unknown as { providerID?: string; modelID?: string; id?: string } | undefined;
-  const defaultModel =
-    d?.providerID && (d.modelID || d.id)
-      ? { providerID: d.providerID, modelID: (d.modelID ?? d.id)! }
-      : undefined;
-
-  return { defaultModel, models };
+  return { defaultModel: extractDefaultModel(rawDefault), models };
 }
 
 /**

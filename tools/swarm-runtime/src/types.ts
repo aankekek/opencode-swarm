@@ -24,7 +24,7 @@ export interface PluginOptions {
   workerShellPolicy?: ShellPolicy;
   /** "ask" lets you approve read-only test commands; "deny" enforces strict read-only. */
   verifierShellPolicy?: ShellPolicy;
-  /** Optional manual default "provider/model#variant" per role. */
+  /** Optional manual default "provider/model#variant" per role (coordinator included; applied on swarm creation). */
   roleModels?: Partial<Record<MemberRole, string>>;
   /** Start realtime Swarm Board HTTP UI (default: true). */
   boardServer?: boolean;

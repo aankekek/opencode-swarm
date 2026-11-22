@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
 
-function createMockContext(repoDir: string, dbPath: string) {
+function createMockContext(repoDir: string, dbPath: string, extraOptions: Record<string, unknown> = {}) {
   const tools = new Map<string, any>();
   const hooks: Record<string, Function> = {};
   const sessions = new Map<string, any>();
@@ -25,6 +25,7 @@ function createMockContext(repoDir: string, dbPath: string) {
       workerShellPolicy: "ask",
       boardServer: true,
       boardPort: 0,
+      ...extraOptions,
     },
     model: {
       async list() {
@@ -208,6 +209,61 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       // 7. Complete swarm & clean up worktree
       const compRes = JSON.parse((await swarmTool.execute({ action: "complete" }, { sessionID: "sess_coord" })).content);
       expect(compRes.ok).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("roleModels.coordinator switches the coordinator session when the swarm is created", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-coord-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, switchModelCalls } = createMockContext(repoDir, dbPath, {
+      roleModels: { coordinator: "openai/gpt-5.4#medium" },
+    });
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      const titleRes = JSON.parse(
+        (await swarmTool.execute({ action: "title", title: "Tuned" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(titleRes.ok).toBe(true);
+      expect(switchModelCalls).toHaveLength(1);
+      expect(switchModelCalls[0].model).toEqual({
+        providerID: "openai",
+        id: "gpt-5.4",
+        variant: "medium",
+      });
+
+      const status = JSON.parse(
+        (await swarmTool.execute({ action: "status" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(status.members[0].name).toBe("coordinator");
+      expect(status.members[0].model).toBe("openai/gpt-5.4#medium");
+
+      // Invalid coordinator spec must not brick swarm creation.
+      const bad = createMockContext(join(root, "repo2"), join(root, "data2", "board.db"), {
+        roleModels: { coordinator: "openai/does-not-exist" },
+      });
+      execFileSync("git", ["init", join(root, "repo2")], { stdio: "ignore" });
+      const cleanupBad = (await swarmRuntimePlugin.setup(bad.ctx)) as () => Promise<void>;
+      try {
+        const badTool = bad.tools.get("swarm");
+        const badRes = JSON.parse(
+          (await badTool.execute({ action: "title", title: "Fallback" }, { sessionID: "sess_coord" })).content,
+        );
+        expect(badRes.ok).toBe(true);
+        expect(bad.switchModelCalls).toHaveLength(0);
+      } finally {
+        await cleanupBad();
+      }
     } finally {
       await cleanup();
       try {

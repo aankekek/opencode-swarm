@@ -13,7 +13,7 @@ Models and variants are **never** auto-selected. By default, workers inherit the
 1. **Tool:** `swarm{action:"models"}` to list available models + `variants[]`, then `swarm{action:"add", model:"provider/model#variant"}` or `swarm{action:"model", name:"parser", model:"provider/model", variant:"high"}`.
 2. **Slash Command:** `/swarm-models` to inspect available models and variants.
 3. **Swarm Board Web UI:** Open the `open_board` URL -> **Members** tab -> use the **Model** and **Variant** dropdowns to switch any waiting member live.
-4. **Config (`opencode.jsonc`):** Set `options.roleModels` (e.g. `"worker": "anthropic/claude-sonnet-4-6#high"`).
+4. **Config (`opencode.jsonc`):** Set `options.roleModels` (e.g. `"worker": "anthropic/claude-sonnet-4-6#high"`). A `"coordinator"` entry is applied by switching the coordinator's own session model when the swarm is first created.
 
 ## Development & Tests
 ```bash

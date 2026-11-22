@@ -116,7 +116,20 @@ export const swarmRuntimePlugin = Plugin.define({
       if (existing) {
         return { swarmId: existing.swarm_id, coordinator: existing };
       }
-      const model = await getSessionModel(sessionId);
+      const sessionModel = await getSessionModel(sessionId);
+      // Manual coordinator default (e.g. a durable $60+ tier). The coordinator is the
+      // caller's own session, so apply the pick by switching that session's model.
+      let model = sessionModel;
+      const coordinatorSpec = roleModels.coordinator;
+      if (coordinatorSpec) {
+        try {
+          model = await resolveAndValidateModel(ctx, coordinatorSpec, undefined, sessionModel);
+        } catch (err) {
+          console.warn(
+            `[swarm-runtime] Ignoring invalid roleModels.coordinator "${coordinatorSpec}": ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       const created = db.createSwarmWithCoordinator({
         title,
         objective: title,
@@ -124,6 +137,28 @@ export const swarmRuntimePlugin = Plugin.define({
         workspaceDir: canonicalWorkspaceRoot,
         model,
       });
+      const changedModel =
+        !!model &&
+        !!sessionModel &&
+        (sessionModel.providerID !== model.providerID ||
+          sessionModel.id !== model.id ||
+          (sessionModel.variant ?? undefined) !== (model.variant ?? undefined));
+      if (model && (changedModel || !sessionModel)) {
+        try {
+          await ctx.session.switchModel({
+            sessionID: sessionId,
+            model: {
+              providerID: model.providerID,
+              id: model.id,
+              ...(model.variant ? { variant: model.variant } : {}),
+            },
+          });
+        } catch (err) {
+          console.warn(
+            `[swarm-runtime] Could not switch coordinator model to ${model.providerID}/${model.id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       // Apply coordinator permissions to current session
       try {
         await ctx.session.update({

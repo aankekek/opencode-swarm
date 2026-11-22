@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseModelSpec, resolveAndValidateModel } from "../src/models.js";
+import { parseModelSpec, listAvailableModels, resolveAndValidateModel } from "../src/models.js";
 import {
   globsPotentiallyOverlap,
   pathMatchesGlob,
@@ -53,25 +53,27 @@ describe("security & path/glob validation", () => {
 });
 
 describe("manual model & variant selection", () => {
+  const modelEntries = [
+    {
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-6",
+      enabled: true,
+      status: "active",
+      variants: [{ id: "low" }, { id: "high" }],
+    },
+    {
+      providerID: "openai",
+      modelID: "gpt-5.4",
+      enabled: true,
+      status: "active",
+      variants: [{ id: "medium" }, { id: "high" }],
+    },
+  ];
+
   const mockCtx = {
     model: {
       async list() {
-        return [
-          {
-            providerID: "anthropic",
-            id: "claude-sonnet-4-6",
-            enabled: true,
-            status: "active",
-            variants: [{ id: "low" }, { id: "high" }],
-          },
-          {
-            providerID: "openai",
-            id: "gpt-5.4",
-            enabled: true,
-            status: "active",
-            variants: [{ id: "medium" }, { id: "high" }],
-          },
-        ];
+        return modelEntries;
       },
       async default() {
         return { providerID: "anthropic", modelID: "claude-sonnet-4-6" };
@@ -103,5 +105,39 @@ describe("manual model & variant selection", () => {
     });
     await expect(resolveAndValidateModel(mockCtx, "anthropic/unknown", undefined, fallback)).rejects.toThrow();
     await expect(resolveAndValidateModel(mockCtx, "anthropic/claude-sonnet-4-6#ultra", undefined, fallback)).rejects.toThrow();
+  });
+
+  test("listAvailableModels reads the host { location, data } envelope", async () => {
+    const envelopeCtx = {
+      model: {
+        async list() {
+          return {
+            location: { directory: "/repo" },
+            data: [
+              ...modelEntries,
+              { providerID: "x", modelID: "old", enabled: true, status: "deprecated", variants: [] },
+              { providerID: "x", modelID: "off", enabled: false, status: "active", variants: [] },
+            ],
+          };
+        },
+        async default() {
+          return { location: { directory: "/repo" }, data: modelEntries[0] };
+        },
+      },
+    } as any;
+
+    const catalog = await listAvailableModels(envelopeCtx, { all: false });
+    expect(catalog.models.map((m) => m.spec)).toEqual([
+      "anthropic/claude-sonnet-4-6",
+      "openai/gpt-5.4",
+    ]);
+    expect(catalog.models[0].variants).toEqual(["low", "high"]);
+    expect(catalog.defaultModel).toEqual({
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-6",
+    });
+
+    const all = await listAvailableModels(envelopeCtx, { all: true });
+    expect(all.models).toHaveLength(4);
   });
 });
