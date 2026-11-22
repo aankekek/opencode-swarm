@@ -111,10 +111,41 @@ const PRELOAD_JS = `(() => {
     const isLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
     root.dataset.theme = isLight ? 'light' : 'dark';
     root.style.colorScheme = isLight ? 'light' : 'dark';
+    if (isLight) {
+      root.style.setProperty('--background', '#fafafa');
+      root.style.setProperty('--foreground', '#18181b');
+      root.style.setProperty('--card', '#ffffff');
+      root.style.setProperty('--border', '#e4e4e7');
+      root.style.setProperty('--primary', '#2563eb');
+      root.style.setProperty('--muted-foreground', '#71717a');
+    } else {
+      root.style.setProperty('--background', '#0f1115');
+      root.style.setProperty('--foreground', '#e6e8ec');
+      root.style.setProperty('--card', '#161a22');
+      root.style.setProperty('--border', '#252b36');
+      root.style.setProperty('--primary', '#3b82f6');
+      root.style.setProperty('--muted-foreground', '#8b93a1');
+    }
   };
   applyTheme();
   if (window.matchMedia) {
     window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyTheme);
+  }
+  const token = new URLSearchParams(window.location.search).get('token');
+  if (token && typeof window.fetch === 'function') {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (input, init = {}) => {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      if (url.startsWith('/api/') || url.startsWith(window.location.origin + '/api/')) {
+        const headers = new Headers(init.headers || (typeof input !== 'string' && input.headers) || undefined);
+        if (!headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + token);
+        if (init.method && init.method.toUpperCase() === 'POST' && !headers.has('Content-Type')) {
+          headers.set('Content-Type', 'application/json');
+        }
+        return origFetch(input, { ...init, headers });
+      }
+      return origFetch(input, init);
+    };
   }
   window.sidecar = window.sidecar || {
     ui: {

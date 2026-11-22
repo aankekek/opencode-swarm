@@ -4,29 +4,56 @@ import { SWARM_RPC_DEF, type SwarmBoardInfo } from "./rpc.js";
 
 export default Plugin.define({
   setup(ctx) {
-    const openSwarmPanel = () => {
+    const [wantedSessions, setWantedSessions] = createSignal<Set<string>>(new Set());
+
+    const markWanted = (sessionKey: string, wanted: boolean) => {
+      setWantedSessions((prev) => {
+        const next = new Set(prev);
+        if (wanted) next.add(sessionKey);
+        else next.delete(sessionKey);
+        return next;
+      });
+    };
+
+    const openSwarmPanel = (toggleIfVisible = false) => {
       const session = ctx.sessions.current();
       if (!session) {
         ctx.toast.show({ title: "Open a session first to view the Swarm Board." });
         return;
       }
-      ctx.layout.open(`${ctx.id}:swarm`, session);
+      const key = `${ctx.id}:swarm`;
+      if (toggleIfVisible && ctx.layout.state(key, session) === "visible") {
+        ctx.layout.hide(key, session);
+        return;
+      }
+      markWanted(session.key, true);
+      ctx.layout.open(key, session);
     };
 
-    ctx.add(TitlebarItem, () => ({
-      id: "swarm-open",
-      label: "Swarm",
-      title: "Open Swarm Board",
-      run: openSwarmPanel,
-    }));
+    ctx.add(TitlebarItem, () => {
+      const session = ctx.sessions.current();
+      const pressed = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
+      return {
+        id: "swarm-open",
+        label: "Swarm",
+        title: "Open Swarm Board",
+        pressed,
+        run: () => openSwarmPanel(true),
+      };
+    });
 
-    ctx.add(MenuItem, () => ({
-      menu: "session.panel" as const,
-      id: "open-swarm",
-      title: "Swarm",
-      description: "Open live Swarm Board",
-      run: openSwarmPanel,
-    }));
+    ctx.add(MenuItem, () => {
+      const session = ctx.sessions.current();
+      const opened = session ? ctx.layout.state(`${ctx.id}:swarm`, session) !== "closed" : false;
+      return {
+        menu: "session.panel" as const,
+        id: "open-swarm",
+        title: "Swarm",
+        description: "Open live Swarm Board",
+        opened,
+        run: () => openSwarmPanel(false),
+      };
+    });
 
     ctx.add(Command, () => ({
       id: "open",
@@ -36,7 +63,7 @@ export default Plugin.define({
       section: "navigation" as const,
       bind: "mod+shift+s",
       slash: { name: "swarm-board" },
-      run: openSwarmPanel,
+      run: () => openSwarmPanel(false),
     }));
 
     const swarmTab: PanelTab = {
@@ -49,8 +76,20 @@ export default Plugin.define({
       id: "board",
       region: "side" as const,
       width: 480,
-      list({ open }) {
-        return open.includes("swarm") ? [swarmTab] : [];
+      mobile: {
+        title: "Swarm",
+        order: 50,
+        kind: "tab" as const,
+        cached: true,
+      },
+      list({ session, open }) {
+        if (open.includes("swarm") || wantedSessions().has(session.key)) {
+          return [swarmTab];
+        }
+        return [];
+      },
+      close({ session }) {
+        markWanted(session.key, false);
       },
       render(props) {
         const [info, setInfo] = createSignal<SwarmBoardInfo | null>(null);
@@ -61,12 +100,18 @@ export default Plugin.define({
           setLoading(true);
           setError(null);
           try {
-            const res = (await (props.session.server.client.rpc.call as (args: unknown) => Promise<unknown>)({
-              id: SWARM_RPC_DEF.id,
+            const res = await props.session.server.client.rpc.call({
+              rpcID: SWARM_RPC_DEF.id,
               method: "getBoardInfo",
+              location: props.session.location,
               input: {},
-            })) as SwarmBoardInfo;
-            setInfo(res);
+            });
+            const payload = (
+              res && typeof res === "object" && "output" in res
+                ? (res as { output?: SwarmBoardInfo }).output
+                : res
+            ) as SwarmBoardInfo | undefined;
+            setInfo(payload ?? null);
           } catch (err) {
             setError(err instanceof Error ? err.message : String(err));
           } finally {
