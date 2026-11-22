@@ -24,8 +24,12 @@ export function startStallMonitor(
         const members = db.listMembers(swarm.id, false);
         if (members.length === 0) continue;
 
-        // If any member is actively working, it is not a stall
-        if (members.some((m) => m.state === "working")) continue;
+        // If any member is actively working, check if it's stuck beyond stallTimeoutMs
+        const workingMembers = members.filter((m) => m.state === "working");
+        if (workingMembers.length > 0) {
+          const stuck = workingMembers.some((m) => now - m.last_active_at >= config.stallTimeoutMs);
+          if (!stuck) continue;
+        }
 
         const latestPost = db.getLatestPost(swarm.id);
         const latestSeq = latestPost?.swarm_seq ?? 0;

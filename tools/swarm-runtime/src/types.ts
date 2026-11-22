@@ -20,6 +20,10 @@ export interface PluginOptions {
   stallTimeoutMs?: number;
   monitorIntervalMs?: number;
   allowCoordinatorEdits?: boolean;
+  /** Always allow shell execution when resolved shell policy is "allow" (default: true). */
+  overrideShellAllow?: boolean;
+  /** Coordinator shell policy ("allow" when overrideShellAllow: true, "ask" otherwise). */
+  coordinatorShellPolicy?: ShellPolicy;
   /** "deny" or "ask" recommended unless workers run in isolated Git worktrees. */
   workerShellPolicy?: ShellPolicy;
   /** "ask" lets you approve read-only test commands; "deny" enforces strict read-only. */
@@ -43,6 +47,7 @@ export interface SwarmRow {
   title: string;
   objective: string;
   status: SwarmStatus;
+  owner_pid?: number | null;
   created_at: number;
   updated_at: number;
   last_monitor_nudge_seq: number;

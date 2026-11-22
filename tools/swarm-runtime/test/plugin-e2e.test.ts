@@ -209,6 +209,143 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       // 7. Complete swarm & clean up worktree
       const compRes = JSON.parse((await swarmTool.execute({ action: "complete" }, { sessionID: "sess_coord" })).content);
       expect(compRes.ok).toBe(true);
+
+      // Verify coordinator session permissions were restored (SEC-H7)
+      expect(ctx.session.update).toBeDefined();
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("role allowlist (SEC-C1) and control action gates (SEC-H6) in plugin tools", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-gates-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, hooks } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const readTool = tools.get("read_board");
+
+      // 1. Spawning coordinator role is forbidden (SEC-C1)
+      const coordSpawnRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "impostor", role: "coordinator", brief: "evil" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(coordSpawnRes.ok).toBe(false);
+      expect(coordSpawnRes.error).toContain("Invalid role");
+
+      // 2. Spawning unknown role is forbidden (SEC-C1)
+      const rootSpawnRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "bad", role: "root", brief: "evil" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(rootSpawnRes.ok).toBe(false);
+      expect(rootSpawnRes.error).toContain("Invalid role");
+
+      // 3. Spawn a valid verifier
+      const verifierRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "my-verifier", role: "verifier", brief: "verify only" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(verifierRes.ok).toBe(true);
+      const verifierSession = verifierRes.spawned[0].session_id;
+
+      // 4. Verifier cannot spawn workers (SEC-H6)
+      const verifierAddRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "helper", brief: "work" },
+          { sessionID: verifierSession },
+        )).content,
+      );
+      expect(verifierAddRes.ok).toBe(false);
+      expect(verifierAddRes.error).toContain("Only @coordinator");
+
+      // 5. Verifier cannot claim locks (SEC-H6)
+      const verifierClaimRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "claim", globs: ["src/**/*.ts"] },
+          { sessionID: verifierSession },
+        )).content,
+      );
+      expect(verifierClaimRes.ok).toBe(false);
+      expect(verifierClaimRes.error).toContain("cannot claim locks");
+
+      // 6. Verifier cannot rename swarm (SEC-H6)
+      const verifierTitleRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "title", title: "Hacked" },
+          { sessionID: verifierSession },
+        )).content,
+      );
+      expect(verifierTitleRes.ok).toBe(false);
+      expect(verifierTitleRes.error).toContain("Only @coordinator");
+
+      // 7. Channel isolation on read_board & post_message (RT-M2 / Medium 6)
+      // Coordinator creates channel 'dev'
+      const chanCreateRes = JSON.parse(
+        (await swarmTool.execute({ action: "channel", op: "create", channel: "dev" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(chanCreateRes.ok).toBe(true);
+
+      // Verifier (not subscribed to 'dev') cannot post to 'dev'
+      const postDevRes = JSON.parse(
+        (await postTool.execute({ text: "hello dev", channel: "dev" }, { sessionID: verifierSession })).content,
+      );
+      expect(postDevRes.ok).toBe(false);
+      expect(postDevRes.error).toContain("not subscribed");
+
+      // Verifier cannot read channel 'dev'
+      const readDevRes = JSON.parse(
+        (await readTool.execute({ channel: "dev" }, { sessionID: verifierSession })).content,
+      );
+      expect(readDevRes.ok).toBe(false);
+      expect(readDevRes.error).toContain("not subscribed");
+
+      // Verifier reading with channel: "*" only gets posts from subscribed channels (no dev leak)
+      await postTool.execute({ text: "coord in main", channel: "main" }, { sessionID: "sess_coord" });
+      await postTool.execute({ text: "coord in dev", channel: "dev" }, { sessionID: "sess_coord" });
+
+      const readAllRes = JSON.parse(
+        (await readTool.execute({ channel: "*", since: 0 }, { sessionID: verifierSession })).content,
+      );
+      expect(readAllRes.posts.some((p: any) => p.text === "coord in dev")).toBe(false);
+      expect(readAllRes.posts.some((p: any) => p.text === "coord in main")).toBe(true);
+
+      // 8. Shell always-allow override (Requirement 2)
+      // For coordinator with coordinatorShellPolicy: "allow" and overrideShellAllow: true
+      const shellPermEvent: any = {
+        sessionID: "sess_coord",
+        action: "shell",
+        resources: [],
+        effect: "ask",
+      };
+      await hooks["permission.evaluate"](shellPermEvent);
+      expect(shellPermEvent.effect).toBe("allow");
+
+      // Normal edit by coordinator is still denied when allowCoordinatorEdits !== true
+      const editPermEvent: any = {
+        sessionID: "sess_coord",
+        action: "edit",
+        resources: ["src/file.ts"],
+        effect: "allow",
+      };
+      await hooks["permission.evaluate"](editPermEvent);
+      expect(editPermEvent.effect).toBe("deny");
     } finally {
       await cleanup();
       try {

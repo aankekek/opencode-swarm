@@ -6,6 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { startBoardServer, type BoardServerHandle } from "./board-server.js";
+import { SWARM_RPC_DEF } from "./rpc.js";
 import { openSqliteDatabase, SwarmBoardDB } from "./db.js";
 import { checkPendingWakePosts, parseMentionsFromText, resolveWakeTargets } from "./mentions.js";
 import { formatModelSpec, listAvailableModels, parseModelSpec, resolveAndValidateModel } from "./models.js";
@@ -78,18 +79,36 @@ export const swarmRuntimePlugin = Plugin.define({
       console.warn(
         `[swarm-runtime] Reconciled ${reconciled.length} stale swarm(s) on startup (${reconciled.map((s) => s.id).join(", ")}); all locks released.`,
       );
+      // SEC-H7: Clear/restore session permissions for the current session if it was part of reconciled swarms
+      try {
+        const anyCtx = ctx as unknown as { sessionID?: string };
+        if (anyCtx.sessionID) {
+          await ctx.session.update({
+            sessionID: anyCtx.sessionID,
+            permissions: [],
+          });
+        }
+      } catch {
+        // Ignore if unsupported or sessionID not present
+      }
     }
 
     // Bounded call-ID cache bridging tool.execute.before -> permission.evaluate
     const pendingCalls = new Map<string, CachedCall>();
+    const MAX_PENDING_CALLS = 500;
     function cachePendingCall(callId: string, entry: CachedCall) {
-      pendingCalls.set(callId, entry);
-      if (pendingCalls.size > 500) {
+      if (pendingCalls.size >= MAX_PENDING_CALLS) {
         const cutoff = Date.now() - 10 * 60_000;
         for (const [k, v] of pendingCalls) {
           if (v.ts < cutoff) pendingCalls.delete(k);
         }
+        // If still at capacity, drop the oldest entry
+        if (pendingCalls.size >= MAX_PENDING_CALLS) {
+          const firstKey = pendingCalls.keys().next().value;
+          if (firstKey) pendingCalls.delete(firstKey);
+        }
       }
+      pendingCalls.set(callId, entry);
     }
 
     // Waiter resolvers for swarm_wait(since, mentions_only)
@@ -182,9 +201,15 @@ export const swarmRuntimePlugin = Plugin.define({
           waiter.resolve(matched);
           return;
         }
+        // If the waiter did not match the trigger post (e.g. unsubscribed channel or not mentioned),
+        // do not fall through to session.prompt to avoid double-waking a parked member.
+        return;
       }
 
-      const { posts } = db.getPostsPage(member.swarm_id, member.last_read_seq, 25, "*");
+      // Medium 7: channel-isolated fallback feed (no cross-channel leaks)
+      const isGlobal = member.role === "coordinator" || member.role === "monitor" || member.role === "narrator";
+      const memberChannels = isGlobal ? "*" : db.getMemberChannels(member.swarm_id, member.id);
+      const { posts } = db.getPostsPage(member.swarm_id, member.last_read_seq, 25, memberChannels);
       const delivered = posts.length > 0 ? posts : [triggerPost];
       const lastSeq = delivered[delivered.length - 1].swarm_seq;
 
@@ -202,17 +227,37 @@ export const swarmRuntimePlugin = Plugin.define({
 
       db.setMemberState(member.id, "working");
       db.advanceReadCursor(member.id, lastSeq);
-      await ctx.session.prompt({
-        sessionID: member.session_id,
-        text: promptText,
-        delivery: "queue",
-      });
+      try {
+        await ctx.session.prompt({
+          sessionID: member.session_id,
+          text: promptText,
+          delivery: "queue",
+        });
+      } catch (err) {
+        // Reset state to waiting on prompt failure so member is not stuck in working
+        db.setMemberState(member.id, "waiting", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
     }
 
     async function postToBoard(swarmId: string, authorName: string, channel: string, text: string): Promise<BoardPostRow> {
       const ch = db.getChannel(swarmId, channel);
       if (!ch) throw new Error(`Unknown channel "#${channel}".`);
       if (ch.archived) throw new Error(`Channel "#${channel}" is archived.`);
+
+      // Medium 6: Channel isolation check on postToBoard
+      const author = db.getMemberByName(swarmId, authorName);
+      if (author) {
+        const isGlobal = author.role === "coordinator" || author.role === "monitor" || author.role === "narrator";
+        if (!isGlobal && channel !== "main") {
+          const authorChannels = db.getMemberChannels(swarmId, author.id);
+          if (!authorChannels.includes(channel)) {
+            throw new Error(`Member @${authorName} is not subscribed to channel "#${channel}".`);
+          }
+        }
+      }
 
       const parsed = parseMentionsFromText(text);
       const post = db.addPost({
@@ -226,8 +271,10 @@ export const swarmRuntimePlugin = Plugin.define({
       });
 
       const targets = resolveWakeTargets(db, swarmId, authorName, channel, parsed);
+      const isMonitorAuthor = authorName === "monitor";
       for (const target of targets) {
-        if (target.paused_quota === 1) continue;
+        // RT-M5: Monitor nudges bypass paused_quota so stall breaks can proceed
+        if (target.paused_quota === 1 && !isMonitorAuthor) continue;
         try {
           await wakeMember(target, post);
         } catch {
@@ -334,12 +381,18 @@ export const swarmRuntimePlugin = Plugin.define({
 
       let childSessionId: string;
       if (args.fork) {
-        const forkTarget =
-          args.fork === "coordinator"
-            ? db.getMemberByName(args.swarmId, "coordinator")
-            : db.getMemberByName(args.swarmId, args.fork);
+        if (args.caller.role !== "coordinator") {
+          throw new Error(`Only @coordinator may fork conversations.`);
+        }
+        if (args.fork === "coordinator") {
+          throw new Error(`Forking coordinator context is not permitted.`);
+        }
+        const forkTarget = db.getMemberByName(args.swarmId, args.fork);
         if (!forkTarget) {
           throw new Error(`Fork target "${args.fork}" not found in swarm "${args.swarmId}".`);
+        }
+        if (forkTarget.role === "coordinator") {
+          throw new Error(`Forking coordinator context is not permitted.`);
         }
         const forkFn = (ctx.session as unknown as { fork?: (args: { sessionID: string }) => Promise<{ id: string }> }).fork;
         if (typeof forkFn !== "function") {
@@ -448,6 +501,31 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     }
 
+    let rpcCleanup: (() => Promise<void> | void) | undefined;
+    try {
+      const rpcReg = await (ctx as unknown as {
+        rpc?: { register?: (def: unknown, handlers: Record<string, () => Promise<unknown>>) => Promise<{ dispose?: () => Promise<void> | void } | void> };
+      }).rpc?.register?.(SWARM_RPC_DEF, {
+        getBoardInfo: async () => {
+          const active = db.getActiveSwarms()[0];
+          const members = active ? db.listMembers(active.id, false) : [];
+          return {
+            url: boardServer?.url ?? "",
+            token: boardServer?.token ?? "",
+            swarmId: active?.id ?? "",
+            title: active?.title ?? "Swarm Board",
+            status: active?.status ?? "idle",
+            activeCount: members.length,
+          };
+        },
+      });
+      if (rpcReg && typeof rpcReg === "object" && "dispose" in rpcReg && typeof rpcReg.dispose === "function") {
+        rpcCleanup = () => rpcReg.dispose!();
+      }
+    } catch {
+      // Ignore if host runtime does not expose ctx.rpc.register
+    }
+
     // -----------------------------------------------------------------------
     // 1. Register 4 Antigravity Core Tools: swarm, post_message, read_board, swarm_wait
     // -----------------------------------------------------------------------
@@ -502,7 +580,11 @@ export const swarmRuntimePlugin = Plugin.define({
           if (action === "title") {
             const title = String(input.title ?? "").trim();
             if (!title) return toolJson({ ok: false, error: "title is required." });
-            const { swarmId } = await ensureCoordinator(toolCtx.sessionID, title);
+            const { swarmId, coordinator } = await ensureCoordinator(toolCtx.sessionID, title);
+            const caller = db.getActiveMemberBySession(toolCtx.sessionID) ?? coordinator;
+            if (caller.role !== "coordinator") {
+              return toolJson({ ok: false, error: "Only @coordinator may change the swarm title." });
+            }
             db.setSwarmTitle(swarmId, title);
             return toolJson({ ok: true, swarm_id: swarmId, title, open_board: boardServer?.url ?? "" });
           }
@@ -541,13 +623,24 @@ export const swarmRuntimePlugin = Plugin.define({
           if (action === "add") {
             const { swarmId, coordinator } = await ensureCoordinator(toolCtx.sessionID);
             const caller = db.getActiveMemberBySession(toolCtx.sessionID) ?? coordinator;
+            if (caller.role !== "coordinator") {
+              return toolJson({ ok: false, error: "Only @coordinator may spawn swarm members." });
+            }
             const baseName = String(input.name ?? "").trim();
             const brief = String(input.brief ?? "").trim();
             if (!baseName || !brief) {
               return toolJson({ ok: false, error: "name and brief are required for action:'add'." });
             }
 
-            const role = (input.role as MemberRole | undefined) ?? "worker";
+            const rawRole = input.role !== undefined ? String(input.role).trim().toLowerCase() : "worker";
+            const allowedRoles: MemberRole[] = ["worker", "verifier", "monitor", "narrator"];
+            if (!allowedRoles.includes(rawRole as MemberRole)) {
+              return toolJson({
+                ok: false,
+                error: `Invalid role "${rawRole}". Allowed roles for spawn: ${allowedRoles.join(", ")}. Coordinator cannot be spawned.`,
+              });
+            }
+            const role = rawRole as MemberRole;
             const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
             const n = typeof input.n === "number" && input.n > 1 ? Math.floor(input.n) : undefined;
             const count = tasks ? tasks.length : n;
@@ -643,14 +736,20 @@ export const swarmRuntimePlugin = Plugin.define({
           }
 
           if (action === "kill") {
-            const targetName = String(input.name ?? "").trim();
-            if (!targetName) return toolJson({ ok: false, error: "name is required for action:'kill'." });
+            const rawTargetName = String(input.name ?? "").trim();
+            if (!rawTargetName) return toolJson({ ok: false, error: "name is required for action:'kill'." });
+            let targetName: string;
+            try {
+              targetName = normalizeHandle(rawTargetName);
+            } catch {
+              targetName = rawTargetName.toLowerCase();
+            }
             const allMembers = db.listMembers(caller.swarm_id, false);
             const targets = allMembers.filter(
               (m) => m.name === targetName || m.group_prefix === targetName,
             );
             if (targets.length === 0) {
-              return toolJson({ ok: false, error: `No live member found for "${targetName}".` });
+              return toolJson({ ok: false, error: `No live member found for "${rawTargetName}".` });
             }
             const killed: string[] = [];
             for (const t of targets) {
@@ -689,10 +788,16 @@ export const swarmRuntimePlugin = Plugin.define({
                 return toolJson({ ok: true, channels: db.listChannels(caller.swarm_id) });
               }
               if (op === "create") {
+                if (caller.role !== "coordinator") {
+                  return toolJson({ ok: false, error: "Only @coordinator may create channels." });
+                }
                 const created = db.createChannel(caller.swarm_id, chName, String(input.topic ?? ""), caller.name);
                 return toolJson({ ok: true, channel: created });
               }
               if (op === "archive") {
+                if (caller.role !== "coordinator") {
+                  return toolJson({ ok: false, error: "Only @coordinator may archive channels." });
+                }
                 db.archiveChannel(caller.swarm_id, chName);
                 return toolJson({ ok: true, archived: chName });
               }
@@ -711,6 +816,9 @@ export const swarmRuntimePlugin = Plugin.define({
           }
 
           if (action === "claim") {
+            if (caller.role !== "coordinator" && caller.role !== "worker") {
+              return toolJson({ ok: false, error: `Member @${caller.name} with role '${caller.role}' cannot claim locks.` });
+            }
             const globs = Array.isArray(input.globs) ? (input.globs as string[]) : [];
             if (globs.length === 0) return toolJson({ ok: false, error: "globs array is required." });
             try {
@@ -745,6 +853,17 @@ export const swarmRuntimePlugin = Plugin.define({
             db.setMemberState(caller.id, "killed");
             db.releaseAllLocksForSwarm(caller.swarm_id);
             db.setSwarmStatus(caller.swarm_id, "completed");
+
+            // SEC-H7: Clear/restore coordinator session permissions
+            try {
+              await ctx.session.update({
+                sessionID: caller.session_id,
+                permissions: [],
+              });
+            } catch {
+              // Ignore if session update unsupported
+            }
+
             return toolJson({ ok: true, swarm_id: caller.swarm_id, status: "completed" });
           }
 
@@ -820,14 +939,25 @@ export const swarmRuntimePlugin = Plugin.define({
           const since = typeof input.since === "number" ? input.since : caller.last_read_seq;
           const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
           const isGlobal = caller.role === "coordinator" || caller.role === "monitor" || caller.role === "narrator";
-          const filter: string[] | "*" =
-            input.channel === "*"
-              ? "*"
-              : input.channel
-                ? [normalizeHandle(input.channel)]
-                : isGlobal
-                  ? "*"
-                  : db.getMemberChannels(caller.swarm_id, caller.id);
+          const myChannels = db.getMemberChannels(caller.swarm_id, caller.id);
+
+          // Medium 6: Channel isolation on read_board
+          let filter: string[] | "*";
+          if (isGlobal) {
+            filter = input.channel === "*" || !input.channel ? "*" : [normalizeHandle(input.channel)];
+          } else {
+            if (input.channel === "*") {
+              filter = myChannels;
+            } else if (input.channel) {
+              const reqChan = normalizeHandle(input.channel);
+              if (!myChannels.includes(reqChan)) {
+                return toolJson({ ok: false, error: `Member @${caller.name} is not subscribed to channel "#${reqChan}".` });
+              }
+              filter = [reqChan];
+            } else {
+              filter = myChannels;
+            }
+          }
 
           const { posts, hasMore } = db.getPostsPage(caller.swarm_id, since, limit, filter);
           if (posts.length > 0) {
@@ -974,14 +1104,43 @@ export const swarmRuntimePlugin = Plugin.define({
         });
       }
 
-      if (!WRITE_TOOLS.has(toolName) && !SHELL_TOOLS.has(toolName)) return;
-      if (!event.sessionID) return;
       if (db.getActiveSwarms().length === 0) return;
 
-      const member = db.getMemberForActiveSwarmPolicy(event.sessionID);
-      if (!member) {
-        throw new Error(`[SWARM] Blocked '${toolName}' from unregistered session while an active swarm is running.`);
+      // SEC-M4: Fail closed without sessionID when swarms are active
+      if (!event.sessionID) {
+        if (WRITE_TOOLS.has(toolName) || SHELL_TOOLS.has(toolName)) {
+          throw new Error(`[SWARM] Blocked '${toolName}': missing sessionID while active swarm is running.`);
+        }
+        return;
       }
+
+      const member = db.getMemberForActiveSwarmPolicy(event.sessionID);
+      // SEC-M3: If session is not part of swarm, only enforce if it is attempting write or shell in the workspace
+      if (!member) {
+        return;
+      }
+
+      // SEC-H3: For read-only roles, deny write and shell tools or any unapproved tool
+      const isReadOnlyRole = member.role === "verifier" || member.role === "monitor" || member.role === "narrator";
+      const isKnownWrite = WRITE_TOOLS.has(toolName);
+      const isKnownShell = SHELL_TOOLS.has(toolName);
+
+      if (isReadOnlyRole) {
+        if (isKnownWrite || isKnownShell || toolName.includes("write") || toolName.includes("edit") || toolName.includes("exec")) {
+          const swarm = db.getSwarm(member.swarm_id);
+          if (swarm) {
+            const targets = extractTargetPaths(toolName, event.input);
+            const verdict = evaluateActionForMember(db, canonicalWorkspaceRoot, member, swarm, toolName, targets, options);
+            if (verdict.decision === "deny") {
+              throw new Error(verdict.reason ?? `[SWARM] Blocked '${toolName}' for read-only @${member.name}.`);
+            }
+          }
+        }
+        return;
+      }
+
+      if (!isKnownWrite && !isKnownShell) return;
+
       const swarm = db.getSwarm(member.swarm_id);
       if (!swarm) return;
 
@@ -1005,6 +1164,9 @@ export const swarmRuntimePlugin = Plugin.define({
       const source = event.source as { id?: string } | undefined;
       const callId = typeof source?.id === "string" ? source.id : undefined;
       const cached = callId ? pendingCalls.get(callId) : undefined;
+      if (callId && cached) {
+        pendingCalls.delete(callId);
+      }
       const sessionId = event.sessionID || cached?.sessionID;
 
       let reason: string | undefined;
@@ -1014,6 +1176,7 @@ export const swarmRuntimePlugin = Plugin.define({
       } else {
         const member = db.getMemberForActiveSwarmPolicy(sessionId);
         if (!member) {
+          // If session is unregistered, fail closed for actions within active swarms
           event.effect = tightenEffect(event.effect, "deny");
           reason = "[SWARM] Denied action from unregistered session while an active swarm is running.";
         } else {
@@ -1032,7 +1195,24 @@ export const swarmRuntimePlugin = Plugin.define({
               Array.from(targetSet),
               options,
             );
-            event.effect = tightenEffect(event.effect, verdict.decision);
+
+            // Shell override support:
+            // when action === "shell" and the member's resolved shell policy is "allow"
+            // AND overrideShellAllow === true (for live non-killed members), explicitly set event.effect = "allow",
+            // while keeping edit and external_directory strictly fenced via tightenEffect.
+            const overrideShell = options.overrideShellAllow ?? true;
+            if (
+              action === "shell" &&
+              overrideShell &&
+              verdict.decision === "allow" &&
+              member.state !== "killed" &&
+              member.state !== "stopped" &&
+              member.paused_quota !== 1
+            ) {
+              event.effect = "allow";
+            } else {
+              event.effect = tightenEffect(event.effect, verdict.decision);
+            }
             reason = verdict.reason;
           }
         }
@@ -1099,9 +1279,9 @@ export const swarmRuntimePlugin = Plugin.define({
           if (!member) continue;
 
           if (eventType === "session.execution.started") {
-            db.setMemberState(member.id, "working");
+            db.setMemberState(member.id, "working", { pausedQuota: false });
           } else if (eventType === "session.idle" || eventType === "session.execution.succeeded") {
-            db.setMemberState(member.id, "waiting", { activity: null });
+            db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
           } else if (eventType === "session.execution.interrupted") {
             db.setMemberState(member.id, "stopped", { activity: null });
           } else if (eventType === "session.execution.failed") {
@@ -1114,7 +1294,8 @@ export const swarmRuntimePlugin = Plugin.define({
           } else if (eventType === "session.step.started") {
             db.incrementMemberSteps(member.id, "Thinking...");
           } else if (eventType === "session.tool.called") {
-            db.incrementMemberSteps(member.id, `Running ${String(data.tool ?? "tool")}`, "tool");
+            const toolLabel = pendingCalls.get(String(data.id))?.tool ?? String(data.tool ?? "tool");
+            db.incrementMemberSteps(member.id, `Running ${toolLabel}`, "tool");
           } else if (eventType === "session.deleted") {
             db.setMemberState(member.id, "killed");
             db.releaseLocksForMember(member.id);
@@ -1139,6 +1320,9 @@ export const swarmRuntimePlugin = Plugin.define({
       abortController.abort();
       pendingCalls.clear();
       waiters.clear();
+      if (rpcCleanup) {
+        await rpcCleanup();
+      }
       if (boardServer) {
         await boardServer.close();
       }

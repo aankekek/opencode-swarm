@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseModelSpec, listAvailableModels, resolveAndValidateModel } from "../src/models.js";
+import { buildRolePermissions, evaluateActionForMember } from "../src/policy.js";
 import {
+  extractTargetPaths,
   globsPotentiallyOverlap,
   pathMatchesGlob,
   resolveSafeWorkspacePath,
@@ -11,6 +13,7 @@ import {
   validateAndNormalizeGlob,
   validateMemberName,
 } from "../src/security.js";
+import type { MemberRow, SwarmRow } from "../src/types.js";
 
 describe("security & path/glob validation", () => {
   test("validateMemberName enforces Antigravity rules", () => {
@@ -26,6 +29,7 @@ describe("security & path/glob validation", () => {
     const root = mkdtempSync(join(tmpdir(), "swarm-sec-"));
     try {
       expect(resolveSafeWorkspacePath(root, "src/app.ts")).toBe("src/app.ts");
+      expect(resolveSafeWorkspacePath(root, "..hidden/x.txt")).toBe("..hidden/x.txt");
       expect(() => resolveSafeWorkspacePath(root, "../outside.ts")).toThrow();
       expect(() => resolveSafeWorkspacePath(root, "\\\\server\\share\\file.ts")).toThrow();
       expect(() => resolveSafeWorkspacePath(root, ".git/config")).toThrow();
@@ -33,6 +37,25 @@ describe("security & path/glob validation", () => {
       expect(() => resolveSafeWorkspacePath(root, "node_modules/pkg/index.js")).toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSafeWorkspacePath blocks dangling symlink escapes (SEC-H4)", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-symlink-root-"));
+    const outside = mkdtempSync(join(tmpdir(), "swarm-symlink-outside-"));
+    try {
+      const linkPath = join(root, "ghost.txt");
+      const targetPath = join(outside, "non-existent-target.txt");
+      try {
+        symlinkSync(targetPath, linkPath);
+        expect(() => resolveSafeWorkspacePath(root, "ghost.txt")).toThrow(/escapes workspace root/);
+      } catch (err: any) {
+        // Skip symlink creation if Windows permissions lack SeCreateSymbolicLinkPrivilege
+        if (err.code !== "EPERM") throw err;
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 
@@ -44,11 +67,132 @@ describe("security & path/glob validation", () => {
     expect(globsPotentiallyOverlap("src/**", "src/api/*.ts")).toBe(true);
   });
 
+  test("glob ReDoS protection caps length, ** count, and rejects **/** (SEC-H5)", () => {
+    expect(() => validateAndNormalizeGlob("a/".repeat(150) + "x.ts")).toThrow(/maximum length/);
+    expect(() => validateAndNormalizeGlob("a/**/**/b")).toThrow(/Consecutive double-star/);
+    expect(() => validateAndNormalizeGlob("a/" + "b/**/".repeat(9) + "z.ts")).toThrow(/maximum permitted '\*\*'/);
+
+    // Verify segment matcher runs in <10ms for deep paths
+    const deepPath = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z.ts";
+    const start = performance.now();
+    expect(pathMatchesGlob(deepPath, "a/**/z.ts")).toBe(true);
+    expect(performance.now() - start).toBeLessThan(50);
+  });
+
+  test("extractTargetPaths extracts file, destination, to, from, and array keys (SEC-H3 / SEC-L10)", () => {
+    expect(extractTargetPaths("move", { file: "src/a.ts", destination: "src/b.ts" })).toEqual(["src/a.ts", "src/b.ts"]);
+    const copyPaths = extractTargetPaths("copy", { from: "foo.ts", to: "bar.ts" });
+    expect(copyPaths).toContain("foo.ts");
+    expect(copyPaths).toContain("bar.ts");
+    expect(extractTargetPaths("batch", { files: ["1.ts", "2.ts"] })).toEqual(["1.ts", "2.ts"]);
+  });
+
   test("tightenEffect never weakens deny or ask", () => {
     expect(tightenEffect("deny", "allow")).toBe("deny");
     expect(tightenEffect("ask", "allow")).toBe("ask");
     expect(tightenEffect("allow", "ask")).toBe("ask");
     expect(tightenEffect("ask", "deny")).toBe("deny");
+  });
+
+  test("policy enforces strict role allowlist and default deny (SEC-C1)", () => {
+    const mockDb: any = { listLocks: () => [] };
+    const swarm: SwarmRow = {
+      id: "sw_test",
+      title: "Test",
+      objective: "Test",
+      status: "running",
+      created_at: 0,
+      updated_at: 0,
+      last_monitor_nudge_seq: 0,
+      monitor_nudge_count: 0,
+    };
+    const root = "C:/fake/repo";
+
+    const attacker: MemberRow = {
+      id: "m_attacker",
+      swarm_id: "sw_test",
+      name: "attacker",
+      generation: 1,
+      session_id: "s_att",
+      role: "root" as any,
+      added_by: "coordinator",
+      group_prefix: null,
+      model_provider: null,
+      model_id: null,
+      model_variant: null,
+      workspace_mode: "inherit",
+      workspace_dir: root,
+      workspace_branch: null,
+      brief: "attack",
+      state: "working",
+      wake_mode: "mentions",
+      wait_since: 0,
+      last_read_seq: 0,
+      last_post_seq: 0,
+      last_post_time: null,
+      steps: 0,
+      activity: null,
+      activity_kind: null,
+      last_error: null,
+      paused_quota: 0,
+      track_status: "open",
+      last_active_at: Date.now(),
+    };
+
+    const res = evaluateActionForMember(mockDb, root, attacker, swarm, "shell", [], {});
+    expect(res.decision).toBe("deny");
+
+    const perms = buildRolePermissions("root" as any, {});
+    expect(perms.every((p) => p.effect === "deny")).toBe(true);
+  });
+
+  test("policy denies write_file and unknown tools for read-only roles (SEC-H3)", () => {
+    const mockDb: any = { listLocks: () => [] };
+    const swarm: SwarmRow = {
+      id: "sw_test",
+      title: "Test",
+      objective: "Test",
+      status: "running",
+      created_at: 0,
+      updated_at: 0,
+      last_monitor_nudge_seq: 0,
+      monitor_nudge_count: 0,
+    };
+    const root = "C:/fake/repo";
+
+    const verifier: MemberRow = {
+      id: "m_v",
+      swarm_id: "sw_test",
+      name: "verifier",
+      generation: 1,
+      session_id: "s_v",
+      role: "verifier",
+      added_by: "coordinator",
+      group_prefix: null,
+      model_provider: null,
+      model_id: null,
+      model_variant: null,
+      workspace_mode: "inherit",
+      workspace_dir: root,
+      workspace_branch: null,
+      brief: "verify",
+      state: "working",
+      wake_mode: "mentions",
+      wait_since: 0,
+      last_read_seq: 0,
+      last_post_seq: 0,
+      last_post_time: null,
+      steps: 0,
+      activity: null,
+      activity_kind: null,
+      last_error: null,
+      paused_quota: 0,
+      track_status: "open",
+      last_active_at: Date.now(),
+    };
+
+    expect(evaluateActionForMember(mockDb, root, verifier, swarm, "write_file", ["foo.ts"], {}).decision).toBe("deny");
+    expect(evaluateActionForMember(mockDb, root, verifier, swarm, "mcp_custom_write", ["foo.ts"], {}).decision).toBe("deny");
   });
 });
 

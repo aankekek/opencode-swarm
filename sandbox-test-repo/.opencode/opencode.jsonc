@@ -6,8 +6,9 @@
         "stallTimeoutMs": 180000,
         "monitorIntervalMs": 30000,
         "allowCoordinatorEdits": false,
-        "workerShellPolicy": "ask",
-        "verifierShellPolicy": "ask",
+        "overrideShellAllow": true,
+        "workerShellPolicy": "allow",
+        "verifierShellPolicy": "allow",
         "boardServer": true,
         // Optional manual model+variant defaults per role (never auto-picked unless set):
         // "roleModels": {

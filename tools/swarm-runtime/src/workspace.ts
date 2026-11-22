@@ -63,7 +63,7 @@ export function provisionMemberWorkspace(args: {
   if (existsSync(cloneDir)) {
     rmSync(cloneDir, { recursive: true, force: true });
   }
-  runGit(["clone", "--shared", "--no-checkout", args.repoRoot, cloneDir], args.repoRoot);
+  runGit(["clone", "--dissociate", "--no-checkout", args.repoRoot, cloneDir], args.repoRoot);
   runGit(["checkout", "-b", branch], cloneDir);
   return { mode: "branch", dir: cloneDir, branch };
 }
@@ -80,13 +80,17 @@ export function cleanupMemberWorkspace(args: {
       try {
         runGit(["worktree", "remove", "--force", args.dir], args.repoRoot);
       } catch {
-        // Fallback to directory removal + prune
+        // Fallback to directory removal
+      }
+      try {
         if (existsSync(args.dir)) rmSync(args.dir, { recursive: true, force: true });
-        try {
-          runGit(["worktree", "prune"], args.repoRoot);
-        } catch {
-          // Ignore prune errors
-        }
+      } catch {
+        // Retry/ignore locked files on Windows
+      }
+      try {
+        runGit(["worktree", "prune", "--expire", "now"], args.repoRoot);
+      } catch {
+        // Ignore prune errors
       }
       return;
     }

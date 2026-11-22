@@ -1,6 +1,6 @@
 import type { SwarmBoardDB } from "./db.js";
 import { pathMatchesGlob, resolveSafeWorkspacePath } from "./security.js";
-import type { MemberRole, MemberRow, PermissionEffect, PluginOptions, SwarmRow } from "./types.js";
+import type { MemberRole, MemberRow, PermissionEffect, PluginOptions, ShellPolicy, SwarmRow } from "./types.js";
 
 export const WRITE_TOOLS = new Set([
   "edit",
@@ -11,16 +11,24 @@ export const WRITE_TOOLS = new Set([
   "multi_edit",
   "delete",
   "delete_file",
+  "write_file",
 ]);
 
 export const SHELL_TOOLS = new Set(["shell", "bash", "cmd", "powershell", "exec", "run_command"]);
+
+export function resolveCoordinatorShellPolicy(options: PluginOptions): ShellPolicy {
+  if (options.coordinatorShellPolicy) return options.coordinatorShellPolicy;
+  const override = options.overrideShellAllow ?? true;
+  return override ? "allow" : "ask";
+}
 
 export function buildRolePermissions(
   role: MemberRole,
   options: PluginOptions,
 ): Array<{ action: string; resource: string; effect: PermissionEffect }> {
-  const workerShell = options.workerShellPolicy ?? "ask";
-  const verifierShell = options.verifierShellPolicy ?? "ask";
+  const workerShell: ShellPolicy = options.workerShellPolicy ?? "ask";
+  const verifierShell: ShellPolicy = options.verifierShellPolicy ?? "ask";
+  const coordinatorShell = resolveCoordinatorShellPolicy(options);
 
   if (role === "verifier" || role === "monitor" || role === "narrator") {
     return [
@@ -33,17 +41,26 @@ export function buildRolePermissions(
   if (role === "coordinator") {
     const perms: Array<{ action: string; resource: string; effect: PermissionEffect }> = [
       { action: "external_directory", resource: "*", effect: "deny" },
+      { action: "shell", resource: "*", effect: coordinatorShell },
     ];
-    if (!options.allowCoordinatorEdits) {
+    if (options.allowCoordinatorEdits !== true) {
       perms.push({ action: "edit", resource: "*", effect: "deny" });
     }
     return perms;
   }
 
-  // worker
+  if (role === "worker") {
+    return [
+      { action: "external_directory", resource: "*", effect: "deny" },
+      { action: "shell", resource: "*", effect: workerShell },
+    ];
+  }
+
+  // Strict default deny for any unknown role
   return [
+    { action: "edit", resource: "*", effect: "deny" },
     { action: "external_directory", resource: "*", effect: "deny" },
-    { action: "shell", resource: "*", effect: workerShell },
+    { action: "shell", resource: "*", effect: "deny" },
   ];
 }
 
@@ -77,84 +94,120 @@ export function evaluateActionForMember(
     }
   }
 
-  if (swarm.status === "running" || swarm.status === "completing") {
-    if (member.role === "verifier" || member.role === "monitor" || member.role === "narrator") {
-      if (isEdit) {
-        return {
-          decision: "deny",
-          reason: `[SWARM] @${member.name} (${member.role}) is read-only and cannot run '${action}'.`,
-        };
-      }
-      if (isShell) {
-        const policy = member.role === "verifier" ? (options.verifierShellPolicy ?? "ask") : "deny";
-        return {
-          decision: policy,
-          reason: `[SWARM] @${member.name} shell policy is '${policy}'.`,
-        };
-      }
-    }
+  // SEC-C1: Role allowlist check
+  const validRoles: Set<string> = new Set(["coordinator", "worker", "verifier", "monitor", "narrator"]);
+  if (!validRoles.has(member.role)) {
+    return {
+      decision: "deny",
+      reason: `[SWARM SECURITY] Unknown member role '${member.role}' is denied all actions by default.`,
+    };
+  }
 
-    if (member.role === "coordinator" && !options.allowCoordinatorEdits && isEdit) {
+  // SEC-H3: Read-only roles must not execute write tools, unknown tools, or write-like tools
+  if (member.role === "verifier" || member.role === "monitor" || member.role === "narrator") {
+    if (isEdit) {
+      return {
+        decision: "deny",
+        reason: `[SWARM] @${member.name} (${member.role}) is read-only and cannot run write/edit action '${action}'.`,
+      };
+    }
+    if (isShell) {
+      const policy = member.role === "verifier" ? (options.verifierShellPolicy ?? "ask") : "deny";
+      return {
+        decision: policy,
+        reason: `[SWARM] @${member.name} shell policy is '${policy}'.`,
+      };
+    }
+    // Deny unknown tools or tools not recognized for read-only roles
+    return {
+      decision: "deny",
+      reason: `[SWARM] @${member.name} (${member.role}) is read-only and denied tool '${action}'.`,
+    };
+  }
+
+  if (member.role === "coordinator") {
+    if (options.allowCoordinatorEdits !== true && isEdit) {
       return {
         decision: "deny",
         reason: `[SWARM] @coordinator delegates edits to workers while swarm '${swarm.id}' is '${swarm.status}'.`,
       };
     }
+    if (isShell) {
+      const policy = resolveCoordinatorShellPolicy(options);
+      return {
+        decision: policy,
+        reason: `[SWARM] Coordinator shell policy is '${policy}'.`,
+      };
+    }
+    return { decision: "allow" };
+  }
 
-    if (member.role === "worker") {
-      if (isShell) {
-        const policy = options.workerShellPolicy ?? "ask";
+  if (member.role === "worker") {
+    if (isShell) {
+      const policy = options.workerShellPolicy ?? "ask";
+      return {
+        decision: policy,
+        reason: `[SWARM] Worker shell policy is '${policy}'.`,
+      };
+    }
+
+    if (isEdit) {
+      if (rawTargets.length === 0) {
         return {
-          decision: policy,
-          reason: `[SWARM] Worker shell policy is '${policy}'.`,
+          decision: "deny",
+          reason: `[SWARM] Blocked '${action}': target file path could not be determined for ownership check.`,
         };
       }
 
-      if (isEdit) {
-        if (rawTargets.length === 0) {
+      // If worker has an isolated worktree/clone, allow edits inside its own workspace_dir
+      const effectiveRoot = member.workspace_dir || canonicalWorkspaceRoot;
+      const allLocks = db.listLocks(member.swarm_id);
+      const myLocks = allLocks.filter((l) => l.owner_member_id === member.id);
+      const otherLocks = allLocks.filter((l) => l.owner_member_id !== member.id);
+
+      for (const rawPath of rawTargets) {
+        let repoRel: string;
+        try {
+          repoRel = resolveSafeWorkspacePath(effectiveRoot, rawPath);
+        } catch (err) {
           return {
             decision: "deny",
-            reason: `[SWARM] Blocked '${action}': target file path could not be determined for ownership check.`,
+            reason: err instanceof Error ? err.message : String(err),
           };
         }
 
-        // If worker has an isolated worktree/clone, allow edits inside its own workspace_dir
-        const effectiveRoot = member.workspace_dir || canonicalWorkspaceRoot;
-        const allLocks = db.listLocks(member.swarm_id);
-        const myLocks = allLocks.filter((l) => l.owner_member_id === member.id);
-        const otherLocks = allLocks.filter((l) => l.owner_member_id !== member.id);
-
-        for (const rawPath of rawTargets) {
-          let repoRel: string;
-          try {
-            repoRel = resolveSafeWorkspacePath(effectiveRoot, rawPath);
-          } catch (err) {
+        if (member.workspace_mode === "inherit") {
+          // SEC-M1: worker with no owned_globs cannot edit files in shared workspace
+          if (myLocks.length === 0) {
             return {
               decision: "deny",
-              reason: err instanceof Error ? err.message : String(err),
+              reason: `[SWARM LOCK] Blocked '${action}' on "${repoRel}": @${member.name} has no claimed locks. Claim ownership first using action:'claim'.`,
             };
           }
 
-          if (member.workspace_mode === "inherit") {
-            const blocker = otherLocks.find((l) => pathMatchesGlob(repoRel, l.glob_pattern));
-            if (blocker) {
-              return {
-                decision: "deny",
-                reason: `[SWARM LOCK] Blocked '${action}' on "${repoRel}": owned by @${blocker.owner_name} (${blocker.glob_pattern}). Use post_message to coordinate.`,
-              };
-            }
+          const blocker = otherLocks.find((l) => pathMatchesGlob(repoRel, l.glob_pattern));
+          if (blocker) {
+            return {
+              decision: "deny",
+              reason: `[SWARM LOCK] Blocked '${action}' on "${repoRel}": owned by @${blocker.owner_name} (${blocker.glob_pattern}). Use post_message to coordinate.`,
+            };
+          }
 
-            if (myLocks.length > 0 && !myLocks.some((l) => pathMatchesGlob(repoRel, l.glob_pattern))) {
-              return {
-                decision: "deny",
-                reason: `[SWARM LOCK] Blocked '${action}' on "${repoRel}": outside @${member.name}'s owned globs (${myLocks.map((l) => l.glob_pattern).join(", ")}).`,
-              };
-            }
+          if (!myLocks.some((l) => pathMatchesGlob(repoRel, l.glob_pattern))) {
+            return {
+              decision: "deny",
+              reason: `[SWARM LOCK] Blocked '${action}' on "${repoRel}": outside @${member.name}'s owned globs (${myLocks.map((l) => l.glob_pattern).join(", ")}).`,
+            };
           }
         }
       }
     }
+    return { decision: "allow" };
   }
 
-  return { decision: "allow" };
+  // Default deny for anything unhandled
+  return {
+    decision: "deny",
+    reason: `[SWARM SECURITY] Action '${action}' denied by default policy.`,
+  };
 }

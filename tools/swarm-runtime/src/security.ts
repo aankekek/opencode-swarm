@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
 import type { PermissionEffect } from "./types.js";
 
@@ -49,14 +49,33 @@ export function isProtectedRepoPath(repoRelPath: string): boolean {
 function resolveCanonicalAncestor(targetAbs: string): string {
   let cursor = targetAbs;
   const suffixParts: string[] = [];
-  while (!existsSync(cursor)) {
-    const parent = dirname(cursor);
-    if (parent === cursor) break;
-    suffixParts.unshift(relative(parent, cursor));
-    cursor = parent;
+  while (true) {
+    try {
+      const st = lstatSync(cursor);
+      if (st.isSymbolicLink()) {
+        try {
+          const real = realpathSync(cursor);
+          return suffixParts.length > 0 ? resolve(real, ...suffixParts) : real;
+        } catch {
+          // Dangling symlink: resolve link destination
+          const target = readlinkSync(cursor);
+          const resolvedTarget = isAbsolute(target) ? resolve(target) : resolve(dirname(cursor), target);
+          return suffixParts.length > 0 ? resolve(resolvedTarget, ...suffixParts) : resolvedTarget;
+        }
+      }
+      // It exists and is not a symlink
+      const real = realpathSync(cursor);
+      return suffixParts.length > 0 ? resolve(real, ...suffixParts) : real;
+    } catch {
+      // cursor does not exist or lstat failed; move up
+      const parent = dirname(cursor);
+      if (parent === cursor) break;
+      suffixParts.unshift(relative(parent, cursor));
+      cursor = parent;
+    }
   }
-  const realBase = existsSync(cursor) ? realpathSync(cursor) : cursor;
-  return suffixParts.length > 0 ? resolve(realBase, ...suffixParts) : realBase;
+  // If we walked to filesystem root and nothing exists, return targetAbs
+  return targetAbs;
 }
 
 /**
@@ -82,7 +101,8 @@ export function resolveSafeWorkspacePath(canonicalWorkspaceRoot: string, rawPath
   if (rel === "" || rel === ".") {
     return "";
   }
-  if (rel.startsWith("..") || isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
+  // SEC-L7: Only block parent traversal .. and ..\ or ../, not ..hidden/x.txt
+  if (rel === ".." || rel.startsWith(".." + "/") || rel.startsWith(".." + "\\") || isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
     throw new Error(
       `[SWARM SECURITY] Path escapes workspace root: "${rawPath}" (outside "${canonicalWorkspaceRoot}").`,
     );
@@ -100,6 +120,10 @@ export function validateAndNormalizeGlob(rawGlob: string): string {
   if (!rawGlob || rawGlob.includes("\0")) {
     throw new Error(`Invalid ownership glob: "${rawGlob}"`);
   }
+  // SEC-H5: Cap glob length <= 256
+  if (rawGlob.length > 256) {
+    throw new Error(`Ownership glob exceeds maximum length of 256 characters (got ${rawGlob.length}).`);
+  }
   const norm = rawGlob.trim().replace(/\\/g, "/").replace(/^\.\//, "");
   if (!norm) {
     throw new Error(`Empty ownership glob is not allowed.`);
@@ -113,6 +137,15 @@ export function validateAndNormalizeGlob(rawGlob: string): string {
         `Pass separate entries in owned_globs instead (e.g. ["src/**/*.ts", "src/**/*.tsx"]).`,
     );
   }
+  // SEC-H5: Cap ** count <= 8 and reject consecutive **/**
+  if (norm.includes("**/**")) {
+    throw new Error(`Consecutive double-star patterns '**/**' are not permitted in glob "${rawGlob}".`);
+  }
+  const doubleStarMatches = norm.match(/\*\*/g);
+  if (doubleStarMatches && doubleStarMatches.length > 8) {
+    throw new Error(`Glob "${rawGlob}" exceeds maximum permitted '**' patterns (max 8, got ${doubleStarMatches.length}).`);
+  }
+
   const segments = norm.split("/");
   if (segments.some((s) => s === "..")) {
     throw new Error(`Ownership glob cannot contain parent traversal '..' (got "${rawGlob}").`);
@@ -121,6 +154,71 @@ export function validateAndNormalizeGlob(rawGlob: string): string {
     throw new Error(`Protected path cannot be claimed as an ownership glob: "${rawGlob}"`);
   }
   return norm.endsWith("/") ? `${norm}**` : norm;
+}
+
+/**
+ * Segment-wise matcher to prevent regex backtracking ReDoS (SEC-H5).
+ * Supports * (single segment wildcard), ? (single char non-slash), and ** (multi-segment).
+ */
+export function pathMatchesGlob(repoRelPath: string, glob: string): boolean {
+  const normGlob = validateAndNormalizeGlob(glob);
+  const cleanPath = repoRelPath.replace(/\\/g, "/").replace(/^\.\//, "");
+
+  const pSegments = cleanPath.split("/");
+  const gSegments = normGlob.split("/");
+
+  // DP table for segment matching: dp[i][j] is true if gSegments[0..i-1] matches pSegments[0..j-1]
+  const n = gSegments.length;
+  const m = pSegments.length;
+  const dp: boolean[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(false));
+  dp[0][0] = true;
+
+  for (let i = 1; i <= n; i++) {
+    const gSeg = gSegments[i - 1];
+    if (gSeg === "**") {
+      dp[i][0] = dp[i - 1][0];
+      for (let j = 1; j <= m; j++) {
+        dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+      }
+    } else {
+      for (let j = 1; j <= m; j++) {
+        if (dp[i - 1][j - 1] && matchSingleSegment(pSegments[j - 1], gSeg)) {
+          dp[i][j] = true;
+        }
+      }
+    }
+  }
+
+  return dp[n][m];
+}
+
+function matchSingleSegment(text: string, pattern: string): boolean {
+  if (pattern === "*") return true;
+  const tLen = text.length;
+  const pLen = pattern.length;
+  const dp: boolean[][] = Array.from({ length: pLen + 1 }, () => Array(tLen + 1).fill(false));
+  dp[0][0] = true;
+
+  for (let i = 1; i <= pLen; i++) {
+    const pChar = pattern[i - 1];
+    if (pChar === "*") {
+      dp[i][0] = dp[i - 1][0];
+      for (let j = 1; j <= tLen; j++) {
+        dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+      }
+    } else {
+      for (let j = 1; j <= tLen; j++) {
+        const tChar = text[j - 1];
+        const match = IS_WINDOWS
+          ? pChar.toLowerCase() === tChar.toLowerCase() || pChar === "?"
+          : pChar === tChar || pChar === "?";
+        if (dp[i - 1][j - 1] && match) {
+          dp[i][j] = true;
+        }
+      }
+    }
+  }
+  return dp[pLen][tLen];
 }
 
 export function globToRegExp(glob: string): RegExp {
@@ -154,11 +252,6 @@ export function globToRegExp(glob: string): RegExp {
   }
   regexStr += "$";
   return new RegExp(regexStr, IS_WINDOWS ? "i" : "");
-}
-
-export function pathMatchesGlob(repoRelPath: string, glob: string): boolean {
-  const cleanPath = repoRelPath.replace(/\\/g, "/").replace(/^\.\//, "");
-  return globToRegExp(glob).test(cleanPath);
 }
 
 function literalExtension(glob: string): string | null {
@@ -201,12 +294,12 @@ export function extractTargetPaths(toolName: string, input: unknown): string[] {
   const obj = input as Record<string, unknown>;
   const paths = new Set<string>();
 
-  for (const key of ["path", "filePath", "file_path", "targetPath", "filename", "resource"]) {
+  for (const key of ["path", "filePath", "file_path", "targetPath", "filename", "resource", "file", "destination", "to", "from"]) {
     if (typeof obj[key] === "string" && obj[key].trim()) {
       paths.add(obj[key].trim());
     }
   }
-  for (const arrKey of ["paths", "resources"]) {
+  for (const arrKey of ["paths", "resources", "files"]) {
     if (Array.isArray(obj[arrKey])) {
       for (const p of obj[arrKey] as unknown[]) {
         if (typeof p === "string" && p.trim()) paths.add(p.trim());

@@ -50,6 +50,7 @@ export class SwarmBoardDB {
         title TEXT NOT NULL,
         objective TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'running',
+        owner_pid INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         last_monitor_nudge_seq INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +139,13 @@ export class SwarmBoardDB {
       CREATE INDEX IF NOT EXISTS idx_members_session ON members(session_id);
       CREATE INDEX IF NOT EXISTS idx_locks_swarm ON file_locks(swarm_id, owner_member_id);
     `);
+
+    // Safe migration for existing databases missing owner_pid
+    try {
+      this.db.exec("ALTER TABLE swarms ADD COLUMN owner_pid INTEGER;");
+    } catch {
+      // Column already exists
+    }
   }
 
   close() {
@@ -183,12 +191,13 @@ export class SwarmBoardDB {
 
       const swarmId = `sw_${randomUUID().slice(0, 8)}`;
       const now = Date.now();
+      const pid = process.pid;
       this.db
         .prepare(
-          `INSERT INTO swarms (id, title, objective, status, created_at, updated_at, last_monitor_nudge_seq, monitor_nudge_count)
-           VALUES (?, ?, ?, 'running', ?, ?, 0, 0)`,
+          `INSERT INTO swarms (id, title, objective, status, owner_pid, created_at, updated_at, last_monitor_nudge_seq, monitor_nudge_count)
+           VALUES (?, ?, ?, 'running', ?, ?, ?, 0, 0)`,
         )
-        .run(swarmId, args.title, args.objective, now, now);
+        .run(swarmId, args.title, args.objective, pid, now, now);
 
       this.db
         .prepare(
@@ -229,14 +238,33 @@ export class SwarmBoardDB {
     return result;
   }
 
+  private isPidAlive(pid: number | null | undefined): boolean {
+    if (!pid || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err: any) {
+      return err.code === "EPERM"; // EPERM means process exists but we lack permission to signal
+    }
+  }
+
   reconcileStaleSwarmsOnStartup(): SwarmRow[] {
-    const stale = this.getActiveSwarms();
-    for (const swarm of stale) {
+    const active = this.getActiveSwarms();
+    const stale: SwarmRow[] = [];
+    const currentPid = process.pid;
+
+    for (const swarm of active) {
+      // RT-M6: If swarm is owned by another live process, do not clobber it
+      if (swarm.owner_pid && swarm.owner_pid !== currentPid && this.isPidAlive(swarm.owner_pid)) {
+        continue;
+      }
+
       this.withImmediateTransaction(() => {
         const now = Date.now();
+        // RT-H1: Mark members 'killed' so partial index idx_active_member_session no longer blocks reuse
         this.db
           .prepare(
-            `UPDATE members SET state = 'stopped', activity = NULL, last_active_at = ?
+            `UPDATE members SET state = 'killed', activity = NULL, last_active_at = ?
              WHERE swarm_id = ? AND state != 'killed'`,
           )
           .run(now, swarm.id);
@@ -253,6 +281,7 @@ export class SwarmBoardDB {
         body: `Recovered on plugin startup after restart/crash: marked swarm '${swarm.id}' interrupted and released all locks.`,
       });
       this.syncMembersJson(swarm.id);
+      stale.push(swarm);
     }
     return stale;
   }
@@ -328,6 +357,9 @@ export class SwarmBoardDB {
 
   subscribeMemberToChannel(swarmId: string, channelName: string, memberId: string) {
     const clean = normalizeHandle(channelName);
+    const ch = this.getChannel(swarmId, clean);
+    if (!ch) throw new Error(`Channel "#${clean}" does not exist.`);
+    if (ch.archived) throw new Error(`Cannot subscribe to archived channel "#${clean}".`);
     this.db
       .prepare(`INSERT OR IGNORE INTO channel_members (swarm_id, channel_name, member_id) VALUES (?, ?, ?)`)
       .run(swarmId, clean, memberId);
@@ -345,7 +377,8 @@ export class SwarmBoardDB {
     const rows = this.db
       .prepare(`SELECT channel_name FROM channel_members WHERE swarm_id = ? AND member_id = ? ORDER BY channel_name ASC`)
       .all(swarmId, memberId) as Array<{ channel_name: string }>;
-    return ["main", ...rows.map((r) => r.channel_name)];
+    const unique = new Set<string>(["main", ...rows.map((r) => r.channel_name)]);
+    return Array.from(unique);
   }
 
   getChannelSubscriberIds(swarmId: string, channelName: string): string[] {
@@ -576,8 +609,8 @@ export class SwarmBoardDB {
         );
 
       this.db
-        .prepare(`UPDATE members SET last_post_seq = ?, last_post_time = ? WHERE swarm_id = ? AND name = ?`)
-        .run(swarmSeq, now, args.swarmId, args.authorName);
+        .prepare(`UPDATE members SET last_post_seq = ?, last_read_seq = MAX(last_read_seq, ?), last_post_time = ? WHERE swarm_id = ? AND name = ?`)
+        .run(swarmSeq, swarmSeq, now, args.swarmId, args.authorName);
 
       return this.db
         .prepare(`SELECT * FROM board_posts WHERE seq = ?`)
@@ -649,10 +682,19 @@ export class SwarmBoardDB {
       const existing = this.listLocks(swarmId);
       const liveIds = new Set(this.listMembers(swarmId, false).map((m) => m.id));
 
+      // RT-H4: Clean up dead locks whose owner is no longer live
+      for (const lock of existing) {
+        if (!liveIds.has(lock.owner_member_id)) {
+          this.db.prepare(`DELETE FROM file_locks WHERE id = ?`).run(lock.id);
+        }
+      }
+
+      // Re-fetch remaining active locks from live owners
+      const activeLocks = this.listLocks(swarmId);
+
       for (const req of normalized) {
-        for (const lock of existing) {
+        for (const lock of activeLocks) {
           if (lock.owner_member_id === ownerMemberId) continue;
-          if (!liveIds.has(lock.owner_member_id)) continue;
           if (globsPotentiallyOverlap(req, lock.glob_pattern)) {
             conflicts.push({
               requested: req,
@@ -668,14 +710,22 @@ export class SwarmBoardDB {
       }
 
       const stmt = this.db.prepare(
-        `INSERT OR IGNORE INTO file_locks (swarm_id, glob_pattern, owner_name, owner_member_id, claimed_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO file_locks (swarm_id, glob_pattern, owner_name, owner_member_id, claimed_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(swarm_id, glob_pattern) DO UPDATE SET
+           owner_name = excluded.owner_name,
+           owner_member_id = excluded.owner_member_id,
+           claimed_at = excluded.claimed_at`,
       );
       const now = Date.now();
+      const claimed: string[] = [];
       for (const req of normalized) {
-        stmt.run(swarmId, req, owner, ownerMemberId, now);
+        const info = stmt.run(swarmId, req, owner, ownerMemberId, now);
+        if (info.changes > 0) {
+          claimed.push(req);
+        }
       }
-      return { claimed: normalized, conflicts: [] };
+      return { claimed, conflicts: [] };
     });
   }
 

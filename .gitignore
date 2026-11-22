@@ -4,4 +4,6 @@ node_modules/
 *.db-shm
 *.debug.jsonl
 dist/
+!tools/swarm-runtime/dist/
+!tools/swarm-runtime/dist/gui-experimental.cjs
 .DS_Store

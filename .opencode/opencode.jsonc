@@ -11,8 +11,9 @@
 
         // Coordinator delegates instead of editing files
         "allowCoordinatorEdits": false,
-        "workerShellPolicy": "ask",
-        "verifierShellPolicy": "ask",
+        "overrideShellAllow": true,
+        "workerShellPolicy": "allow",
+        "verifierShellPolicy": "allow",
 
         // Realtime Swarm Board Web UI on 127.0.0.1 (port 0 = ephemeral)
         "boardServer": true,
