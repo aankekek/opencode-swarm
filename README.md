@@ -1,4 +1,4 @@
-# OpenCode Swarm Runtime (1:1 Antigravity Swarm Mode)
+# OpenCode Swarm (`opencode-swarm`)
 
 A 1:1 recreation of **Antigravity Swarm Mode** for **OpenCode v2** (`@opencode/plugin@2.3.2`) with **manual model & variant selection**, real Git worktree/clone isolation, multi-channel board routing, stall monitoring, and a realtime Swarm Board Web UI.
 
