@@ -109,6 +109,56 @@ export interface SetRoleModelResult {
   error?: string;
 }
 
+export type UninstallCategoryId =
+  | "pluginRegistration"
+  | "gitWorktreesAndBranches"
+  | "runtimeData"
+  | "buildArtifacts"
+  | "tempFiles";
+
+export type UninstallSelection = Record<UninstallCategoryId, boolean>;
+
+export interface UninstallPlanItem {
+  path: string;
+  kind: "edit-config" | "delete-file" | "delete-dir" | "git-worktree" | "git-branch";
+  detail: string;
+  sizeBytes?: number;
+}
+
+export interface UninstallPlanCategory {
+  id: UninstallCategoryId;
+  title: string;
+  description: string;
+  defaultChecked: boolean;
+  items: UninstallPlanItem[];
+}
+
+export interface UninstallPlan {
+  workspaceRoot: string;
+  pluginRoot: string;
+  runtimeDataDir: string;
+  categories: UninstallPlanCategory[];
+  preserved: string[];
+  reloadCommands: string[];
+}
+
+export interface UninstallVerificationCheck {
+  id: string;
+  label: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface UninstallResult {
+  ok: boolean;
+  removed: string[];
+  edited: string[];
+  skipped: string[];
+  errors: string[];
+  verification: UninstallVerificationCheck[];
+  nextSteps: string[];
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -220,6 +270,27 @@ export const SWARM_RPC_DEF = {
       }),
       output: standardSchema<SetRoleModelResult>((v) =>
         isObject(v) && typeof v.ok === "boolean" ? null : "output must be SetRoleModelResult",
+      ),
+    },
+    previewUninstall: {
+      input: optionalObjectSchema<Record<string, never>>(() => null),
+      output: standardSchema<UninstallPlan>((v) =>
+        isObject(v) && Array.isArray(v.categories) && Array.isArray(v.preserved)
+          ? null
+          : "output must be UninstallPlan",
+      ),
+    },
+    executeUninstall: {
+      input: optionalObjectSchema<{ categories?: Partial<UninstallSelection> }>((v) => {
+        if (v.categories !== undefined && !isObject(v.categories)) {
+          return "categories must be an object";
+        }
+        return null;
+      }),
+      output: standardSchema<UninstallResult>((v) =>
+        isObject(v) && typeof v.ok === "boolean" && Array.isArray(v.verification)
+          ? null
+          : "output must be UninstallResult",
       ),
     },
   },

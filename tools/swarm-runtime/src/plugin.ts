@@ -6,7 +6,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writ
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { startBoardServer, type BoardServerHandle } from "./board-server.js";
-import { SWARM_RPC_DEF, type SwarmChangedEvent } from "./rpc.js";
+import { SWARM_RPC_DEF, type SwarmChangedEvent, type UninstallSelection } from "./rpc.js";
+import { buildUninstallPlan, executeUninstallPlan } from "./uninstall.js";
 import { openSqliteDatabase, SwarmBoardDB } from "./db.js";
 import { checkPendingWakePosts, parseMentionsFromText, resolveWakeTargets } from "./mentions.js";
 import { formatModelSpec, listAvailableModels, parseModelSpec, resolveAndValidateModel } from "./models.js";
@@ -109,6 +110,8 @@ export const swarmRuntimePlugin = Plugin.define({
 
     const sqlite = await openSqliteDatabase(dbPath);
     const db = new SwarmBoardDB(sqlite, dataDir);
+    let dbClosed = false;
+    let boardServerClosed = false;
 
     const reconciled = db.reconcileStaleSwarmsOnStartup();
     if (reconciled.length > 0) {
@@ -1028,6 +1031,61 @@ export const swarmRuntimePlugin = Plugin.define({
             rerunMembers,
           };
         },
+        previewUninstall: async () => {
+          return buildUninstallPlan({
+            workspaceRoot: canonicalWorkspaceRoot,
+            boardUrl: boardServerClosed ? undefined : boardServer?.url,
+          });
+        },
+        executeUninstall: async (args?: Record<string, unknown>) => {
+          const categories = (
+            args?.categories && typeof args.categories === "object" && !Array.isArray(args.categories)
+              ? args.categories
+              : {}
+          ) as Partial<UninstallSelection>;
+          const prevBoardUrl = boardServerClosed ? undefined : boardServer?.url;
+          const plan = buildUninstallPlan({
+            workspaceRoot: canonicalWorkspaceRoot,
+            boardUrl: prevBoardUrl,
+          });
+          return await executeUninstallPlan(plan, categories, {
+            env: {
+              workspaceRoot: canonicalWorkspaceRoot,
+              boardUrl: prevBoardUrl,
+            },
+            beforeRuntimeDataDelete: async () => {
+              stopMonitor();
+              abortController.abort();
+              pendingCalls.clear();
+              waiters.clear();
+              lastCoordinatorWakeSeq.clear();
+              if (!dbClosed) {
+                for (const activeSwarm of db.getActiveSwarms()) {
+                  for (const m of db.listMembers(activeSwarm.id, false)) {
+                    try {
+                      await ctx.session.interrupt({ sessionID: m.session_id });
+                    } catch {
+                      // Ignore
+                    }
+                  }
+                  db.releaseAllLocksForSwarm(activeSwarm.id);
+                }
+              }
+              if (boardServer && !boardServerClosed) {
+                boardServerClosed = true;
+                await boardServer.close().catch(() => {});
+              }
+              if (!dbClosed) {
+                dbClosed = true;
+                try {
+                  db.close();
+                } catch {
+                  // Ignore
+                }
+              }
+            },
+          });
+        },
       }) ?? undefined;
       if (rpcReg && typeof rpcReg === "object" && "dispose" in rpcReg && typeof rpcReg.dispose === "function") {
         rpcCleanup = () => rpcReg!.dispose!();
@@ -1944,10 +2002,14 @@ export const swarmRuntimePlugin = Plugin.define({
       if (rpcCleanup) {
         await rpcCleanup();
       }
-      if (boardServer) {
+      if (boardServer && !boardServerClosed) {
+        boardServerClosed = true;
         await boardServer.close();
       }
-      db.close();
+      if (!dbClosed) {
+        dbClosed = true;
+        db.close();
+      }
     };
   },
 });

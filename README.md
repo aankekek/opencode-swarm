@@ -40,3 +40,13 @@ bun install
 bun run typecheck
 bun test
 ```
+
+## Uninstall
+- **GUI Checklist:** Open **Settings → Swarm Board → Uninstall...** (or Command Palette → `Uninstall Swarm Plugin`) to review and confirm removal of all configs, runtime data, worktrees, build artifacts, and temp files.
+- **CLI Checklist:**
+  ```bash
+  cd tools/swarm-runtime
+  bun run uninstall:dry-run   # preview exact paths to be removed
+  bun run uninstall           # confirm and remove completely + verify
+  ```
+- **Manual Checklist:** See [tools/swarm-runtime/docs/UNINSTALL.md](tools/swarm-runtime/docs/UNINSTALL.md).

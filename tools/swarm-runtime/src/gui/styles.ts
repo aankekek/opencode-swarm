@@ -496,4 +496,222 @@ export const SWARM_GUI_STYLES = `
   align-items: center;
   gap: 8px;
 }
+
+.swarm-uninstall-root,
+.swarm-uninstall-plan,
+.swarm-uninstall-report {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--text-base, #b5b4b0);
+  font-size: 12px;
+}
+
+.swarm-uninstall-intro {
+  margin: 0;
+  color: var(--text-base, #b5b4b0);
+}
+
+.swarm-uninstall-categories {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.swarm-uninstall-card {
+  border-radius: 8px;
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  background: var(--surface-raised-base, #1d1d1c);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.swarm-uninstall-card.is-checked {
+  border-color: rgba(245, 166, 35, 0.45);
+}
+
+.swarm-uninstall-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.swarm-uninstall-card-title {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.swarm-uninstall-card-title strong {
+  color: var(--text-strong, #ededec);
+  font-size: 13px;
+}
+
+.swarm-uninstall-card-title span {
+  color: var(--text-weak, #8a8984);
+  font-size: 11px;
+}
+
+.swarm-uninstall-count {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--surface-base-hover, #262625);
+  color: var(--text-weak, #8a8984);
+  white-space: nowrap;
+}
+
+.swarm-uninstall-empty {
+  font-size: 11px;
+  color: var(--text-weak, #8a8984);
+  padding-left: 24px;
+}
+
+.swarm-uninstall-items {
+  margin: 0;
+  padding-left: 24px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.swarm-uninstall-items li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.swarm-uninstall-kind {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--background-base, #141413);
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  color: var(--text-weak, #8a8984);
+  font-size: 10px;
+}
+
+.swarm-uninstall-path {
+  color: var(--text-strong, #ededec);
+  font-family: var(--font-family-mono, monospace);
+  word-break: break-all;
+}
+
+.swarm-uninstall-detail {
+  color: var(--text-weak, #8a8984);
+  font-size: 11px;
+}
+
+.swarm-uninstall-preserved {
+  border-radius: 8px;
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  background: var(--background-base, #141413);
+  padding: 10px 12px;
+}
+
+.swarm-uninstall-preserved strong {
+  color: var(--text-strong, #ededec);
+  display: block;
+  margin-bottom: 4px;
+}
+
+.swarm-uninstall-preserved ul,
+.swarm-uninstall-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-weak, #8a8984);
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.swarm-uninstall-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+}
+
+.swarm-uninstall-banner.is-ok {
+  background: rgba(74, 222, 128, 0.1);
+  border-color: rgba(74, 222, 128, 0.35);
+}
+
+.swarm-uninstall-banner.is-warn {
+  background: rgba(224, 82, 82, 0.12);
+  border-color: rgba(224, 82, 82, 0.4);
+}
+
+.swarm-uninstall-banner strong {
+  color: var(--text-strong, #ededec);
+}
+
+.swarm-uninstall-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.swarm-uninstall-section strong {
+  color: var(--text-strong, #ededec);
+}
+
+.swarm-uninstall-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.swarm-uninstall-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--surface-raised-base, #1d1d1c);
+}
+
+.swarm-uninstall-check-row.is-pass > span {
+  color: #4ade80;
+  font-weight: 700;
+}
+
+.swarm-uninstall-check-row.is-fail > span {
+  color: var(--icon-critical-base, #e05252);
+  font-weight: 700;
+}
+
+.swarm-uninstall-code {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--background-base, #141413);
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  color: var(--text-strong, #ededec);
+  font-family: var(--font-family-mono, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+.swarm-uninstall-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+}
 `;

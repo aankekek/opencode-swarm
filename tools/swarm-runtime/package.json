@@ -13,7 +13,9 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build:gui": "vite build",
-    "dev:gui": "vite build --watch"
+    "dev:gui": "vite build --watch",
+    "uninstall": "bun run scripts/uninstall.ts",
+    "uninstall:dry-run": "bun run scripts/uninstall.ts --dry-run"
   },
   "dependencies": {
     "@opencode/plugin": "2.3.2"

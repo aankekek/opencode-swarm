@@ -14,6 +14,7 @@ export interface SwarmSettingsViewProps {
   activeSwarmCount: () => number;
   onOpenPanel: () => void;
   onOpenSetupWizard?: () => void;
+  onOpenUninstall?: () => void;
   onRefresh: () => void;
   target?: string;
 }
@@ -165,6 +166,21 @@ export function SwarmSettingsView(props: SwarmSettingsViewProps) {
           </SettingsRow>
         </div>
       </SettingsSection>
+
+      {props.onOpenUninstall && (
+        <SettingsSection title="Uninstall">
+          <div data-action="swarm-board.uninstall">
+            <SettingsRow
+              title="Uninstall Swarm Plugin"
+              description="Review the full removal checklist and completely remove Swarm Runtime config, runtime data, worktrees, build artifacts, and temp files"
+            >
+              <Button size="small" variant="ghost" onClick={props.onOpenUninstall}>
+                Uninstall...
+              </Button>
+            </SettingsRow>
+          </div>
+        </SettingsSection>
+      )}
     </SettingsLayout>
   );
 }

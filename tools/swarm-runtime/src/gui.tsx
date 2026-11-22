@@ -14,11 +14,18 @@ import {
   type SettingEntry,
 } from "@opencode/plugin/gui";
 import { createEffect, createMemo, createSignal, lazy, onCleanup, Show, Suspense } from "solid-js";
-import SWARM_RPC_DEF, { type SetRoleModelResult, type SwarmRoleConfig } from "../src/rpc.js";
+import SWARM_RPC_DEF, {
+  type SetRoleModelResult,
+  type SwarmRoleConfig,
+  type UninstallPlan,
+  type UninstallResult,
+  type UninstallSelection,
+} from "../src/rpc.js";
 import { SWARM_GUI_STYLES } from "./gui/styles.js";
 import { SwarmControlOverlay, type SwarmControlRole } from "./gui/SwarmControlOverlay.js";
 import { SwarmOnboardingModal } from "./gui/SwarmOnboardingModal.js";
 import { SwarmSettingsView, type SwarmRpcStatus } from "./gui/SwarmSettingsView.js";
+import { SwarmUninstallModal } from "./gui/SwarmUninstallModal.js";
 import {
   DEFAULT_SWARM_SETTINGS,
   normalizeSwarmList,
@@ -86,6 +93,12 @@ const SETTINGS_ENTRIES: readonly SettingEntry[] = [
     title: "Setup Role Models",
     description: "Choose recommended or custom models for Coordinator, Worker, Verifier, and Monitor",
     keywords: "swarm models onboarding wizard setup",
+  },
+  {
+    id: "swarm-board.uninstall",
+    title: "Uninstall Swarm Plugin",
+    description: "Review removal checklist and completely uninstall Swarm Runtime",
+    keywords: "swarm uninstall remove cleanup reset",
   },
 ];
 
@@ -470,6 +483,24 @@ export default Plugin.define({
       ));
     };
 
+    const openUninstallModal = () => {
+      ctx.dialogs.open((dialog) => (
+        <SwarmUninstallModal
+          ctx={ctx}
+          loadPlan={async () => {
+            return (await getRpc().previewUninstall({}, getCallOptions())) as UninstallPlan | null;
+          }}
+          onExecute={async (categories: Partial<UninstallSelection>) => {
+            return (await getRpc().executeUninstall({ categories }, getCallOptions())) as UninstallResult | null;
+          }}
+          onResetGuiStore={() => {
+            store.set(DEFAULT_SWARM_SETTINGS);
+          }}
+          onClose={() => dialog.close()}
+        />
+      ));
+    };
+
     safeAdd(SettingsPage, () => ({
       id: SWARM_SETTINGS_PAGE_ID,
       title: "Swarm Board",
@@ -484,6 +515,7 @@ export default Plugin.define({
           activeSwarmCount={() => swarms().length}
           onOpenPanel={() => openSwarmPanel(false)}
           onOpenSetupWizard={openOnboardingWizard}
+          onOpenUninstall={openUninstallModal}
           onRefresh={() => void refresh()}
           target={target}
         />
@@ -609,6 +641,15 @@ export default Plugin.define({
       group: "Swarm",
       section: "model" as const,
       run: () => openOnboardingWizard(),
+    }));
+
+    safeAdd(Command, () => ({
+      id: "uninstall",
+      title: "Uninstall Swarm Plugin",
+      description: "Open the Swarm removal checklist and completely uninstall Swarm Runtime",
+      group: "Swarm",
+      section: "general" as const,
+      run: () => openUninstallModal(),
     }));
 
     const swarmTab: PanelTab = {

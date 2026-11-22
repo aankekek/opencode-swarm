@@ -6,7 +6,7 @@ import { SWARM_RPC_DEF } from "../src/rpc.js";
 import { swarmRuntimePlugin } from "../src/plugin.js";
 
 describe("SWARM_RPC_DEF and RPC bridge", () => {
-  test("SWARM_RPC_DEF defines id, 7 methods, and changed event", () => {
+  test("SWARM_RPC_DEF defines id, 9 methods, and changed event", () => {
     expect(SWARM_RPC_DEF.id).toBe("local.swarm-runtime");
     expect(Object.keys(SWARM_RPC_DEF.methods)).toEqual([
       "getBoardInfo",
@@ -16,6 +16,8 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       "killMember",
       "getRoleConfig",
       "setRoleModel",
+      "previewUninstall",
+      "executeUninstall",
     ]);
     expect(SWARM_RPC_DEF.events.changed).toBeDefined();
   });

@@ -51,7 +51,7 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("toastEnabled");
     expect(code).toContain("pinned");
 
-    // Composer pill, overlay, searchable A-Z select, onboarding & bee branding
+    // Composer pill, overlay, searchable A-Z select, onboarding, uninstall & bee branding
     expect(code).toContain("🐝 Swarm: Buzzing");
     expect(code).toContain("🐝 Swarm: Dozing");
     expect(code).toContain("🐝 Swarm Control");
@@ -61,6 +61,11 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("onboardingComplete");
     expect(code).toContain("getRoleConfig");
     expect(code).toContain("setRoleModel");
+    expect(code).toContain("previewUninstall");
+    expect(code).toContain("executeUninstall");
+    expect(code).toContain("Uninstall Swarm Plugin");
+    expect(code).not.toContain("node:child_process");
+    expect(code).not.toContain("node:fs");
 
     // Pixel-Bee Web View is default and only side-tab body
     expect(code).toContain("swarm-gui-iframe");
