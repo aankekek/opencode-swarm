@@ -196,6 +196,7 @@ export function normalizeSwarmSnapshot(raw: unknown): SwarmSnapshot | null {
     boardUrl: typeof r.boardUrl === "string" ? r.boardUrl : undefined,
     pausedQuota,
     paused_quota: pausedQuota,
+    stalled: Boolean(r.stalled),
     verifierStatus,
     members,
     posts,

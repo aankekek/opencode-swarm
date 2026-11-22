@@ -106,6 +106,16 @@ export function resolveWakeTargets(
 /**
  * Race-free check for swarm_wait: returns matching posts already on the board after `sinceSeq`.
  */
+function safeParseStringArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 export function checkPendingWakePosts(
   db: SwarmBoardDB,
   member: MemberRow,
@@ -131,11 +141,11 @@ export function checkPendingWakePosts(
 
   return others.filter((p) => {
     if (p.is_all === 1) return true;
-    const mentions = JSON.parse(p.mentions_json) as string[];
+    const mentions = safeParseStringArray(p.mentions_json);
     if (mentions.includes(member.name) || (member.group_prefix && mentions.includes(member.group_prefix))) {
       return true;
     }
-    const chMentions = JSON.parse(p.channel_mentions_json) as string[];
+    const chMentions = safeParseStringArray(p.channel_mentions_json);
     if (chMentions.length > 0) {
       if (isGlobalRole) return true;
       const myChannels = Array.isArray(channelsFilter) ? channelsFilter : db.getMemberChannels(member.swarm_id, member.id);

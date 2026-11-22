@@ -10,7 +10,7 @@ const IS_WINDOWS = process.platform === "win32";
  * lowercase, starts with [a-z0-9], up to 24 chars of [a-z0-9_-],
  * cannot be all, everyone, coordinator, or coordinator-*.
  */
-export function validateMemberName(raw: string): string {
+export function validateMemberName(raw: string, role?: string): string {
   const cleaned = raw.trim().replace(/^@+/, "").toLowerCase();
   if (!/^[a-z0-9][a-z0-9_-]{0,23}$/.test(cleaned)) {
     throw new Error(
@@ -24,6 +24,9 @@ export function validateMemberName(raw: string): string {
     cleaned.startsWith("coordinator-")
   ) {
     throw new Error(`Reserved member name "${raw}" cannot be used for a worker.`);
+  }
+  if ((cleaned === "verifier" || cleaned === "monitor" || cleaned === "narrator") && role && role !== cleaned) {
+    throw new Error(`Reserved role name "${raw}" can only be used with role "${cleaned}".`);
   }
   return cleaned;
 }
@@ -108,6 +111,11 @@ export function resolveSafeWorkspacePath(canonicalWorkspaceRoot: string, rawPath
     );
   }
   const normalized = rel.replace(/\\/g, "/");
+  if (IS_WINDOWS && normalized.includes(":")) {
+    throw new Error(
+      `[SWARM SECURITY] Windows Alternate Data Streams (':') are not permitted in path: "${rawPath}"`,
+    );
+  }
   if (isProtectedRepoPath(normalized)) {
     throw new Error(
       `[SWARM SECURITY] Protected repository path cannot be modified by swarm members: "${normalized}"`,

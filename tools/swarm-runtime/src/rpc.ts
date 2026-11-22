@@ -57,6 +57,7 @@ export interface SwarmSnapshot {
   } | null;
   boardUrl: string;
   head: number;
+  stalled?: boolean;
   members: SwarmSnapshotMember[];
   board_posts: SwarmSnapshotPost[];
   file_locks: SwarmSnapshotFileLock[];

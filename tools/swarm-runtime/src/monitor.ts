@@ -11,17 +11,18 @@ export function startStallMonitor(
   config: MonitorConfig,
   onPost: (swarmId: string, authorName: string, channel: string, text: string) => Promise<BoardPostRow>,
 ): () => void {
-  let running = false;
+  const inFlightSwarms = new Set<string>();
+  const postTimeoutMs = Math.max(100, Math.min(config.monitorIntervalMs, 15_000));
 
   const timer = setInterval(async () => {
-    if (running) return;
-    running = true;
     try {
       const now = Date.now();
       for (const swarm of db.getActiveSwarms()) {
         if (swarm.status !== "running") continue;
         if (swarm.owner_pid && swarm.owner_pid !== process.pid) continue;
+        if (inFlightSwarms.has(swarm.id)) continue;
 
+        inFlightSwarms.add(swarm.id);
         try {
           const members = db.listMembers(swarm.id, false);
           if (members.length === 0) continue;
@@ -67,16 +68,24 @@ export function startStallMonitor(
 
           const nextCount = latestSeq <= swarm.last_monitor_nudge_seq ? swarm.monitor_nudge_count + 1 : 1;
           db.updateMonitorNudge(swarm.id, latestSeq, nextCount);
-          const post = await onPost(swarm.id, "monitor", "main", nudgeMessage);
+          let timeoutId: ReturnType<typeof setTimeout> | undefined;
+          const post = await Promise.race([
+            onPost(swarm.id, "monitor", "main", nudgeMessage),
+            new Promise<never>((_, reject) => {
+              timeoutId = setTimeout(() => reject(new Error(`Monitor nudge timed out after ${postTimeoutMs}ms`)), postTimeoutMs);
+            }),
+          ]).finally(() => {
+            if (timeoutId) clearTimeout(timeoutId);
+          });
           db.updateMonitorNudge(swarm.id, post.swarm_seq, nextCount);
         } catch (err) {
           console.error(`[swarm-runtime] monitor error for swarm ${swarm.id}:`, err);
+        } finally {
+          inFlightSwarms.delete(swarm.id);
         }
       }
     } catch (err) {
       console.error("[swarm-runtime] monitor error:", err);
-    } finally {
-      running = false;
     }
   }, config.monitorIntervalMs);
 

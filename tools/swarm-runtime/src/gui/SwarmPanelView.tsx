@@ -127,8 +127,16 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
             <Button
               variant="danger"
               onClick={async () => {
-                await props.onCompleteSwarm(snap.swarmId);
-                dialog.close();
+                try {
+                  await props.onCompleteSwarm(snap.swarmId);
+                  dialog.close();
+                } catch (err) {
+                  props.ctx.toast.show({
+                    title: "Failed to complete swarm",
+                    description: err instanceof Error ? err.message : String(err),
+                    variant: "error",
+                  });
+                }
               }}
             >
               Complete Swarm

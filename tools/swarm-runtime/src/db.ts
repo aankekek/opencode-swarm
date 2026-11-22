@@ -40,9 +40,9 @@ export class SwarmBoardDB {
     private dataDir: string,
   ) {
     this.db.exec(`
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
-      PRAGMA busy_timeout = 5000;
       PRAGMA foreign_keys = ON;
 
       CREATE TABLE IF NOT EXISTS swarms (
@@ -167,8 +167,8 @@ export class SwarmBoardDB {
     } catch (err) {
       try {
         this.db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback failure
+      } catch (rbErr) {
+        console.warn("[swarm-runtime] SQLite ROLLBACK failed:", rbErr);
       }
       throw err;
     }
@@ -591,6 +591,8 @@ export class SwarmBoardDB {
     this.db
       .prepare(`UPDATE members SET wake_mode = ?, wait_since = ?, state = 'waiting', activity = NULL, last_active_at = ? WHERE id = ? AND state != 'killed'`)
       .run(wakeMode, waitSince, Date.now(), memberId);
+    const member = this.getMemberById(memberId);
+    if (member) this.syncMembersJson(member.swarm_id);
   }
 
   incrementMemberSteps(memberId: string, activity?: string, activityKind?: string) {
@@ -599,18 +601,26 @@ export class SwarmBoardDB {
         `UPDATE members SET steps = steps + 1, activity = COALESCE(?, activity), activity_kind = COALESCE(?, activity_kind), last_active_at = ? WHERE id = ?`,
       )
       .run(activity ?? null, activityKind ?? null, Date.now(), memberId);
+    if (activity) {
+      const member = this.getMemberById(memberId);
+      if (member) this.syncMembersJson(member.swarm_id);
+    }
   }
 
   setTrackStatus(memberId: string, status: TrackStatus) {
     this.db
       .prepare(`UPDATE members SET track_status = ?, last_active_at = ? WHERE id = ?`)
       .run(status, Date.now(), memberId);
+    const member = this.getMemberById(memberId);
+    if (member) this.syncMembersJson(member.swarm_id);
   }
 
   advanceReadCursor(memberId: string, seq: number) {
     this.db
       .prepare(`UPDATE members SET last_read_seq = MAX(last_read_seq, ?) WHERE id = ?`)
       .run(seq, memberId);
+    const member = this.getMemberById(memberId);
+    if (member) this.syncMembersJson(member.swarm_id);
   }
 
   // -------------------------------------------------------------------------
@@ -823,8 +833,8 @@ export class SwarmBoardDB {
         JSON.stringify({ title: swarm.title, status: swarm.status, members: record }, null, 2),
         "utf8",
       );
-    } catch {
-      // Ignore mirror write errors
+    } catch (err) {
+      console.warn("[swarm-runtime] Failed to sync members.json:", err);
     }
   }
 
@@ -838,8 +848,8 @@ export class SwarmBoardDB {
         time: new Date(post.created_at).toISOString(),
       });
       appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), line + "\n", "utf8");
-    } catch {
-      // Ignore mirror write errors
+    } catch (err) {
+      console.warn("[swarm-runtime] Failed to append board.jsonl:", err);
     }
   }
 }

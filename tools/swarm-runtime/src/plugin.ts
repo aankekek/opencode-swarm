@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin";
 
 type Context = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0];
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { startBoardServer, type BoardServerHandle } from "./board-server.js";
@@ -35,6 +35,29 @@ function toolJson(payload: unknown): { content: string } {
 function isQuotaOrRateLimitError(raw: unknown): boolean {
   const text = typeof raw === "string" ? raw : JSON.stringify(raw ?? "");
   return /(429|quota|rate[\s_-]?limit|insufficient_quota|usage limit|resource_exhausted)/i.test(text);
+}
+
+function safeParseStringArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function cloneToolInput(input: unknown): Record<string, unknown> | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  try {
+    return structuredClone(input) as Record<string, unknown>;
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
+    } catch {
+      return { ...(input as Record<string, unknown>) };
+    }
+  }
 }
 
 export const swarmRuntimePlugin = Plugin.define({
@@ -90,10 +113,17 @@ export const swarmRuntimePlugin = Plugin.define({
     }
 
     function persistRoleModels() {
+      const tmpPath = `${roleModelsPath}.${process.pid}.${Date.now()}.tmp`;
       try {
-        writeFileSync(roleModelsPath, JSON.stringify(roleModels, null, 2), "utf8");
-      } catch {
-        // Ignore persistence write errors
+        writeFileSync(tmpPath, JSON.stringify(roleModels, null, 2), "utf8");
+        renameSync(tmpPath, roleModelsPath);
+      } catch (err) {
+        console.warn("[swarm-runtime] Failed to persist role-models.json:", err);
+        try {
+          writeFileSync(roleModelsPath, JSON.stringify(roleModels, null, 2), "utf8");
+        } catch {
+          // Ignore fallback write error
+        }
       }
     }
 
@@ -632,7 +662,7 @@ export const swarmRuntimePlugin = Plugin.define({
       ownedGlobs?: string[];
       groupPrefix?: string | null;
     }) {
-      const cleanName = validateMemberName(args.name);
+      const cleanName = validateMemberName(args.name, args.role);
       const spawnKey = `${args.swarmId}:${cleanName}`;
       if (spawningMembers.has(spawnKey)) {
         throw new Error(`Member "@${cleanName}" is already being spawned in swarm "${args.swarmId}".`);
@@ -793,6 +823,11 @@ export const swarmRuntimePlugin = Plugin.define({
       } catch (err) {
         if (childSessionId) {
           await ctx.session.interrupt({ sessionID: childSessionId }).catch(() => {});
+          const sessionApi = ctx.session as unknown as {
+            remove?: (a: { sessionID: string }) => Promise<unknown>;
+            delete?: (a: { sessionID: string }) => Promise<unknown>;
+          };
+          await (sessionApi.remove?.({ sessionID: childSessionId }) ?? sessionApi.delete?.({ sessionID: childSessionId }))?.catch?.(() => {});
         }
         if (insertedMember) {
           db.setMemberState(insertedMember.id, "killed");
@@ -836,6 +871,8 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     }
 
+    const getBoardUrl = () => (boardServer && !boardServerClosed && boardServer.isAlive() ? boardServer.url : "");
+
     let rpcCleanup: (() => Promise<void> | void) | undefined;
     try {
       rpcReg = await (ctx as unknown as {
@@ -853,7 +890,7 @@ export const swarmRuntimePlugin = Plugin.define({
           const active = db.getActiveSwarms()[0];
           const members = active ? db.listMembers(active.id, false) : [];
           return {
-            url: boardServer?.url ?? "",
+            url: getBoardUrl(),
             token: boardServer?.token ?? "",
             swarmId: active?.id ?? "",
             title: active?.title ?? "Swarm Board",
@@ -863,7 +900,7 @@ export const swarmRuntimePlugin = Plugin.define({
         },
         getSwarmSnapshot: async (args?: Record<string, unknown>) => {
           if (dbClosed) {
-            return { swarm: null, boardUrl: "", head: 0, members: [], board_posts: [], file_locks: [] };
+            return { swarm: null, boardUrl: "", head: 0, stalled: false, members: [], board_posts: [], file_locks: [] };
           }
           const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
           const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
@@ -886,8 +923,9 @@ export const swarmRuntimePlugin = Plugin.define({
           if (!swarm) {
             return {
               swarm: null,
-              boardUrl: boardServer?.url ?? "",
+              boardUrl: getBoardUrl(),
               head: 0,
+              stalled: false,
               members: [],
               board_posts: [],
               file_locks: [],
@@ -921,13 +959,18 @@ export const swarmRuntimePlugin = Plugin.define({
             seq: p.swarm_seq,
             channel: p.channel,
             author: p.author_name,
-            mentions: JSON.parse(p.mentions_json || "[]") as string[],
-            channel_mentions: JSON.parse(p.channel_mentions_json || "[]") as string[],
+            mentions: safeParseStringArray(p.mentions_json),
+            channel_mentions: safeParseStringArray(p.channel_mentions_json),
             is_all: Boolean(p.is_all),
             body: p.body,
             created_at: p.created_at,
           }));
           const latest = db.getLatestPost(swarm.id);
+          const head = latest?.swarm_seq ?? 0;
+          const stalled =
+            swarm.status === "running" &&
+            swarm.monitor_nudge_count > 0 &&
+            head <= swarm.last_monitor_nudge_seq;
           const file_locks = rawLocks.map((l) => ({
             id: l.id,
             glob_pattern: l.glob_pattern,
@@ -944,8 +987,9 @@ export const swarmRuntimePlugin = Plugin.define({
               created_at: swarm.created_at,
               updated_at: swarm.updated_at,
             },
-            boardUrl: boardServer?.url ?? "",
-            head: latest?.swarm_seq ?? 0,
+            boardUrl: getBoardUrl(),
+            head,
+            stalled,
             members,
             board_posts,
             file_locks,
@@ -1334,7 +1378,7 @@ export const swarmRuntimePlugin = Plugin.define({
             }
             db.setSwarmTitle(swarmId, title);
             emitSwarmChanged({ swarmId, reason: "swarm_updated", summary: title });
-            return toolJson({ ok: true, swarm_id: swarmId, title, open_board: boardServer?.url ?? "" });
+            return toolJson({ ok: true, swarm_id: swarmId, title, open_board: getBoardUrl() });
           }
 
           if (action === "status") {
@@ -1348,7 +1392,7 @@ export const swarmRuntimePlugin = Plugin.define({
             return toolJson({
               ok: true,
               swarm,
-              open_board: caller.role === "coordinator" ? (boardServer?.url ?? "") : "",
+              open_board: caller.role === "coordinator" ? getBoardUrl() : "",
               members: members.map((m) => ({
                 name: m.name,
                 role: m.role,
@@ -1407,7 +1451,7 @@ export const swarmRuntimePlugin = Plugin.define({
                   });
                 }
                 for (let i = 0; i < count; i++) {
-                  const shardName = validateMemberName(`${baseName}-${i + 1}`);
+                  const shardName = validateMemberName(`${baseName}-${i + 1}`, role);
                   const existing = db.getMemberByName(swarmId, shardName);
                   if (existing) {
                     return toolJson({
@@ -1416,6 +1460,7 @@ export const swarmRuntimePlugin = Plugin.define({
                     });
                   }
                 }
+                const normalizedPrefix = normalizeHandle(baseName);
                 for (let i = 0; i < count; i++) {
                   const sliceBrief = tasks ? `${brief}\n\nAssigned slice: ${tasks[i]}` : brief;
                   const m = await spawnSingleMember({
@@ -1430,7 +1475,7 @@ export const swarmRuntimePlugin = Plugin.define({
                     fork: input.fork as string | undefined,
                     channels: input.channels as string[] | undefined,
                     ownedGlobs: input.owned_globs as string[] | undefined,
-                    groupPrefix: baseName,
+                    groupPrefix: normalizedPrefix,
                   });
                   spawnedMembers.push(m);
                   spawned.push({
@@ -1470,7 +1515,7 @@ export const swarmRuntimePlugin = Plugin.define({
                   workspace: m.workspace_mode,
                 });
               }
-              return toolJson({ ok: true, swarm_id: swarmId, spawned, open_board: boardServer?.url ?? "" });
+              return toolJson({ ok: true, swarm_id: swarmId, spawned, open_board: getBoardUrl() });
             } catch (err) {
               for (const m of spawnedMembers) {
                 await ctx.session.interrupt({ sessionID: m.session_id }).catch(() => {});
@@ -1707,6 +1752,9 @@ export const swarmRuntimePlugin = Plugin.define({
         },
         options: { codemode: false },
         async execute(rawInput, toolCtx) {
+          if (toolCtx.signal?.aborted) {
+            return toolJson({ woken: false, aborted: true, posts: [] });
+          }
           const caller = db.getActiveMemberBySession(toolCtx.sessionID);
           if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
           const input = rawInput as { text: string; channel?: string; mark_done?: boolean };
@@ -1824,6 +1872,9 @@ export const swarmRuntimePlugin = Plugin.define({
         },
         options: { codemode: false },
         async execute(rawInput, toolCtx) {
+          if (toolCtx.signal?.aborted) {
+            return toolJson({ woken: false, aborted: true, posts: [] });
+          }
           const caller = db.getActiveMemberBySession(toolCtx.sessionID);
           if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
           const input = (rawInput ?? {}) as { since?: number; mentions_only?: boolean };
@@ -1861,7 +1912,9 @@ export const swarmRuntimePlugin = Plugin.define({
           db.setMemberWait(caller.id, mentionsOnly ? "mentions" : "any", sinceSeq);
           emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
           if (caller.role !== "coordinator") {
-            void maybeWakeIdleCoordinator(caller.swarm_id);
+            void maybeWakeIdleCoordinator(caller.swarm_id).catch((err) => {
+              console.warn("[swarm-runtime] coordinator wake error:", err);
+            });
           }
 
           const waitResult = await new Promise<{ posts: BoardPostRow[]; aborted?: boolean }>((resolveWait) => {
@@ -1959,7 +2012,7 @@ export const swarmRuntimePlugin = Plugin.define({
       if (event.id) {
         cachePendingCall(event.id, {
           tool: toolName,
-          input: event.input,
+          input: cloneToolInput(event.input),
           sessionID: event.sessionID,
           ts: Date.now(),
         });
@@ -2041,9 +2094,6 @@ export const swarmRuntimePlugin = Plugin.define({
       const source = event.source as { id?: string } | undefined;
       const callId = typeof source?.id === "string" ? source.id : undefined;
       const cached = callId ? pendingCalls.get(callId) : undefined;
-      if (callId && cached) {
-        pendingCalls.delete(callId);
-      }
       const sessionId = event.sessionID || cached?.sessionID;
 
       let reason: string | undefined;
@@ -2267,15 +2317,27 @@ export const swarmRuntimePlugin = Plugin.define({
       quiesceResolvers.clear();
       pendingKillCleanup.clear();
       if (rpcCleanup) {
-        await rpcCleanup();
+        try {
+          await rpcCleanup();
+        } catch (err) {
+          console.warn("[swarm-runtime] rpcCleanup error during shutdown:", err);
+        }
       }
       if (boardServer && !boardServerClosed) {
         boardServerClosed = true;
-        await boardServer.close();
+        try {
+          await boardServer.close();
+        } catch (err) {
+          console.warn("[swarm-runtime] boardServer.close error during shutdown:", err);
+        }
       }
       if (!dbClosed) {
         dbClosed = true;
-        db.close();
+        try {
+          db.close();
+        } catch (err) {
+          console.warn("[swarm-runtime] db.close error during shutdown:", err);
+        }
       }
     };
   },

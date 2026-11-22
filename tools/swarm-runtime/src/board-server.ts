@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { SwarmBoardDB } from "./db.js";
@@ -19,6 +20,7 @@ export interface BoardServerHandle {
   url: string;
   port: number;
   token: string;
+  isAlive: () => boolean;
   close: () => Promise<void>;
 }
 
@@ -61,6 +63,27 @@ function readJsonFileSafe(filePath: string): unknown {
     return JSON.parse(raw);
   } catch {
     return null;
+  }
+}
+
+function readTextTailSafe(filePath: string, maxBytes = MAX_BODY_BYTES): string {
+  try {
+    if (!existsSync(filePath)) return "";
+    const raw = readFileSync(filePath, "utf8");
+    if (raw.length <= maxBytes) return raw;
+    return raw.slice(raw.length - maxBytes);
+  } catch {
+    return "";
+  }
+}
+
+function safeParseStringArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
   }
 }
 
@@ -190,6 +213,8 @@ const PRELOAD_JS = `(() => {
 export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise<BoardServerHandle> {
   const token = randomBytes(24).toString("hex");
   let actualPort = port;
+  let dead = false;
+  const openSockets = new Set<Socket>();
 
   const server: Server = createServer(async (req, res) => {
     try {
@@ -241,7 +266,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
         const edgeMap = new Map<string, { from: string; to: string; count: number; viaAll: boolean }>();
         for (const p of posts) {
           postCounts.set(p.author_name, (postCounts.get(p.author_name) ?? 0) + 1);
-          const mentions = JSON.parse(p.mentions_json) as string[];
+          const mentions = safeParseStringArray(p.mentions_json);
           if (p.is_all === 1) {
             for (const m of members) {
               if (m.name === p.author_name || m.role === "monitor" || m.role === "narrator") continue;
@@ -264,6 +289,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
         const swarmDir = deps.db.getSwarmDir(swarm.id);
         const viewJson = readJsonFileSafe(join(swarmDir, "view.json"));
         const planJson = readJsonFileSafe(join(swarmDir, "plan.json"));
+        const rawBoardText = readTextTailSafe(join(swarmDir, "board.jsonl"));
 
         const payload = {
           conversationId: conversationIdParam ?? "",
@@ -307,8 +333,8 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
             lastPostSeq: m.last_post_seq,
           })),
           messages: posts.map((p) => {
-            const mentions = JSON.parse(p.mentions_json) as string[];
-            const channelMentions = JSON.parse(p.channel_mentions_json) as string[];
+            const mentions = safeParseStringArray(p.mentions_json);
+            const channelMentions = safeParseStringArray(p.channel_mentions_json);
             return {
               seq: p.swarm_seq,
               channel: p.channel,
@@ -326,6 +352,8 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
           edges: Array.from(edgeMap.values()),
           view: viewJson,
           plan: planJson,
+          dir: swarmDir,
+          raw: rawBoardText,
           availableModels: catalog.models,
           roleModels: deps.getRoleModelDefaults(),
         };
@@ -406,15 +434,25 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
     }
   });
 
+  server.on("connection", (socket: Socket) => {
+    openSockets.add(socket);
+    socket.once("close", () => openSockets.delete(socket));
+  });
+
   await new Promise<void>((resolve, reject) => {
     const onStartupError = (err: Error) => {
+      dead = true;
       reject(err);
     };
     server.once("error", onStartupError);
     server.listen(port, "127.0.0.1", () => {
       server.removeListener("error", onStartupError);
       server.on("error", (err) => {
+        dead = true;
         console.error("[swarm-runtime] board-server error:", err);
+      });
+      server.on("close", () => {
+        dead = true;
       });
       resolve();
     });
@@ -426,9 +464,20 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
     port: actualPort,
     token,
     url: `http://127.0.0.1:${actualPort}/?token=${token}`,
-    close: () =>
-      new Promise<void>((resolve) => {
+    isAlive: () => !dead,
+    close: () => {
+      dead = true;
+      for (const socket of openSockets) {
+        try {
+          socket.destroy();
+        } catch {
+          // Ignore socket destroy error
+        }
+      }
+      openSockets.clear();
+      return new Promise<void>((resolve) => {
         server.close(() => resolve());
-      }),
+      });
+    },
   };
 }
