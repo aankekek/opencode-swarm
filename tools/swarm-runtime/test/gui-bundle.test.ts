@@ -51,6 +51,12 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("toastEnabled");
     expect(code).toContain("pinned");
 
+    // Pixel-Bee Web View is default and only side-tab body
+    expect(code).toContain("swarm-gui-iframe");
+    expect(code).toContain("swarm:theme");
+    expect(code).toContain("swarm:open_session");
+    expect(code).not.toContain("Pixel-Bee Web View");
+
     // Zero bundled host modules
     expect(code).not.toContain("@opencode/ui");
     expect(code).not.toContain("node:sqlite");

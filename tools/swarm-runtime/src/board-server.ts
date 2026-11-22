@@ -112,25 +112,54 @@ const PRELOAD_JS = `(() => {
     root.dataset.theme = isLight ? 'light' : 'dark';
     root.style.colorScheme = isLight ? 'light' : 'dark';
     if (isLight) {
-      root.style.setProperty('--background', '#fafafa');
-      root.style.setProperty('--foreground', '#18181b');
+      root.style.setProperty('--background', '#f8f8f7');
+      root.style.setProperty('--foreground', '#0b0b0b');
+      root.style.setProperty('--secondary-foreground', '#52514e');
       root.style.setProperty('--card', '#ffffff');
-      root.style.setProperty('--border', '#e4e4e7');
-      root.style.setProperty('--primary', '#2563eb');
-      root.style.setProperty('--muted-foreground', '#71717a');
+      root.style.setProperty('--secondary', '#f1f1ef');
+      root.style.setProperty('--muted', '#f4f4f2');
+      root.style.setProperty('--border', '#e7e6e2');
+      root.style.setProperty('--card-border', '#e7e6e2');
+      root.style.setProperty('--primary', '#2a78d6');
+      root.style.setProperty('--muted-foreground', '#8a8984');
+      root.style.setProperty('--sw-success', '#0ca30c');
+      root.style.setProperty('--sw-warning', '#d99a0b');
+      root.style.setProperty('--sw-error', '#d03b3b');
     } else {
-      root.style.setProperty('--background', '#0f1115');
-      root.style.setProperty('--foreground', '#e6e8ec');
-      root.style.setProperty('--card', '#161a22');
-      root.style.setProperty('--border', '#252b36');
-      root.style.setProperty('--primary', '#3b82f6');
-      root.style.setProperty('--muted-foreground', '#8b93a1');
+      root.style.setProperty('--background', '#141413');
+      root.style.setProperty('--foreground', '#ededec');
+      root.style.setProperty('--secondary-foreground', '#b5b4b0');
+      root.style.setProperty('--card', '#1d1d1c');
+      root.style.setProperty('--secondary', '#262625');
+      root.style.setProperty('--muted', '#1a1a19');
+      root.style.setProperty('--border', '#2f2f2d');
+      root.style.setProperty('--card-border', '#2f2f2d');
+      root.style.setProperty('--primary', '#4a90e2');
+      root.style.setProperty('--muted-foreground', '#8a8984');
+      root.style.setProperty('--sw-success', '#2cc28c');
+      root.style.setProperty('--sw-warning', '#f0b429');
+      root.style.setProperty('--sw-error', '#e05252');
     }
   };
   applyTheme();
   if (window.matchMedia) {
     window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyTheme);
   }
+  window.addEventListener('message', (event) => {
+    const data = event && event.data;
+    if (!data || data.type !== 'swarm:theme') return;
+    if (data.mode === 'light' || data.mode === 'dark') {
+      root.dataset.theme = data.mode;
+      root.style.colorScheme = data.mode;
+    }
+    if (data.tokens && typeof data.tokens === 'object') {
+      for (const [k, v] of Object.entries(data.tokens)) {
+        if (typeof v === 'string' && v.trim()) {
+          root.style.setProperty(k, v.trim());
+        }
+      }
+    }
+  });
   const token = new URLSearchParams(window.location.search).get('token');
   if (token && typeof window.fetch === 'function') {
     const origFetch = window.fetch.bind(window);
@@ -191,9 +220,17 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
 
         const members = deps.db.listMembers(swarm.id, true);
         const channels = deps.db.listChannels(swarm.id);
-        const { posts } = deps.db.getPostsPage(swarm.id, 0, 500, "*");
+        const { posts, hasMore } = deps.db.getLatestPostsWindow(swarm.id, 500, "*");
         const latestPost = deps.db.getLatestPost(swarm.id);
         const head = latestPost ? latestPost.swarm_seq : 0;
+
+        let unseen: number[] = [];
+        if (convMember && convMember.role !== "coordinator" && convMember.role !== "monitor" && convMember.role !== "narrator") {
+          const allowedChannels = new Set(deps.db.getMemberChannels(swarm.id, convMember.id));
+          unseen = posts
+            .filter((p) => p.channel !== "main" && !allowedChannels.has(p.channel))
+            .map((p) => p.swarm_seq);
+        }
 
         const postCounts = new Map<string, number>();
         const edgeMap = new Map<string, { from: string; to: string; count: number; viaAll: boolean }>();
@@ -232,6 +269,8 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
           objective: swarm.objective,
           status: swarm.status,
           head,
+          hasMore,
+          unseen,
           graphTab: true,
           rawTab: true,
           builtinOverview: true,
@@ -288,7 +327,12 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
 
         const etag = createHash("sha1").update(JSON.stringify(payload)).digest("hex").slice(0, 12);
         if (etagParam && etagParam === etag) {
-          return sendJson(res, 200, { swarm: swarm.id, unchanged: true, etag });
+          return sendJson(res, 200, {
+            swarm: swarm.id,
+            unchanged: true,
+            etag,
+            member: convMember?.name ?? null,
+          });
         }
         return sendJson(res, 200, { ...payload, etag });
       }

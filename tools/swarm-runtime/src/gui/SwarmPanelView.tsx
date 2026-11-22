@@ -1,117 +1,109 @@
 import type { DialogHandle } from "@opencode/plugin/gui";
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
-import type { SwarmGuiContext, SwarmMember, SwarmSnapshot, SwarmSummary } from "./types.js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import type { SwarmGuiContext, SwarmSnapshot, SwarmSummary } from "./types.js";
 
 export interface SwarmPanelViewProps {
   ctx: SwarmGuiContext;
   snapshot: () => SwarmSnapshot | null;
   swarms: () => SwarmSummary[];
   selectedSwarmId: () => string | null;
+  sessionId?: () => string | undefined;
   onSelectSwarm: (id: string) => void;
   onRefresh: () => void;
-  onKillMember: (swarmId: string, handle: string) => Promise<void>;
   onCompleteSwarm: (swarmId: string) => Promise<void>;
   onOpenSettings?: () => void;
   rpcError?: () => string | undefined;
   server?: unknown;
 }
 
-function renderHighlightedBody(body: string) {
-  const parts = body.split(/(@[a-zA-Z0-9_-]+)/g);
-  return (
-    <For each={parts}>
-      {(part) =>
-        part.startsWith("@") ? (
-          <span class="swarm-gui-mention">{part}</span>
-        ) : (
-          <span>{part}</span>
-        )
-      }
-    </For>
-  );
-}
-
-function memberDotClass(state: string): string {
-  const s = state.toLowerCase();
-  if (s === "working" || s === "active") return "swarm-gui-dot swarm-gui-dot-working";
-  if (s === "waiting" || s === "idle") return "swarm-gui-dot swarm-gui-dot-waiting";
-  if (s.includes("paused") || s.includes("quota") || s === "stalled") {
-    return "swarm-gui-dot swarm-gui-dot-paused";
-  }
-  return "swarm-gui-dot swarm-gui-dot-killed";
-}
-
 export default function SwarmPanelView(props: SwarmPanelViewProps) {
   const { Button, Dialog } = props.ctx.ui;
+  const [reloadNonce, setReloadNonce] = createSignal(0);
+  let iframeRef: HTMLIFrameElement | undefined;
 
-  const [subTab, setSubTab] = createSignal("board");
-  const [webView, setWebView] = createSignal(false);
-  const [handleFilter, setHandleFilter] = createSignal("");
-  const [autoScroll, setAutoScroll] = createSignal(true);
-  let boardScrollRef: HTMLDivElement | undefined;
+  const boardBaseUrl = createMemo(() => props.snapshot()?.boardUrl ?? "");
+  const activeSwarmId = createMemo(() => props.selectedSwarmId() ?? props.snapshot()?.swarmId ?? "");
 
-  const filteredPosts = createMemo(() => {
-    const snap = props.snapshot();
-    if (!snap) return [];
-    const q = handleFilter().trim().toLowerCase();
-    if (!q) return snap.posts;
-    return snap.posts.filter(
-      (p) =>
-        p.author.toLowerCase().includes(q) ||
-        p.body.toLowerCase().includes(q) ||
-        (p.mentions ?? []).some((m) => m.toLowerCase().includes(q))
-    );
+  const iframeSrc = createMemo(() => {
+    const base = boardBaseUrl();
+    if (!base) return "";
+    const swarmId = activeSwarmId();
+    const convId = props.sessionId?.() ?? "";
+    const nonce = reloadNonce();
+    try {
+      const url = new URL(base);
+      if (swarmId) url.searchParams.set("swarmId", swarmId);
+      if (convId) url.searchParams.set("conversationId", convId);
+      if (nonce > 0) url.searchParams.set("_r", String(nonce));
+      return url.toString();
+    } catch {
+      return base;
+    }
   });
+
+  const expectedOrigin = createMemo(() => {
+    const src = iframeSrc();
+    if (!src) return "";
+    try {
+      return new URL(src).origin;
+    } catch {
+      return "";
+    }
+  });
+
+  const syncThemeToIframe = () => {
+    const win = iframeRef?.contentWindow;
+    const targetOrigin = expectedOrigin();
+    if (!win || !targetOrigin) return;
+    const mode = props.ctx.appearance.mode();
+    const cs = typeof document !== "undefined" ? getComputedStyle(document.documentElement) : null;
+    const readVar = (name: string) => cs?.getPropertyValue(name).trim() || "";
+    const tokens: Record<string, string> = {};
+    const map: Array<[string, string]> = [
+      ["--background", "--background-base"],
+      ["--card", "--surface-raised-base"],
+      ["--secondary", "--surface-base-hover"],
+      ["--foreground", "--text-strong"],
+      ["--secondary-foreground", "--text-base"],
+      ["--muted-foreground", "--text-weak"],
+      ["--border", "--border-weak-base"],
+      ["--card-border", "--border-weak-base"],
+      ["--primary", "--text-interactive-base"],
+      ["--sw-success", "--icon-success-base"],
+      ["--sw-warning", "--icon-warning-base"],
+      ["--sw-error", "--icon-critical-base"],
+      ["--font-family", "--font-family-sans"],
+      ["--editor-font-family", "--font-family-mono"],
+    ];
+    for (const [dest, src] of map) {
+      const val = readVar(src);
+      if (val) tokens[dest] = val;
+    }
+    win.postMessage({ type: "swarm:theme", mode, tokens }, targetOrigin);
+  };
 
   createEffect(() => {
-    filteredPosts();
-    if (autoScroll() && boardScrollRef) {
-      boardScrollRef.scrollTop = boardScrollRef.scrollHeight;
-    }
+    props.ctx.appearance.mode();
+    syncThemeToIframe();
   });
 
-  const openMemberSession = (member: SwarmMember) => {
-    const sessionId = member.session_id ?? member.sessionId;
-    if (!sessionId) {
-      props.ctx.toast.show({ title: `No session linked for ${member.handle}` });
-      return;
-    }
-    const server = member.server ?? props.server;
-    if (!server) {
-      props.ctx.toast.show({ title: `No server context for ${member.handle}` });
-      return;
-    }
-    props.ctx.tabs.open({ server: server as never, id: sessionId }, { focus: true });
-  };
-
-  const confirmKillMember = (member: SwarmMember, e: MouseEvent) => {
-    e.stopPropagation();
-    const swarmId = props.snapshot()?.swarmId;
-    if (!swarmId) return;
-    props.ctx.dialogs.open((dialog: DialogHandle) => (
-      <Dialog title={`Kill ${member.handle}?`}>
-        <div style={{ padding: "12px 16px", display: "flex", "flex-direction": "column", gap: "12px" }}>
-          <div>
-            This permanently terminates <strong>{member.handle}</strong> and releases its locks.
-          </div>
-          <div style={{ display: "flex", "justify-content": "flex-end", gap: "8px" }}>
-            <Button variant="ghost" onClick={() => dialog.close()}>
-              Cancel
-            </Button>
-            <Button
-              variant="danger"
-              onClick={async () => {
-                await props.onKillMember(swarmId, member.handle);
-                dialog.close();
-              }}
-            >
-              Kill Member
-            </Button>
-          </div>
-        </div>
-      </Dialog>
-    ));
-  };
+  if (typeof window !== "undefined") {
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== iframeRef?.contentWindow) return;
+      const origin = expectedOrigin();
+      if (origin && event.origin !== origin) return;
+      const data = event.data as { type?: string; sessionID?: string } | null;
+      if (data?.type === "swarm:open_session" && typeof data.sessionID === "string" && data.sessionID) {
+        if (!props.server) {
+          props.ctx.toast.show({ title: "No server context for member session" });
+          return;
+        }
+        props.ctx.tabs.open({ server: props.server as never, id: data.sessionID }, { focus: true });
+      }
+    };
+    window.addEventListener("message", onMessage);
+    onCleanup(() => window.removeEventListener("message", onMessage));
+  }
 
   const confirmCompleteSwarm = () => {
     const snap = props.snapshot();
@@ -146,7 +138,7 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
       <div class="swarm-gui-header">
         <select
           class="swarm-gui-select"
-          value={props.selectedSwarmId() ?? props.snapshot()?.swarmId ?? ""}
+          value={activeSwarmId()}
           onChange={(e) => props.onSelectSwarm(e.currentTarget.value)}
         >
           <Show when={props.swarms().length === 0}>
@@ -162,162 +154,45 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
             )}
           </For>
         </select>
-        <Button size="small" variant="ghost" onClick={() => props.onRefresh()}>
+        <Button
+          size="small"
+          variant="ghost"
+          onClick={() => {
+            props.onRefresh();
+            setReloadNonce((n) => n + 1);
+          }}
+        >
           Refresh
         </Button>
+        <Show when={props.snapshot()?.status === "running"}>
+          <Button size="small" variant="neutral" onClick={confirmCompleteSwarm}>
+            Complete
+          </Button>
+        </Show>
         <Show when={props.onOpenSettings}>
           <Button size="small" variant="ghost" onClick={() => props.onOpenSettings?.()}>
             Settings
           </Button>
         </Show>
-        <Show when={props.snapshot()?.boardUrl}>
-          <Button size="small" variant={webView() ? "contrast" : "ghost"} onClick={() => setWebView(!webView())}>
-            Pixel-Bee Web View
-          </Button>
-        </Show>
       </div>
 
-      <Show when={!props.snapshot()}>
-        <div
-          style={{
-            padding: "8px 12px",
-            "font-size": "11px",
-            color: "var(--text-weak, #9ca3af)",
-            "border-bottom": "1px solid var(--border-weak-base, rgba(255, 255, 255, 0.06))",
-          }}
-        >
-          {props.rpcError?.() ?? "No swarm active in this workspace. Run /swarm <task> to start one."}
-        </div>
-      </Show>
-
       <Show
-        when={!webView() || !props.snapshot()?.boardUrl}
-        fallback={<iframe class="swarm-gui-iframe" src={props.snapshot()?.boardUrl} title="Swarm Board Web View" />}
-      >
-        <div style={{ display: "flex", "flex-direction": "column", flex: 1, "min-height": 0 }}>
-          <div class="swarm-gui-toolbar">
-            <Button size="small" variant={subTab() === "board" ? "contrast" : "ghost"} onClick={() => setSubTab("board")}>
-              Board ({props.snapshot()?.posts.length ?? 0})
-            </Button>
-            <Button size="small" variant={subTab() === "members" ? "contrast" : "ghost"} onClick={() => setSubTab("members")}>
-              Members ({props.snapshot()?.members.length ?? 0})
-            </Button>
-            <Button size="small" variant={subTab() === "locks" ? "contrast" : "ghost"} onClick={() => setSubTab("locks")}>
-              Locks / Graph ({props.snapshot()?.locks.length ?? 0})
-            </Button>
+        when={iframeSrc()}
+        fallback={
+          <div class="swarm-gui-empty">
+            {props.rpcError?.() ?? "No swarm active in this workspace. Run /swarm <task> to start one."}
           </div>
-
-          <Show when={subTab() === "board"}>
-            <div class="swarm-gui-toolbar">
-              <input
-                class="swarm-gui-input"
-                type="text"
-                placeholder="Filter by @handle or text..."
-                value={handleFilter()}
-                onInput={(e) => setHandleFilter(e.currentTarget.value)}
-              />
-              <Button size="small" variant={autoScroll() ? "neutral" : "ghost"} onClick={() => setAutoScroll(!autoScroll())}>
-                {autoScroll() ? "Auto-scroll: On" : "Auto-scroll: Off"}
-              </Button>
-            </div>
-            <div class="swarm-gui-scroll" ref={boardScrollRef}>
-              <For each={filteredPosts()}>
-                {(post) => (
-                  <div class="swarm-gui-post">
-                    <div class="swarm-gui-post-head">
-                      <span class="swarm-gui-author">@{post.author.replace(/^@/, "")}</span>
-                      <span class="swarm-gui-time">{post.createdAt ?? post.created_at ?? ""}</span>
-                    </div>
-                    <div class="swarm-gui-post-body">{renderHighlightedBody(post.body)}</div>
-                  </div>
-                )}
-              </For>
-            </div>
-          </Show>
-
-          <Show when={subTab() === "members"}>
-            <div class="swarm-gui-toolbar" style={{ "justify-content": "space-between" }}>
-              <span>Click a member to open its session</span>
-              <Show when={props.snapshot()?.status !== "completed"}>
-                <Button size="small" variant="neutral" onClick={confirmCompleteSwarm}>
-                  Complete Swarm
-                </Button>
-              </Show>
-            </div>
-            <div class="swarm-gui-scroll">
-              <For each={props.snapshot()?.members ?? []}>
-                {(member) => (
-                  <div class="swarm-gui-member" onClick={() => openMemberSession(member)}>
-                    <div class="swarm-gui-member-head">
-                      <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-                        <span class={memberDotClass(member.state)} />
-                        <span class="swarm-gui-author">@{member.handle.replace(/^@/, "")}</span>
-                        <span class="swarm-gui-time">[{member.state}]</span>
-                      </div>
-                      <Show when={member.handle !== "coordinator" && member.state !== "killed"}>
-                        <Button size="small" variant="ghost" onClick={(e: MouseEvent) => confirmKillMember(member, e)}>
-                          Kill
-                        </Button>
-                      </Show>
-                    </div>
-                    <div class="swarm-gui-meta">
-                      <Show when={member.model}>
-                        <span>
-                          {member.model}
-                          {member.variant ? ` (${member.variant})` : ""}
-                        </span>
-                      </Show>
-                      <Show when={member.trackStatus}>
-                        <span>· {member.trackStatus}</span>
-                      </Show>
-                    </div>
-                    <Show when={(member.ownedGlobs ?? []).length > 0}>
-                      <div class="swarm-gui-meta">Owns: {(member.ownedGlobs ?? []).join(", ")}</div>
-                    </Show>
-                  </div>
-                )}
-              </For>
-            </div>
-          </Show>
-
-          <Show when={subTab() === "locks"}>
-            <div class="swarm-gui-scroll">
-              <table class="swarm-gui-table">
-                <thead>
-                  <tr>
-                    <th>Glob</th>
-                    <th>Owner</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <For each={props.snapshot()?.locks ?? []}>
-                    {(lock) => (
-                      <tr>
-                        <td>{lock.glob}</td>
-                        <td>@{lock.owner.replace(/^@/, "")}</td>
-                      </tr>
-                    )}
-                  </For>
-                </tbody>
-              </table>
-              <Show when={(props.snapshot()?.handoffs ?? []).length > 0}>
-                <div style={{ "margin-top": "8px", "font-weight": 600 }}>Mention / Handoff Flow</div>
-                <For each={props.snapshot()?.handoffs ?? []}>
-                  {(h) => (
-                    <div class="swarm-gui-meta">
-                      <span>@{h.from.replace(/^@/, "")}</span>
-                      <span>→</span>
-                      <span>@{h.to.replace(/^@/, "")}</span>
-                      <Show when={h.summary}>
-                        <span>({h.summary})</span>
-                      </Show>
-                    </div>
-                  )}
-                </For>
-              </Show>
-            </div>
-          </Show>
-        </div>
+        }
+      >
+        <iframe
+          ref={(el) => {
+            iframeRef = el;
+          }}
+          class="swarm-gui-iframe"
+          src={iframeSrc()}
+          title="Swarm Board"
+          onLoad={() => syncThemeToIframe()}
+        />
       </Show>
     </div>
   );

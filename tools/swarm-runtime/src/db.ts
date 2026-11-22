@@ -188,6 +188,12 @@ export class SwarmBoardDB {
           `Session already belongs to active swarm '${existingActive.swarm_id}' as ${existingActive.name}. Complete it first.`,
         );
       }
+      const workspaceActive = this.getActiveSwarms();
+      if (workspaceActive.length > 0) {
+        throw new Error(
+          `Workspace already has an active swarm '${workspaceActive[0].id}' (${workspaceActive[0].title}). Complete it first.`,
+        );
+      }
 
       const swarmId = `sw_${randomUUID().slice(0, 8)}`;
       const now = Date.now();
@@ -214,7 +220,7 @@ export class SwarmBoardDB {
              model_provider, model_id, model_variant, workspace_mode, workspace_dir, workspace_branch,
              brief, state, wake_mode, wait_since, last_read_seq, last_post_seq, last_post_time,
              steps, activity, activity_kind, last_error, paused_quota, track_status, last_active_at
-           ) VALUES (?, ?, 'coordinator', 1, ?, 'coordinator', 'user', NULL, ?, ?, ?, 'inherit', ?, NULL, ?, 'working', 'any', 0, 0, 0, NULL, 0, NULL, NULL, NULL, 0, 'open', ?)`,
+           ) VALUES (?, ?, 'coordinator', 1, ?, 'coordinator', 'user', NULL, ?, ?, ?, 'inherit', ?, NULL, ?, 'working', 'mentions', 0, 0, 0, NULL, 0, NULL, NULL, NULL, 0, 'open', ?)`,
         )
         .run(
           coordId,
@@ -254,8 +260,8 @@ export class SwarmBoardDB {
     const currentPid = process.pid;
 
     for (const swarm of active) {
-      // RT-M6: If swarm is owned by another live process, do not clobber it
-      if (swarm.owner_pid && swarm.owner_pid !== currentPid && this.isPidAlive(swarm.owner_pid)) {
+      // S2: If swarm is owned by this process or another live process, do not clobber it
+      if (swarm.owner_pid && (swarm.owner_pid === currentPid || this.isPidAlive(swarm.owner_pid))) {
         continue;
       }
 
@@ -292,7 +298,7 @@ export class SwarmBoardDB {
 
   getActiveSwarms(): SwarmRow[] {
     return this.db
-      .prepare(`SELECT * FROM swarms WHERE status IN ('running', 'completing')`)
+      .prepare(`SELECT * FROM swarms WHERE status IN ('running', 'completing') ORDER BY created_at DESC, rowid DESC`)
       .all() as unknown as SwarmRow[];
   }
 
@@ -676,6 +682,30 @@ export class SwarmBoardDB {
     }
     const hasMore = rows.length > limit;
     return { posts: hasMore ? rows.slice(0, limit) : rows, hasMore };
+  }
+
+  getLatestPostsWindow(
+    swarmId: string,
+    limit = 500,
+    channelsFilter?: string[] | "*",
+  ): { posts: BoardPostRow[]; hasMore: boolean } {
+    let rows: BoardPostRow[];
+    if (!channelsFilter || channelsFilter === "*") {
+      rows = this.db
+        .prepare(`SELECT * FROM board_posts WHERE swarm_id = ? ORDER BY swarm_seq DESC LIMIT ?`)
+        .all(swarmId, limit + 1) as unknown as BoardPostRow[];
+    } else {
+      const placeholders = channelsFilter.map(() => "?").join(", ");
+      rows = this.db
+        .prepare(
+          `SELECT * FROM board_posts WHERE swarm_id = ? AND channel IN (${placeholders}) ORDER BY swarm_seq DESC LIMIT ?`,
+        )
+        .all(swarmId, ...channelsFilter, limit + 1) as unknown as BoardPostRow[];
+    }
+    const hasMore = rows.length > limit;
+    const sliced = hasMore ? rows.slice(0, limit) : rows;
+    sliced.reverse();
+    return { posts: sliced, hasMore };
   }
 
   getLatestPost(swarmId: string): BoardPostRow | undefined {

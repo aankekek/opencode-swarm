@@ -440,6 +440,7 @@ export default Plugin.define({
               snapshot={snapshot}
               swarms={swarms}
               selectedSwarmId={selectedSwarmId}
+              sessionId={() => props.session.id}
               onSelectSwarm={(id) => setSelectedSwarmId(id)}
               onRefresh={() => void refresh()}
               onOpenSettings={openSwarmSettings}
@@ -450,10 +451,6 @@ export default Plugin.define({
                 }
                 if (s.state === "error") return s.message;
                 return undefined;
-              }}
-              onKillMember={async (swarmId, handle) => {
-                await getRpc().killMember({ swarmId, handle }, getCallOptions());
-                await refresh();
               }}
               onCompleteSwarm={async (swarmId) => {
                 await getRpc().completeSwarm({ swarmId }, getCallOptions());

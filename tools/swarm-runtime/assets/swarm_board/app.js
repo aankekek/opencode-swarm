@@ -322,7 +322,7 @@
     closeGifModal();
     frameTeardown();
     frame.failed = null;
-    state.tabChosen = urlTabChosen;
+    state.tabChosen = state.tabChosen || urlTabChosen;
   }
 
   function showView(view) {
@@ -371,6 +371,8 @@
       }
       const q = new URLSearchParams({etag: state.etag});
       if (conv) q.set('conversationId', conv);
+      const urlSwarmId = params.get('swarmId');
+      if (urlSwarmId) q.set('swarmId', urlSwarmId);
       const r = await getJson(`/api/swarm?${q}`);
       state.lastOk = Date.now();
       if (!r.swarm) {
@@ -381,7 +383,7 @@
         return;
       }
       if (r.swarm !== state.swarm) resetSwarm(r.swarm);
-      state.me = r.member || null;
+      if ('member' in r) state.me = r.member || null;
       if (!r.unchanged) {
         state.etag = r.etag;
         ingest(r);
@@ -2673,7 +2675,10 @@
   const TABS = ['overview', 'feed', 'members', 'graph', 'raw'];
   // byUser: an explicit choice, which stops the Overview/Board auto-pick.
   function selectTab(tab, focus = false, byUser = false) {
-    if (byUser) state.tabChosen = true;
+    if (byUser) {
+      state.tabChosen = true;
+      try { sessionStorage.setItem('swarm_board_tab', tab); } catch {}
+    }
     document.querySelectorAll('.tab').forEach((x) => {
       const on = x.dataset.tab === tab;
       x.classList.toggle('active', on);
@@ -2856,6 +2861,16 @@
   // URL params: ?tab=overview|feed|members|graph|raw; ?replay=N;
   // ?narrator=plain; ?conversationId=X stands in for the pane's conversation
   // when the page is opened standalone.
+  if (!urlTabChosen) {
+    try {
+      const savedTab = sessionStorage.getItem('swarm_board_tab');
+      if (savedTab && TABS.includes(savedTab)) {
+        initialTab = savedTab;
+        urlTabChosen = true;
+        state.tabChosen = true;
+      }
+    } catch {}
+  }
   if (urlTabChosen) selectTab(initialTab, false, true);
   if (params.get('replay'))
     replay.idx = parseInt(params.get('replay'), 10) || 0;

@@ -132,10 +132,25 @@ describe("board-server", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/swarm`);
       expect(res.status).toBe(200);
-      const data = (await res.json()) as { swarm: string; head: number; messages: unknown[] };
+      const data = (await res.json()) as {
+        swarm: string;
+        head: number;
+        hasMore: boolean;
+        etag: string;
+        messages: Array<{ seq: number }>;
+      };
       expect(data.swarm).toBe(swarm.id);
       expect(data.head).toBe(505);
+      expect(data.hasMore).toBe(true);
       expect(data.messages.length).toBe(500);
+      expect(data.messages[0].seq).toBe(6);
+      expect(data.messages[data.messages.length - 1].seq).toBe(505);
+
+      // K2: unchanged fast path must include member
+      const unchangedRes = await fetch(`http://127.0.0.1:${handle.port}/api/swarm?etag=${data.etag}`);
+      const unchangedData = (await unchangedRes.json()) as { unchanged: boolean; member: string | null };
+      expect(unchangedData.unchanged).toBe(true);
+      expect("member" in unchangedData).toBe(true);
     } finally {
       await handle.close();
       sqlite.close();

@@ -204,6 +204,9 @@ export const swarmRuntimePlugin = Plugin.define({
     };
 
     async function wakeMember(member: MemberRow, triggerPost: BoardPostRow) {
+      const swarm = db.getSwarm(member.swarm_id);
+      if (!swarm || swarm.status !== "running") return;
+
       // If member is parked on swarm_wait in-process, resolve its waiter directly
       const waiter = waiters.get(member.id);
       if (waiter) {
@@ -211,6 +214,7 @@ export const swarmRuntimePlugin = Plugin.define({
         if (matched.length > 0) {
           waiters.delete(member.id);
           db.setMemberState(member.id, "working");
+          db.advanceReadCursor(member.id, matched[matched.length - 1].swarm_seq);
           waiter.resolve(matched);
           return;
         }
@@ -219,36 +223,47 @@ export const swarmRuntimePlugin = Plugin.define({
         return;
       }
 
-      // Medium 7: channel-isolated fallback feed (no cross-channel leaks)
-      const isGlobal = member.role === "coordinator" || member.role === "monitor" || member.role === "narrator";
-      const memberChannels = isGlobal ? "*" : db.getMemberChannels(member.swarm_id, member.id);
-      const { posts } = db.getPostsPage(member.swarm_id, member.last_read_seq, 25, memberChannels);
-      const delivered = posts.length > 0 ? posts : [triggerPost];
-      const lastSeq = delivered[delivered.length - 1].swarm_seq;
+      // Never inject [SWARM BOARD WAKE-UP] prompts into the user's coordinator chat.
+      // When @coordinator is parked in swarm_wait, the waiter branch above wakes it silently.
+      if (member.role === "coordinator") {
+        return;
+      }
 
-      const feed = delivered
+      const fresh = db.getMemberById(member.id);
+      if (!fresh || fresh.state === "killed" || fresh.last_read_seq >= triggerPost.swarm_seq) {
+        return;
+      }
+
+      // Medium 7: channel-isolated fallback feed (no cross-channel leaks)
+      const isGlobal = fresh.role === "monitor" || fresh.role === "narrator";
+      const memberChannels = isGlobal ? "*" : db.getMemberChannels(fresh.swarm_id, fresh.id);
+      const { posts } = db.getPostsPage(fresh.swarm_id, fresh.last_read_seq, 25, memberChannels);
+      if (posts.length === 0) return;
+      const lastSeq = posts[posts.length - 1].swarm_seq;
+
+      const feed = posts
         .map((p) => `[#${p.swarm_seq} #${p.channel}] @${p.author_name}:\n${p.body}`)
         .join("\n\n");
 
       const promptText = [
-        `[SWARM BOARD WAKE-UP for @${member.name} — Swarm ${member.swarm_id}]`,
+        `[SWARM BOARD WAKE-UP for @${fresh.name} — Swarm ${fresh.swarm_id}]`,
         `New board traffic:`,
         feed,
         ``,
         `Act on your assignment and report via \`post_message\`.`,
       ].join("\n");
 
-      db.setMemberState(member.id, "working");
-      db.advanceReadCursor(member.id, lastSeq);
+      db.setMemberState(fresh.id, "working");
+      db.advanceReadCursor(fresh.id, lastSeq);
       try {
         await ctx.session.prompt({
-          sessionID: member.session_id,
+          sessionID: fresh.session_id,
           text: promptText,
           delivery: "queue",
         });
       } catch (err) {
         // Reset state to waiting on prompt failure so member is not stuck in working
-        db.setMemberState(member.id, "waiting", {
+        db.setMemberState(fresh.id, "waiting", {
           error: err instanceof Error ? err.message : String(err),
         });
         throw err;
@@ -298,6 +313,7 @@ export const swarmRuntimePlugin = Plugin.define({
       const targets = resolveWakeTargets(db, swarmId, authorName, channel, parsed);
       const isMonitorAuthor = authorName === "monitor";
       for (const target of targets) {
+        if (excludeMemberIds?.has(target.id)) continue;
         // RT-M5: Monitor nudges bypass paused_quota so stall breaks can proceed
         if (target.paused_quota === 1 && !isMonitorAuthor) continue;
         try {
@@ -501,11 +517,24 @@ export const swarmRuntimePlugin = Plugin.define({
         channels,
       });
 
-      await ctx.session.prompt({
-        sessionID: childSessionId,
-        text: openingPrompt,
-        delivery: "queue",
-      });
+      try {
+        await ctx.session.prompt({
+          sessionID: childSessionId,
+          text: openingPrompt,
+          delivery: "queue",
+        });
+      } catch (err) {
+        await ctx.session.interrupt({ sessionID: childSessionId }).catch(() => {});
+        db.setMemberState(member.id, "killed");
+        db.releaseLocksForMember(member.id);
+        cleanupMemberWorkspace({
+          mode: wsMode,
+          dir: provisioned.dir,
+          branch: provisioned.branch,
+          repoRoot: canonicalWorkspaceRoot,
+        });
+        throw err;
+      }
 
       return member;
     }
@@ -606,7 +635,7 @@ export const swarmRuntimePlugin = Plugin.define({
             last_active_at: m.last_active_at ?? null,
             activity: m.activity ?? null,
           }));
-          const board_posts = db.getPostsPage(swarm.id, 0, 500, "*").posts.map((p) => ({
+          const board_posts = db.getLatestPostsWindow(swarm.id, 500, "*").posts.map((p) => ({
             seq: p.swarm_seq,
             channel: p.channel,
             author: p.author_name,
@@ -830,8 +859,28 @@ export const swarmRuntimePlugin = Plugin.define({
             const count = tasks ? tasks.length : n;
 
             const spawned: Array<{ name: string; session_id: string; model: string; workspace: string }> = [];
+            const spawnedMembers: MemberRow[] = [];
             try {
               if (count && count > 1) {
+                const wsMode = (input.workspace as WorkspaceMode | undefined) ?? "inherit";
+                const globs = (input.owned_globs as string[] | undefined) ?? [];
+                if (globs.length > 0 && wsMode === "inherit") {
+                  return toolJson({
+                    ok: false,
+                    error:
+                      "Cannot assign identical owned_globs to multiple inherit-mode shards; spawn individually with disjoint owned_globs or use workspace:'share'.",
+                  });
+                }
+                for (let i = 0; i < count; i++) {
+                  const shardName = validateMemberName(`${baseName}-${i + 1}`);
+                  const existing = db.getMemberByName(swarmId, shardName);
+                  if (existing) {
+                    return toolJson({
+                      ok: false,
+                      error: `Member @${shardName} already exists in swarm ${swarmId} (state: ${existing.state}).`,
+                    });
+                  }
+                }
                 for (let i = 0; i < count; i++) {
                   const sliceBrief = tasks ? `${brief}\n\nAssigned slice: ${tasks[i]}` : brief;
                   const m = await spawnSingleMember({
@@ -848,6 +897,7 @@ export const swarmRuntimePlugin = Plugin.define({
                     ownedGlobs: input.owned_globs as string[] | undefined,
                     groupPrefix: baseName,
                   });
+                  spawnedMembers.push(m);
                   spawned.push({
                     name: m.name,
                     session_id: m.session_id,
@@ -873,6 +923,7 @@ export const swarmRuntimePlugin = Plugin.define({
                   channels: input.channels as string[] | undefined,
                   ownedGlobs: input.owned_globs as string[] | undefined,
                 });
+                spawnedMembers.push(m);
                 spawned.push({
                   name: m.name,
                   session_id: m.session_id,
@@ -886,6 +937,17 @@ export const swarmRuntimePlugin = Plugin.define({
               }
               return toolJson({ ok: true, swarm_id: swarmId, spawned, open_board: boardServer?.url ?? "" });
             } catch (err) {
+              for (const m of spawnedMembers) {
+                await ctx.session.interrupt({ sessionID: m.session_id }).catch(() => {});
+                db.setMemberState(m.id, "killed");
+                db.releaseLocksForMember(m.id);
+                cleanupMemberWorkspace({
+                  mode: m.workspace_mode,
+                  dir: m.workspace_dir,
+                  branch: m.workspace_branch,
+                  repoRoot: canonicalWorkspaceRoot,
+                });
+              }
               return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
             }
           }
@@ -1160,7 +1222,8 @@ export const swarmRuntimePlugin = Plugin.define({
           }
 
           const { posts, hasMore } = db.getPostsPage(caller.swarm_id, since, limit, filter);
-          if (posts.length > 0) {
+          const readingAllVisible = !input.channel || input.channel === "*";
+          if (posts.length > 0 && readingAllVisible) {
             db.advanceReadCursor(caller.id, posts[posts.length - 1].swarm_seq);
           }
           return toolJson({
@@ -1208,6 +1271,12 @@ export const swarmRuntimePlugin = Plugin.define({
                 text: p.body,
               })),
             });
+          }
+
+          const prevWaiter = waiters.get(caller.id);
+          if (prevWaiter) {
+            waiters.delete(caller.id);
+            prevWaiter.resolve([]);
           }
 
           db.setMemberWait(caller.id, mentionsOnly ? "mentions" : "any", sinceSeq);

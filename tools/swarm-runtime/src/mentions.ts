@@ -58,6 +58,12 @@ export function resolveWakeTargets(
   for (const m of liveMembers) {
     if (m.name === authorName) continue;
 
+    const isGlobalRole = m.role === "coordinator" || m.role === "monitor" || m.role === "narrator";
+    const memberChannels = isGlobalRole ? [] : db.getMemberChannels(swarmId, m.id);
+    if (!isGlobalRole && channel !== "main" && !memberChannels.includes(channel)) {
+      continue;
+    }
+
     // 1. @all wakes every live member
     if (parsed.isAll) {
       targets.set(m.id, m);
@@ -75,8 +81,6 @@ export function resolveWakeTargets(
 
     // 3. @#channel wakes subscribers of that channel (+ coordinator/monitor/narrator)
     if (parsed.channelMentions.length > 0) {
-      const memberChannels = db.getMemberChannels(swarmId, m.id);
-      const isGlobalRole = m.role === "coordinator" || m.role === "monitor" || m.role === "narrator";
       const channelHit = parsed.channelMentions.some((ch) => {
         const chRow = db.getChannel(swarmId, ch);
         if (!chRow || chRow.archived) return false;
@@ -89,9 +93,7 @@ export function resolveWakeTargets(
     }
 
     // 4. Members parked with wake_mode='any' wake on any post in their visible channels
-    if (m.wake_mode === "any") {
-      const isGlobalRole = m.role === "coordinator" || m.role === "monitor" || m.role === "narrator";
-      const memberChannels = db.getMemberChannels(swarmId, m.id);
+    if (m.wake_mode === "any" && m.state === "waiting") {
       if (isGlobalRole || channel === "main" || memberChannels.includes(channel)) {
         targets.set(m.id, m);
       }

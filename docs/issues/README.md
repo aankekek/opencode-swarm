@@ -6,14 +6,17 @@ Findings for `tools/swarm-runtime` and the repo-root OpenCode config. This folde
 |---|---|
 | [`2026-11-22-user-issues.md`](./2026-11-22-user-issues.md) | User-facing issue audit (install, GUI, board, workflow, docs) - full reports + consolidated list |
 | [`2026-11-22-user-issues.json`](./2026-11-22-user-issues.json) | Machine-readable version (7 blockers, 29 majors, 20 minors) |
+| [`2026-11-22-concurrency-state-contract-audit.md`](./2026-11-22-concurrency-state-contract-audit.md) | Concurrency/state/contract audit - 11 defects, 10 invariants (full reports + consolidated list) |
+| [`2026-11-22-concurrency-state-contract.json`](./2026-11-22-concurrency-state-contract.json) | Machine-readable version (5 concurrency, 2 state, 4 contract) |
 | [`2026-11-22-swarm-runtime-audit.md`](./2026-11-22-swarm-runtime-audit.md) | First audit: internal security/runtime/compatibility reports |
 | [`2026-11-22-findings.json`](./2026-11-22-findings.json) | Machine-readable version of the first audit (48 items) |
 | [`2026-11-22-fix-status.md`](./2026-11-22-fix-status.md) | What the dev/fixer hardening update fixed and what remains |
 
 **First audit counts:** 1 critical, 11 high, 12 medium, 23 low/minor.
 **User-issues pass:** 7 blockers, 29 major, 20 minor. Verifier confirmed 12/12 top claims.
+**Concurrency/state/contract pass:** 11 genuine defects (5 concurrency, 2 state, 4 contract). Verifier: 9 PASS, 1 PARTIAL, 0 FAIL.
 
-**Baseline:** `bun install` 398 packages; `bun run typecheck` clean; `bun test` 22 pass / 0 fail; `bun run build:gui` 4.01 kB.
+**Current baseline:** `bun install` 398 packages; `bun run typecheck` clean; `bun test` 24 pass / 0 fail; `bun run build:gui` 21.83 kB.
 
 ## Top blockers
 

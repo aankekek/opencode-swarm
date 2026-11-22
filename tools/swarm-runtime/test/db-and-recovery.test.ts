@@ -32,9 +32,25 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       });
       db1.close();
 
-      // Reopen DB -> simulate crash recovery (Review 3 Test 3)
+      // Reopen DB -> same-PID reload must preserve the live swarm (S2)
       const sqlite2 = await openSqliteDatabase(dbPath);
       const db2 = new SwarmBoardDB(sqlite2, dir);
+      const samePidReconciled = db2.reconcileStaleSwarmsOnStartup();
+      expect(samePidReconciled.length).toBe(0);
+      expect(db2.getSwarm(s2.id)?.status).toBe("running");
+
+      // S1: Second active swarm in the same workspace is rejected while s2 is running
+      expect(() =>
+        db2.createSwarmWithCoordinator({
+          title: "Duplicate Workspace Swarm",
+          objective: "Should fail",
+          coordinatorSessionId: "sess_coord_2",
+          workspaceDir: dir,
+        }),
+      ).toThrow(/Workspace already has an active swarm/);
+
+      // Simulate dead foreign PID crash recovery
+      sqlite2.prepare(`UPDATE swarms SET owner_pid = 999999 WHERE id = ?`).run(s2.id);
       const reconciled = db2.reconcileStaleSwarmsOnStartup();
       expect(reconciled.length).toBe(1);
       expect(reconciled[0].id).toBe(s2.id);
