@@ -483,6 +483,214 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
     );
   });
 
+  test("add assigns the first open plan unit when no task_ids are given", async () => {
+    await withBridgeHarness(async ({ registeredTools, registeredHandlers }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Auto assign" }, toolCtx);
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["write parser", "add tests", "update docs"] }, toolCtx),
+      );
+      expect(plan.ok).toBe(true);
+
+      const res = parseToolResult(await swarmTool.execute({ action: "add", name: "alpha", brief: "work" }, toolCtx));
+      expect(res.ok).toBe(true);
+      expect(res.total_units).toBe(3);
+      expect(res.assigned_units).toBe(1);
+      expect(res.unassigned_units).toBe(2);
+      expect(res.done_units).toBe(0);
+
+      // The worker's brief names the unit it owns.
+      const snap = (await registeredHandlers.getSwarmSnapshot({ sessionId: "coord-sess-1" })) as {
+        board_posts: Array<{ body: string }>;
+      };
+      expect(snap.board_posts.some((p) => p.body.includes("Assigned unit: write parser"))).toBe(true);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.tasks).toHaveLength(3);
+      const first = status.tasks.find((t: { id: number }) => t.id === plan.task_ids[0]);
+      expect(first.status).toBe("assigned");
+      expect(first.assignee).toBe("alpha");
+      expect(status.tasks.filter((t: { status: string }) => t.status === "open")).toHaveLength(2);
+    });
+  });
+
+  test("add with tasks assigns the first N open units to the shard batch", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Batch assign" }, toolCtx);
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["unit one", "unit two", "unit three"] }, toolCtx),
+      );
+
+      const res = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "pair", brief: "work", tasks: ["a", "b"] }, toolCtx),
+      );
+      expect(res.ok).toBe(true);
+      expect(res.spawned).toHaveLength(2);
+      expect(res.assigned_units).toBe(2);
+      expect(res.unassigned_units).toBe(1);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.tasks.find((t: { id: number }) => t.id === plan.task_ids[0]).status).toBe("assigned");
+      expect(status.tasks.find((t: { id: number }) => t.id === plan.task_ids[1]).status).toBe("assigned");
+      expect(status.tasks.find((t: { id: number }) => t.id === plan.task_ids[2]).status).toBe("open");
+    });
+  });
+
+  test("explicit task_ids assigns exactly that unit and leaves earlier units open", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Explicit ids" }, toolCtx);
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["first", "second", "third"] }, toolCtx),
+      );
+
+      const res = parseToolResult(
+        await swarmTool.execute(
+          { action: "add", name: "picked", brief: "work", task_ids: [plan.task_ids[1]] },
+          toolCtx,
+        ),
+      );
+      expect(res.ok).toBe(true);
+      expect(res.assigned_units).toBe(1);
+      expect(res.unassigned_units).toBe(2);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      const second = status.tasks.find((t: { id: number }) => t.id === plan.task_ids[1]);
+      expect(second.status).toBe("assigned");
+      expect(second.assignee).toBe("picked");
+      expect(status.tasks.find((t: { id: number }) => t.id === plan.task_ids[0]).status).toBe("open");
+    });
+  });
+
+  test("add rejects mismatched task_ids and task_ids on non-workers without spawning", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Id guards" }, toolCtx);
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["one", "two", "three"] }, toolCtx),
+      );
+
+      const mismatch = parseToolResult(
+        await swarmTool.execute(
+          { action: "add", name: "pair", brief: "work", tasks: ["a", "b"], task_ids: [plan.task_ids[0]] },
+          toolCtx,
+        ),
+      );
+      expect(mismatch.ok).toBe(false);
+      expect(String(mismatch.error)).toContain("provide exactly one id per member");
+
+      const nonInteger = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "bad", brief: "work", task_ids: ["1"] }, toolCtx),
+      );
+      expect(nonInteger.ok).toBe(false);
+      expect(String(nonInteger.error)).toContain("array of integer unit ids");
+
+      const verifier = parseToolResult(
+        await swarmTool.execute(
+          { action: "add", name: "check", role: "verifier", brief: "verify", task_ids: [plan.task_ids[0]] },
+          toolCtx,
+        ),
+      );
+      expect(verifier.ok).toBe(false);
+      expect(String(verifier.error)).toContain("only be assigned to workers");
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.members.filter((m: { role: string }) => m.role === "worker")).toHaveLength(0);
+      expect(status.members.filter((m: { role: string }) => m.role === "verifier")).toHaveLength(0);
+      expect(status.assigned_units).toBe(0);
+    });
+  });
+
+  test("add rejects more workers than open units in the plan", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Unit shortage" }, toolCtx);
+      await swarmTool.execute({ action: "plan", tasks: ["only unit"] }, toolCtx);
+
+      const res = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "extra", brief: "work", tasks: ["a", "b"] }, toolCtx),
+      );
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toContain("would leave some without a unit");
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.members.filter((m: { role: string }) => m.role === "worker")).toHaveLength(0);
+      expect(status.unassigned_units).toBe(1);
+    });
+  });
+
+  test("verifier spawn with a plan and no ids consumes no unit", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Verifier plan" }, toolCtx);
+      await swarmTool.execute({ action: "plan", tasks: ["one", "two", "three"] }, toolCtx);
+
+      const res = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "check", role: "verifier", brief: "verify" }, toolCtx),
+      );
+      expect(res.ok).toBe(true);
+      expect(res.total_units).toBe(3);
+      expect(res.assigned_units).toBe(0);
+      expect(res.unassigned_units).toBe(3);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.tasks.every((t: { status: string }) => t.status === "open")).toBe(true);
+    });
+  });
+
+  test("worker completion marks its plan units done and moves counts", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const postTool = registeredTools.get("post_message")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Done counts" }, toolCtx);
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["finish me", "leave me"] }, toolCtx),
+      );
+
+      const add = parseToolResult(await swarmTool.execute({ action: "add", name: "solo", brief: "work" }, toolCtx));
+      expect(add.ok).toBe(true);
+      expect(add.assigned_units).toBe(1);
+
+      const workerCtx = { sessionID: add.spawned[0].session_id };
+      const done = parseToolResult(await postTool.execute({ text: "[done] finished", mark_done: true }, workerCtx));
+      expect(done.ok).toBe(true);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.total_units).toBe(2);
+      expect(status.assigned_units).toBe(0);
+      expect(status.done_units).toBe(1);
+      expect(status.open_units).toBe(1);
+      expect(status.unassigned_units).toBe(1);
+      expect(status.tasks.find((t: { id: number }) => t.id === plan.task_ids[0]).status).toBe("done");
+      expect(status.tasks.find((t: { id: number }) => t.id === plan.task_ids[1]).status).toBe("open");
+    });
+  });
+
+  test("status reports zero units and an empty task list with no plan", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "No plan" }, toolCtx);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.total_units).toBe(0);
+      expect(status.open_units).toBe(0);
+      expect(status.assigned_units).toBe(0);
+      expect(status.done_units).toBe(0);
+      expect(status.unassigned_units).toBe(0);
+      expect(status.tasks).toEqual([]);
+      expect(status.tasks_truncated).toBe(false);
+    });
+  });
+
   test("invalid worker and shard options fall back to defaults", async () => {
     await withBridgeHarness(
       async ({ registeredTools }) => {

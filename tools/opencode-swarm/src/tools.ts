@@ -5,7 +5,14 @@ import { formatModelSpec, listAvailableModels } from "./models.js";
 import { hasFreshVerifierPass } from "./monitor.js";
 import type { SwarmChangedEvent } from "./rpc.js";
 import { normalizeHandle, validateMemberName } from "./security.js";
-import type { BoardPostRow, MemberRole, MemberRow, PluginOptions, WorkspaceMode } from "./types.js";
+import type {
+  BoardPostRow,
+  MemberRole,
+  MemberRow,
+  PluginOptions,
+  SwarmTaskRow,
+  WorkspaceMode,
+} from "./types.js";
 import type { WaiterEntry } from "./wake.js";
 import { cleanupMemberWorkspace } from "./workspace.js";
 
@@ -190,15 +197,42 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
         if (action === "status") {
           const caller = db.getLatestMemberBySession(toolCtx.sessionID);
           if (!caller) {
-            return toolJson({ ok: true, swarm: null, open_board: "" });
+            return toolJson({
+              ok: true,
+              swarm: null,
+              open_board: "",
+              total_units: 0,
+              open_units: 0,
+              assigned_units: 0,
+              done_units: 0,
+              unassigned_units: 0,
+              tasks: [],
+              tasks_truncated: false,
+            });
           }
           const swarm = db.getSwarm(caller.swarm_id);
           const members = db.listMembers(caller.swarm_id, true);
           const locks = db.listLocks(caller.swarm_id);
+          const planTasks = db.listTasks(caller.swarm_id);
+          const counts = db.getTaskCounts(caller.swarm_id);
+          const visibleTasks = planTasks.slice(0, 100).map((t) => ({
+            id: t.id,
+            seq: t.seq,
+            label: t.label,
+            status: t.status,
+            assignee: t.assignee_name,
+          }));
           return toolJson({
             ok: true,
             swarm,
             open_board: caller.role === "coordinator" ? deps.getBoardUrl() : "",
+            total_units: counts.total,
+            open_units: counts.open,
+            assigned_units: counts.assigned,
+            done_units: counts.done,
+            unassigned_units: counts.open,
+            tasks: visibleTasks,
+            tasks_truncated: planTasks.length > visibleTasks.length,
             members: members.map((m) => ({
               name: m.name,
               role: m.role,
@@ -242,6 +276,23 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
           const n = typeof input.n === "number" && input.n > 1 ? Math.floor(input.n) : undefined;
           const count = tasks ? tasks.length : n;
+          let requestedTaskIds: number[] | undefined;
+          if (input.task_ids !== undefined) {
+            if (!Array.isArray(input.task_ids)) {
+              return toolJson({ ok: false, error: "task_ids must be an array of integer unit ids." });
+            }
+            const rawIds = input.task_ids as unknown[];
+            if (!rawIds.every((id) => typeof id === "number" && Number.isInteger(id))) {
+              return toolJson({ ok: false, error: "task_ids must be an array of integer unit ids." });
+            }
+            requestedTaskIds = rawIds as number[];
+          }
+          if (requestedTaskIds && role !== "worker") {
+            return toolJson({
+              ok: false,
+              error: `task_ids can only be assigned to workers; ${role}s do not own units.`,
+            });
+          }
           const cap = positiveInt(deps.options.maxWorkers) ?? 6;
           const shardCap = positiveInt(deps.options.maxShardsPerAdd) ?? 8;
 
@@ -253,6 +304,12 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           }
 
           const requested = count ?? 1;
+          if (requestedTaskIds && requestedTaskIds.length !== requested) {
+            return toolJson({
+              ok: false,
+              error: `task_ids has ${requestedTaskIds.length} id(s) but ${requested} member(s) will be spawned; provide exactly one id per member.`,
+            });
+          }
           const liveWorkersBefore = db.listMembers(swarmId, false).filter((m) => m.role === "worker");
           if (role === "worker" && liveWorkersBefore.length + requested > cap) {
             return toolJson({
@@ -262,6 +319,46 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               cap,
             });
           }
+
+          // Resolve which plan units this add owns before spawning anything.
+          const planTasks = db.listTasks(swarmId);
+          let unitByIndex: Array<SwarmTaskRow | undefined> = [];
+          if (requestedTaskIds) {
+            const byId = new Map(planTasks.map((t) => [t.id, t]));
+            const missing = requestedTaskIds.filter((id) => !byId.has(id));
+            if (missing.length > 0) {
+              return toolJson({
+                ok: false,
+                error: `task_ids not found in this swarm's plan: ${missing.join(", ")}.`,
+              });
+            }
+            const unavailable = requestedTaskIds.filter((id) => byId.get(id)!.status !== "open");
+            if (unavailable.length > 0) {
+              return toolJson({
+                ok: false,
+                error: `task_ids already taken: ${unavailable
+                  .map((id) => `${id} (${byId.get(id)!.status})`)
+                  .join(", ")}.`,
+              });
+            }
+            unitByIndex = requestedTaskIds.map((id) => byId.get(id));
+          } else if (planTasks.length > 0 && role === "worker") {
+            const openTasks = planTasks.filter((t) => t.status === "open");
+            if (openTasks.length < requested) {
+              return toolJson({
+                ok: false,
+                error: `Plan has ${openTasks.length} open unit(s); spawning ${requested} worker(s) would leave some without a unit. Reduce the batch, add units, or spawn without a plan.`,
+              });
+            }
+            unitByIndex = openTasks.slice(0, requested);
+          }
+          const briefFor = (index: number): string => {
+            if (tasks && typeof tasks[index] === "string") {
+              return `${brief}\n\nAssigned slice: ${tasks[index]}`;
+            }
+            const unit = unitByIndex[index];
+            return unit ? `${brief}\n\nAssigned unit: ${unit.label}` : brief;
+          };
 
           const spawned: Array<{ name: string; session_id: string; model: string; workspace: string }> = [];
           const spawnedMembers: MemberRow[] = [];
@@ -288,7 +385,7 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               }
               const normalizedPrefix = normalizeHandle(baseName);
               for (let i = 0; i < count; i++) {
-                const sliceBrief = tasks ? `${brief}\n\nAssigned slice: ${tasks[i]}` : brief;
+                const sliceBrief = briefFor(i);
                 const m = await deps.spawnSingleMember({
                   swarmId,
                   caller,
@@ -321,7 +418,7 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
                 caller,
                 name: baseName,
                 role,
-                brief,
+                brief: briefFor(0),
                 model: input.model as string | undefined,
                 variant: input.variant as string | undefined,
                 workspace: input.workspace as WorkspaceMode | undefined,
@@ -341,7 +438,13 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
                 workspace: m.workspace_mode,
               });
             }
+            for (let i = 0; i < spawnedMembers.length; i++) {
+              const unit = unitByIndex[i];
+              if (!unit) continue;
+              db.assignTasks(swarmId, spawnedMembers[i].id, spawnedMembers[i].name, [unit.id]);
+            }
             const liveWorkersAfter = db.listMembers(swarmId, false).filter((m) => m.role === "worker");
+            const counts = db.getTaskCounts(swarmId);
             return toolJson({
               ok: true,
               swarm_id: swarmId,
@@ -350,6 +453,11 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               cap,
               open_tracks: liveWorkersAfter.filter((m) => m.track_status === "open").length,
               shard_cap: shardCap,
+              total_units: counts.total,
+              open_units: counts.open,
+              assigned_units: counts.assigned,
+              done_units: counts.done,
+              unassigned_units: counts.open,
               open_board: deps.getBoardUrl(),
             });
           } catch (err) {
@@ -678,6 +786,13 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
 
         if (isDonePost || isVerifierPass) {
           db.setTrackStatus(caller.id, "done");
+          if (caller.role === "worker") {
+            try {
+              db.completeTasksForMember(caller.id);
+            } catch (err) {
+              console.warn("[opencode-swarm] Failed to complete plan units for member:", err);
+            }
+          }
         }
         if (caller.role !== "coordinator" && (isDonePost || isVerifierPass || isVerifierFail)) {
           db.setMemberState(caller.id, "waiting", { activity: null, pausedQuota: false });
