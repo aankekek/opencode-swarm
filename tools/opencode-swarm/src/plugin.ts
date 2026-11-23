@@ -73,6 +73,12 @@ export const swarmRuntimePlugin = Plugin.define({
     const options = (ctx.options ?? {}) as PluginOptions;
     const stallTimeoutMs = options.stallTimeoutMs ?? 180_000;
     const monitorIntervalMs = options.monitorIntervalMs ?? 30_000;
+    const maxWorkers =
+      typeof options.maxWorkers === "number" &&
+      Number.isInteger(options.maxWorkers) &&
+      options.maxWorkers > 0
+        ? options.maxWorkers
+        : 6;
     const debugEvents = options.debugEvents ?? false;
     const debugHooks = options.debugHooks ?? false;
     let autoSpawnVerifier = options.autoSpawnVerifier !== false;
@@ -1415,7 +1421,7 @@ export const swarmRuntimePlugin = Plugin.define({
     // -----------------------------------------------------------------------
     const stopMonitor = startStallMonitor(
       db,
-      { stallTimeoutMs, monitorIntervalMs },
+      { stallTimeoutMs, monitorIntervalMs, maxWorkers },
       (swarmId, authorName, channel, text) => postToBoard(swarmId, authorName, channel, text),
     );
 

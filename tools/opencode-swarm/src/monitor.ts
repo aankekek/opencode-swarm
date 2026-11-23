@@ -4,6 +4,8 @@ import type { BoardPostRow, MemberRow } from "./types.js";
 export interface MonitorConfig {
   stallTimeoutMs: number;
   monitorIntervalMs: number;
+  /** Worker cap used by the coverage nudge. Defaults to 6 when omitted. */
+  maxWorkers?: number;
 }
 
 export function isVerifierAuthor(authorName: string, member?: MemberRow): boolean {
@@ -60,13 +62,22 @@ export function startStallMonitor(
   // independently of the race timeout. Prevents a later tick from starting a
   // second nudge while a slow post is still pending.
   const pendingPosts = new Set<string>();
+  // Last coverage nudge per swarm: the board seq it was based on and how many
+  // plan units were still unassigned then. Bounded by the active swarms.
+  const lastCoverage = new Map<string, { seq: number; open: number }>();
   const postTimeoutMs = Math.max(100, Math.min(config.monitorIntervalMs, 15_000));
+  const maxWorkers = config.maxWorkers ?? 6;
 
   const timer = setInterval(async () => {
     try {
       const now = Date.now();
+      const activeSwarmIds = new Set<string>();
       for (const swarm of db.getActiveSwarms()) {
-        if (swarm.status !== "running") continue;
+        activeSwarmIds.add(swarm.id);
+        if (swarm.status !== "running") {
+          lastCoverage.delete(swarm.id);
+          continue;
+        }
         if (swarm.owner_pid && swarm.owner_pid !== process.pid) continue;
         if (inFlightSwarms.has(swarm.id) || pendingPosts.has(swarm.id)) continue;
 
@@ -96,13 +107,42 @@ export function startStallMonitor(
           );
           if (now - lastActivity < config.stallTimeoutMs) continue;
 
+          const counts = db.getTaskCounts(swarm.id);
+          const liveWorkers = members.filter((m) => m.role === "worker").length;
+          const anyWorking = members.some((m) => m.state === "working");
+          // Board movement means someone other than the monitor/narrator posted;
+          // nudge posts of our own must not look like fresh activity.
+          let movementSeq = 0;
+          const windowPosts = db.getLatestPostsWindow(swarm.id, 200).posts;
+          for (let i = windowPosts.length - 1; i >= 0; i--) {
+            const p = windowPosts[i];
+            if (p.author_name === "monitor" || p.author_name === "narrator") continue;
+            movementSeq = p.swarm_seq;
+            break;
+          }
+          const prevCoverage = lastCoverage.get(swarm.id);
+          const coverageDue =
+            swarm.status === "running" &&
+            counts.open >= 3 &&
+            !anyWorking &&
+            (prevCoverage === undefined ||
+              movementSeq > prevCoverage.seq ||
+              counts.open > prevCoverage.open);
+
           const coordinator = members.find((m) => m.role === "coordinator");
           const openWorkers = members.filter((m) => m.role === "worker" && m.track_status === "open");
           const verifier = members.find((m) => m.role === "verifier");
           const hasPass = hasFreshVerifierPass(db, swarm.id, members);
 
           let nudgeMessage: string;
-          if (coordinator && latestPost && latestPost.swarm_seq > coordinator.last_read_seq) {
+          if (coverageDue) {
+            lastCoverage.set(swarm.id, { seq: movementSeq, open: counts.open });
+            if (liveWorkers >= maxWorkers) {
+              nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned and the worker cap ${maxWorkers} is reached. Finish current tracks so units free, or group the remaining units into fewer workers.`;
+            } else {
+              nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned, ${liveWorkers} worker(s) live (cap ${maxWorkers}). Spawn one worker per unit, group by area, or shard with add{tasks}. Use swarm{action:"plan"} to adjust the plan.`;
+            }
+          } else if (coordinator && latestPost && latestPost.swarm_seq > coordinator.last_read_seq) {
             nudgeMessage = `@coordinator [stall] #${latestPost.swarm_seq} (from @${latestPost.author_name}) is unread; all members are waiting.`;
           } else if (openWorkers.length > 0) {
             const summary = openWorkers
@@ -148,6 +188,10 @@ export function startStallMonitor(
         } finally {
           inFlightSwarms.delete(swarm.id);
         }
+      }
+      // Drop coverage state for swarms that are no longer active.
+      for (const id of lastCoverage.keys()) {
+        if (!activeSwarmIds.has(id)) lastCoverage.delete(id);
       }
     } catch (err) {
       console.error("[opencode-swarm] monitor error:", err);
