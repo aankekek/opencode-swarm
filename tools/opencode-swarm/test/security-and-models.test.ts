@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseModelSpec, listAvailableModels, resolveAndValidateModel } from "../src/models.js";
@@ -14,6 +14,31 @@ import {
   validateMemberName,
 } from "../src/security.js";
 import type { MemberRow, SwarmRow } from "../src/types.js";
+
+/**
+ * Creates a directory link (junction on Windows, dir symlink elsewhere).
+ * Returns false when the environment forbids link creation.
+ */
+function createDirLink(target: string, linkPath: string): boolean {
+  try {
+    symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch (err: any) {
+    if (err?.code === "EPERM" || err?.code === "EACCES" || err?.code === "ENOSYS") return false;
+    throw err;
+  }
+}
+
+const symlinkSupport = (() => {
+  const probe = mkdtempSync(join(tmpdir(), "swarm-symlink-probe-"));
+  try {
+    mkdirSync(join(probe, "target"));
+    return createDirLink(join(probe, "target"), join(probe, "probe-link"));
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+
 
 describe("security & path/glob validation", () => {
   test("validateMemberName enforces Antigravity rules", () => {
@@ -53,6 +78,84 @@ describe("security & path/glob validation", () => {
         // Skip symlink creation if Windows permissions lack SeCreateSymbolicLinkPrivilege
         if (err.code !== "EPERM") throw err;
       }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSafeWorkspacePath resolves symlinks before applying '..' (vendor/../escape.txt)", () => {
+    if (!symlinkSupport) {
+      console.warn("[skipped] resolveSafeWorkspacePath symlink '..' escape tests: symlinks unavailable");
+      return;
+    }
+    const root = mkdtempSync(join(tmpdir(), "swarm-symlink-dotdot-root-"));
+    const outside = mkdtempSync(join(tmpdir(), "swarm-symlink-dotdot-outside-"));
+    try {
+      writeFileSync(join(outside, "escape.txt"), "outside");
+      expect(createDirLink(outside, join(root, "vendor"))).toBe(true);
+
+      // Lexical collapse would yield <root>/escape.txt; the OS lands in outside's parent.
+      expect(() => resolveSafeWorkspacePath(root, "vendor/../escape.txt")).toThrow(/escapes workspace root/);
+      expect(() => resolveSafeWorkspacePath(root, "vendor/../../escape.txt")).toThrow(/escapes workspace root/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSafeWorkspacePath keeps blocking direct symlink traversal", () => {
+    if (!symlinkSupport) {
+      console.warn("[skipped] resolveSafeWorkspacePath direct symlink traversal test: symlinks unavailable");
+      return;
+    }
+    const root = mkdtempSync(join(tmpdir(), "swarm-symlink-direct-root-"));
+    const outside = mkdtempSync(join(tmpdir(), "swarm-symlink-direct-outside-"));
+    try {
+      writeFileSync(join(outside, "pwn.txt"), "outside");
+      expect(createDirLink(outside, join(root, "link"))).toBe(true);
+      expect(() => resolveSafeWorkspacePath(root, "link/pwn.txt")).toThrow(/escapes workspace root/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSafeWorkspacePath still allows in-workspace '..' and non-existent paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-inroot-"));
+    try {
+      mkdirSync(join(root, "sub"));
+      writeFileSync(join(root, "file.txt"), "ok");
+      expect(resolveSafeWorkspacePath(root, "sub/../file.txt")).toBe("file.txt");
+      expect(resolveSafeWorkspacePath(root, "new/dir/file.ts")).toBe("new/dir/file.ts");
+      expect(resolveSafeWorkspacePath(root, "./sub/../file.txt")).toBe("file.txt");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSafeWorkspacePath canonicalizes symlinks that point inside the workspace", () => {
+    if (!symlinkSupport) {
+      console.warn("[skipped] resolveSafeWorkspacePath inside-workspace symlink test: symlinks unavailable");
+      return;
+    }
+    const root = mkdtempSync(join(tmpdir(), "swarm-symlink-inside-root-"));
+    try {
+      mkdirSync(join(root, "real"));
+      writeFileSync(join(root, "real", "deep.txt"), "ok");
+      expect(createDirLink(join(root, "real"), join(root, "alias"))).toBe(true);
+      expect(resolveSafeWorkspacePath(root, "alias/deep.txt")).toBe("real/deep.txt");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveSafeWorkspacePath rejects Windows-style and absolute outside paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-outside-"));
+    const outside = mkdtempSync(join(tmpdir(), "swarm-outside-target-"));
+    try {
+      expect(() => resolveSafeWorkspacePath(root, "..\\..\\escape.txt")).toThrow(/escapes workspace root/);
+      expect(() => resolveSafeWorkspacePath(root, join(outside, "escape.txt"))).toThrow(/escapes workspace root/);
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });

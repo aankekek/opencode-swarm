@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { PermissionEffect } from "./types.js";
 
 const PROTECTED_TOP_DIRS = new Set([".git", ".opencode", "node_modules"]);
@@ -49,36 +49,52 @@ export function isProtectedRepoPath(repoRelPath: string): boolean {
   return PROTECTED_TOP_DIRS.has(firstSegment);
 }
 
-function resolveCanonicalAncestor(targetAbs: string): string {
-  let cursor = targetAbs;
-  const suffixParts: string[] = [];
-  while (true) {
-    try {
-      const st = lstatSync(cursor);
-      if (st.isSymbolicLink()) {
-        try {
-          const real = realpathSync(cursor);
-          return suffixParts.length > 0 ? resolve(real, ...suffixParts) : real;
-        } catch {
-          // Dangling symlink: resolve link destination
-          const target = readlinkSync(cursor);
-          const resolvedTarget = isAbsolute(target) ? resolve(target) : resolve(dirname(cursor), target);
-          return suffixParts.length > 0 ? resolve(resolvedTarget, ...suffixParts) : resolvedTarget;
-        }
+const MAX_SYMLINK_HOPS = 40;
+
+function pathComponents(value: string): string[] {
+  return value.split(/[\\/]+/).filter((part) => part.length > 0);
+}
+
+/**
+ * Walks a path component by component the way the OS does, resolving symlinks
+ * as they are encountered. This is required because `resolve()` collapses `..`
+ * lexically: with `vendor -> C:\Windows\System32`, `vendor/../escape.txt`
+ * collapses to `<root>/escape.txt`, while the OS lands in `C:\Windows\escape.txt`.
+ */
+function resolveOsFaithfulPath(canonicalRoot: string, input: string): string {
+  const absoluteInput = isAbsolute(input);
+  const start = absoluteInput ? parse(input).root || canonicalRoot : canonicalRoot;
+  const remainder = absoluteInput ? input.slice(start.length) : input;
+  let cur = start;
+  for (const part of pathComponents(remainder)) {
+    if (part === ".") continue;
+    if (part === "..") {
+      // Applied to the already-realpath'd `cur`, so `vendor/..` lands in the
+      // symlink target's parent rather than the link's parent.
+      cur = dirname(cur);
+      continue;
+    }
+    cur = join(cur, part);
+    for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
+      let st;
+      try {
+        st = lstatSync(cur);
+      } catch {
+        // Not created yet: keep the lexical join and keep walking, since
+        // later segments may still exist as ancestors.
+        break;
       }
-      // It exists and is not a symlink
-      const real = realpathSync(cursor);
-      return suffixParts.length > 0 ? resolve(real, ...suffixParts) : real;
-    } catch {
-      // cursor does not exist or lstat failed; move up
-      const parent = dirname(cursor);
-      if (parent === cursor) break;
-      suffixParts.unshift(relative(parent, cursor));
-      cursor = parent;
+      if (!st.isSymbolicLink()) break;
+      try {
+        cur = realpathSync(cur);
+      } catch {
+        // Dangling symlink: follow its destination textually.
+        const target = readlinkSync(cur);
+        cur = isAbsolute(target) ? target : resolve(dirname(cur), target);
+      }
     }
   }
-  // If we walked to filesystem root and nothing exists, return targetAbs
-  return targetAbs;
+  return cur;
 }
 
 /**
@@ -95,11 +111,14 @@ export function resolveSafeWorkspacePath(canonicalWorkspaceRoot: string, rawPath
     throw new Error(`[SWARM SECURITY] UNC network paths are blocked: "${trimmed}"`);
   }
 
-  const candidateAbs = isAbsolute(trimmed)
-    ? resolve(trimmed)
-    : resolve(canonicalWorkspaceRoot, trimmed);
-  const candidateReal = resolveCanonicalAncestor(candidateAbs);
-  const rel = relative(canonicalWorkspaceRoot, candidateReal);
+  let workspaceRoot = canonicalWorkspaceRoot;
+  try {
+    workspaceRoot = realpathSync(canonicalWorkspaceRoot);
+  } catch {
+    // Missing/unreadable root: fall back to the supplied canonical root.
+  }
+  const candidateReal = resolveOsFaithfulPath(workspaceRoot, trimmed);
+  const rel = relative(workspaceRoot, candidateReal);
 
   if (rel === "" || rel === ".") {
     return "";
