@@ -292,7 +292,7 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               ok: true,
               swarm_id: swarmId,
               spawned,
-              workers: liveWorkersBefore.length + spawned.length,
+              workers: liveWorkersAfter.length,
               cap,
               open_tracks: liveWorkersAfter.filter((m) => m.track_status === "open").length,
               shard_cap: shardCap,

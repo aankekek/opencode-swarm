@@ -386,7 +386,7 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
     );
   });
 
-  test("verifier spawns are not blocked by the worker cap", async () => {
+  test("verifier spawns are not blocked by or counted against the worker cap", async () => {
     await withBridgeHarness(
       async ({ registeredTools }) => {
         const swarmTool = registeredTools.get("swarm")!;
@@ -402,9 +402,22 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
           await swarmTool.execute({ action: "add", name: "check", role: "verifier", brief: "verify" }, toolCtx),
         );
         expect(verifier.ok).toBe(true);
-        expect(verifier.workers).toBe(2);
+        expect(verifier.workers).toBe(1);
+
+        const second = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "second", brief: "work" }, toolCtx),
+        );
+        expect(second.ok).toBe(true);
+        expect(second.workers).toBe(2);
+
+        const third = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "third", brief: "work" }, toolCtx),
+        );
+        expect(third.ok).toBe(false);
+        expect(String(third.error)).toContain("Worker cap 2 reached");
+        expect(third.workers).toBe(2);
       },
-      { maxWorkers: 1 },
+      { maxWorkers: 2 },
     );
   });
 
