@@ -271,6 +271,13 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     }
 
+    function abortAllWaiters() {
+      for (const memberId of Array.from(waiters.keys())) {
+        resolveWaiterAborted(memberId);
+      }
+      waiters.clear();
+    }
+
     async function getSessionModel(sessionId: string): Promise<ModelSelection | undefined> {
       try {
         const info = await ctx.session.get({ sessionID: sessionId });
@@ -715,7 +722,7 @@ export const swarmRuntimePlugin = Plugin.define({
           stopMonitor();
           abortController.abort();
           pendingCalls.clear();
-          waiters.clear();
+          abortAllWaiters();
           wake.clearCoordinatorWakeSeq();
           if (!dbClosed) {
             for (const activeSwarm of db.getActiveSwarms()) {
@@ -1139,7 +1146,7 @@ export const swarmRuntimePlugin = Plugin.define({
       stopMonitor();
       abortController.abort();
       pendingCalls.clear();
-      waiters.clear();
+      abortAllWaiters();
       wake.clearState();
       spawningMembers.clear();
       activeToolCounts.clear();

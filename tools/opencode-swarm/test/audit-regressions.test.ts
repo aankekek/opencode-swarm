@@ -6,6 +6,7 @@ import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
 import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
 import { hasFreshVerifierPass } from "../src/monitor.js";
+import { parseMentionsFromText } from "../src/mentions.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "../src/prompts.js";
 
 function createHarness(repoDir: string, dbPath: string) {
@@ -921,5 +922,119 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       channels: ["main"],
     });
     expect(verifierPrompt).not.toContain("do not post acknowledgment replies");
+  });
+
+  test("K: cleanup aborts parked swarm_wait instead of hanging forever", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-wait-cleanup-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const waitTool = tools.get("swarm_wait");
+
+      await swarmTool.execute({ action: "title", title: "Wait Cleanup Test" }, { sessionID: "sess_coord" });
+      const waitPromise = waitTool.execute({ since: 0, mentions_only: true }, { sessionID: "sess_coord" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      await cleanup();
+      const waitRes = JSON.parse((await waitPromise).content);
+      expect(waitRes.woken).toBe(false);
+      expect(waitRes.aborted).toBe(true);
+      expect(waitRes.posts).toEqual([]);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("L: parked coordinator in swarm_wait wakes when verifier posts PASS without @coordinator", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-wait-pass-wake-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const waitTool = tools.get("swarm_wait");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature L" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+
+      const coordWaitPromise = waitTool.execute({ since: 1, mentions_only: true }, { sessionID: "sess_coord" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      await postTool.execute({ text: "[done] finished feature L" }, { sessionID: w1Sess });
+      const snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifier = snap.members.find((m: any) => m.role === "verifier");
+      expect(verifier).toBeDefined();
+
+      // Verifier posts PASS without @coordinator mention
+      await postTool.execute({ text: "PASS — all checks green" }, { sessionID: verifier.session_id });
+
+      const waitRes = JSON.parse((await coordWaitPromise).content);
+      expect(waitRes.woken).toBe(true);
+      expect(waitRes.handoff).toContain('swarm{action:"complete"}');
+      expect(waitRes.posts.some((p: any) => p.author === verifier.name && p.text.includes("PASS"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("M: late swarm_wait after PASS returns immediately with handoff, and markdown @mentions are parsed", async () => {
+    const parsedMd = parseMentionsFromText("Done! **@coordinator** and `@verifier`—please check, cc user@example.com");
+    expect(parsedMd.memberMentions).toEqual(["coordinator", "verifier"]);
+
+    const root = mkdtempSync(join(tmpdir(), "swarm-late-wait-pass-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const waitTool = tools.get("swarm_wait");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature M" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+
+      await postTool.execute({ text: "[done] finished feature M" }, { sessionID: w1Sess });
+      const snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifier = snap.members.find((m: any) => m.role === "verifier");
+
+      // Verifier posts PASS without @coordinator mention
+      await postTool.execute({ text: "PASS — verified" }, { sessionID: verifier.session_id });
+
+      const lateWaitRes = JSON.parse(
+        (await waitTool.execute({ since: 1, mentions_only: true }, { sessionID: "sess_coord" })).content,
+      );
+      expect(lateWaitRes.woken).toBe(true);
+      expect(lateWaitRes.handoff).toContain('swarm{action:"complete"}');
+      expect(lateWaitRes.posts.some((p: any) => p.text.includes("PASS"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
   });
 });

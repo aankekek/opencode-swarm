@@ -5,7 +5,7 @@ import type { SwarmChangedEvent } from "./rpc.js";
 import type { BoardPostRow, MemberRow } from "./types.js";
 
 export interface WaiterEntry {
-  resolve: (res: { posts: BoardPostRow[]; aborted?: boolean }) => void;
+  resolve: (res: { posts: BoardPostRow[]; aborted?: boolean; handoff?: string }) => void;
   sinceSeq: number;
   mentionsOnly: boolean;
 }
@@ -247,7 +247,8 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
       if (outcome === "spawned" || outcome === "requested" || outcome === "in_progress") return;
     }
 
-    if (coord.state !== "waiting" || coord.paused_quota === 1 || waiters.has(coord.id)) {
+    const coordWaiter = waiters.get(coord.id);
+    if ((!coordWaiter && coord.state !== "waiting") || coord.paused_quota === 1) {
       return;
     }
 
@@ -283,6 +284,18 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
       : allWorkersDone && !anyWorking && !hasFreshPass && !isVerifierReport
         ? `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Verification is NOT done: no verifier PASS yet. Call read_board(since: ${prevReadSeq}) to review, spawn or repair a verifier (@verifier) to independently verify worker output, and do NOT call swarm{action:"complete"} until a verifier posts PASS.`
         : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
+
+    if (coordWaiter) {
+      waiters.delete(coord.id);
+      const unread = db
+        .getPostsPage(swarmId, coordWaiter.sinceSeq, 50, "*")
+        .posts.filter((p) => p.author_name !== coord.name);
+      const posts = unread.length > 0 ? unread : [latestPost];
+      recordWakeSeq(coord.id, latestPost.swarm_seq);
+      db.advanceReadCursor(coord.id, latestPost.swarm_seq);
+      coordWaiter.resolve({ posts, handoff: handoffText });
+      return;
+    }
 
     try {
       await deps.promptSession({

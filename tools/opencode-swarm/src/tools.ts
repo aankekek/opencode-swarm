@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { SwarmBoardDB } from "./db.js";
 import { checkPendingWakePosts } from "./mentions.js";
 import { formatModelSpec, listAvailableModels } from "./models.js";
+import { hasFreshVerifierPass } from "./monitor.js";
 import type { SwarmChangedEvent } from "./rpc.js";
 import { normalizeHandle, validateMemberName } from "./security.js";
 import type { BoardPostRow, MemberRole, MemberRow, WorkspaceMode } from "./types.js";
@@ -649,6 +650,44 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           });
         }
 
+        if (caller.role === "coordinator") {
+          const members = db.listMembers(caller.swarm_id, false);
+          const nonCoord = members.filter(
+            (m) => m.role !== "coordinator" && m.role !== "monitor" && m.role !== "narrator",
+          );
+          const anyWorking = nonCoord.some((m) => m.state === "working");
+          const workers = nonCoord.filter((m) => m.role === "worker");
+          const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
+          if (allWorkersDone && !anyWorking && hasFreshVerifierPass(db, caller.swarm_id, members)) {
+            const unread = db
+              .getPostsPage(caller.swarm_id, sinceSeq, 50, "*")
+              .posts.filter((p) => p.author_name !== caller.name);
+            const latestPost = db.getLatestPost(caller.swarm_id);
+            const posts =
+              unread.length > 0
+                ? unread
+                : latestPost && latestPost.author_name !== caller.name
+                  ? [latestPost]
+                  : [];
+            if (posts.length > 0) {
+              const maxSeq = posts[posts.length - 1].swarm_seq;
+              deps.recordWakeSeq(caller.id, maxSeq);
+              db.advanceReadCursor(caller.id, maxSeq);
+            }
+            return toolJson({
+              woken: true,
+              handoff:
+                'All swarm members finished and @verifier posted PASS. Present the final summary to the user and call swarm{action:"complete"}.',
+              posts: posts.map((p) => ({
+                seq: p.swarm_seq,
+                channel: p.channel,
+                author: p.author_name,
+                text: p.body,
+              })),
+            });
+          }
+        }
+
         const prevWaiter = waiters.get(caller.id);
         if (prevWaiter) {
           waiters.delete(caller.id);
@@ -663,21 +702,23 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           });
         }
 
-        const waitResult = await new Promise<{ posts: BoardPostRow[]; aborted?: boolean }>((resolveWait) => {
-          const onAbort = () => {
-            waiters.delete(caller.id);
-            resolveWait({ posts: [], aborted: true });
-          };
-          toolCtx.signal?.addEventListener("abort", onAbort, { once: true });
-          waiters.set(caller.id, {
-            sinceSeq,
-            mentionsOnly,
-            resolve: (res) => {
-              toolCtx.signal?.removeEventListener("abort", onAbort);
-              resolveWait(res);
-            },
-          });
-        });
+        const waitResult = await new Promise<{ posts: BoardPostRow[]; aborted?: boolean; handoff?: string }>(
+          (resolveWait) => {
+            const onAbort = () => {
+              waiters.delete(caller.id);
+              resolveWait({ posts: [], aborted: true });
+            };
+            toolCtx.signal?.addEventListener("abort", onAbort, { once: true });
+            waiters.set(caller.id, {
+              sinceSeq,
+              mentionsOnly,
+              resolve: (res) => {
+                toolCtx.signal?.removeEventListener("abort", onAbort);
+                resolveWait(res);
+              },
+            });
+          },
+        );
 
         const wokenPosts = waitResult.posts;
         if (wokenPosts.length > 0) {
@@ -691,6 +732,7 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
         return toolJson({
           woken: wokenPosts.length > 0,
           ...(waitResult.aborted ? { aborted: true } : {}),
+          ...(waitResult.handoff ? { handoff: waitResult.handoff } : {}),
           posts: wokenPosts.map((p) => ({
             seq: p.swarm_seq,
             channel: p.channel,
