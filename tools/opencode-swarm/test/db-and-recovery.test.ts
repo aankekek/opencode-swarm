@@ -160,4 +160,139 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       } catch {}
     }
   });
+
+  test("live member keeps a long-held lock past the kill grace window", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-lock-live-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(dbPath), dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Live Lock Swarm",
+        objective: "Live owner keeps its lock regardless of age",
+        coordinatorSessionId: "coord_sess",
+        workspaceDir: dir,
+      });
+      const w1 = db.insertMember({
+        swarmId: swarm.id,
+        name: "w1",
+        sessionId: "s_w1",
+        role: "worker",
+        addedBy: "coordinator",
+        groupPrefix: null,
+        model: undefined,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        workspaceBranch: null,
+        brief: "work",
+        state: "working",
+        lastReadSeq: 0,
+        channels: ["main"],
+      });
+      const claim = db.claimLocksAtomic(swarm.id, w1.id, w1.name, ["src/a/**"]);
+      expect(claim.claimed).toEqual(["src/a/**"]);
+      const claimedAt = db.listLocks(swarm.id)[0].claimed_at;
+
+      const w2 = db.insertMember({
+        swarmId: swarm.id,
+        name: "w2",
+        sessionId: "s_w2",
+        role: "worker",
+        addedBy: "coordinator",
+        groupPrefix: null,
+        model: undefined,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        workspaceBranch: null,
+        brief: "work2",
+        state: "working",
+        lastReadSeq: 0,
+        channels: ["main"],
+      });
+
+      // 61s later the owner is still live: the lock must survive the claim.
+      const res = db.claimLocksAtomic(swarm.id, w2.id, w2.name, ["src/a/**"], claimedAt + 61_000);
+      expect(res.claimed).toEqual([]);
+      expect(res.conflicts).toHaveLength(1);
+      expect(res.conflicts[0].owner).toBe("w1");
+
+      const locks = db.listLocks(swarm.id);
+      expect(locks).toHaveLength(1);
+      expect(locks[0].owner_member_id).toBe(w1.id);
+      expect(locks[0].owner_name).toBe("w1");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test("killed owner's lock is reclaimed after the grace window", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-lock-expired-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(dbPath), dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Expired Lock Swarm",
+        objective: "Killed owner lock expires after the grace window",
+        coordinatorSessionId: "coord_sess",
+        workspaceDir: dir,
+      });
+      const w1 = db.insertMember({
+        swarmId: swarm.id,
+        name: "w1",
+        sessionId: "s_w1",
+        role: "worker",
+        addedBy: "coordinator",
+        groupPrefix: null,
+        model: undefined,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        workspaceBranch: null,
+        brief: "work",
+        state: "working",
+        lastReadSeq: 0,
+        channels: ["main"],
+      });
+      const claim = db.claimLocksAtomic(swarm.id, w1.id, w1.name, ["src/a/**"]);
+      expect(claim.claimed).toEqual(["src/a/**"]);
+      const claimedAt = db.listLocks(swarm.id)[0].claimed_at;
+      db.setMemberState(w1.id, "killed");
+
+      const w2 = db.insertMember({
+        swarmId: swarm.id,
+        name: "w2",
+        sessionId: "s_w2",
+        role: "worker",
+        addedBy: "coordinator",
+        groupPrefix: null,
+        model: undefined,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        workspaceBranch: null,
+        brief: "work2",
+        state: "working",
+        lastReadSeq: 0,
+        channels: ["main"],
+      });
+
+      // 61s after claiming, a killed owner's lock is outside the grace window
+      // and may be reclaimed by the next claim.
+      const res = db.claimLocksAtomic(swarm.id, w2.id, w2.name, ["src/a/**"], claimedAt + 61_000);
+      expect(res.claimed).toEqual(["src/a/**"]);
+      expect(res.conflicts).toHaveLength(0);
+
+      const locks = db.listLocks(swarm.id);
+      expect(locks).toHaveLength(1);
+      expect(locks[0].owner_name).toBe("w2");
+      expect(locks[0].owner_member_id).toBe(w2.id);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
 });

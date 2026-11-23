@@ -758,6 +758,7 @@ export class SwarmBoardDB {
     ownerMemberId: string,
     ownerName: string,
     rawGlobs: string[],
+    nowMs?: number,
   ): { claimed: string[]; conflicts: Array<{ requested: string; existing: string; owner: string }> } {
     const owner = normalizeHandle(ownerName);
     const normalized = Array.from(new Set(rawGlobs.map(validateAndNormalizeGlob)));
@@ -768,13 +769,18 @@ export class SwarmBoardDB {
       // RT-H4: clean up only truly orphaned locks. Member rows are retained
       // after a kill, so `state='killed'` is NOT a signal that the owner is
       // gone: its in-flight tools may still be writing. Reclaim a lock only
-      // when the owner row no longer exists at all, or when the lock has
-      // outlived KILL_LOCK_GRACE_MS (the deferred-cleanup safety net case).
+      // when the owner row no longer exists at all, or when the owner is not
+      // live (e.g. killed) and the lock has outlived KILL_LOCK_GRACE_MS (the
+      // deferred-cleanup safety net case). A live owner keeps its lock however
+      // long it has held it.
       const allMemberIds = new Set(this.listMembers(swarmId, true).map((m) => m.id));
+      const liveIds = new Set(this.listMembers(swarmId, false).map((m) => m.id));
       const now = Date.now();
+      const expiryNow = nowMs ?? now;
       for (const lock of existing) {
+        const live = liveIds.has(lock.owner_member_id);
         const orphaned = !allMemberIds.has(lock.owner_member_id);
-        const expired = now - lock.claimed_at >= KILL_LOCK_GRACE_MS;
+        const expired = !live && expiryNow - lock.claimed_at >= KILL_LOCK_GRACE_MS;
         if (orphaned || expired) {
           this.db.prepare(`DELETE FROM file_locks WHERE id = ?`).run(lock.id);
         }
