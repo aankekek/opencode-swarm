@@ -147,6 +147,9 @@ export default Plugin.define({
     const [selectedSwarmId, setSelectedSwarmId] = createSignal<string | null>(null);
     const [userPinnedSwarmId, setUserPinnedSwarmId] = createSignal<string | null>(null);
     const [snapshot, setSnapshot] = createSignal<SwarmSnapshot | null>(null);
+    // Non-null only when the snapshot was resolved from the current session id and
+    // that swarm is live. This is what allows the GUI surfaces to exist at all.
+    const [sessionSwarmId, setSessionSwarmId] = createSignal<string | null>(null);
     const [boardUrl, setBoardUrl] = createSignal<string>("");
     const [mountedDirectory, setMountedDirectory] = createSignal<string | undefined>(undefined);
     const [rpcStatus, setRpcStatus] = createSignal<SwarmRpcStatus>({ state: "connected" });
@@ -158,10 +161,12 @@ export default Plugin.define({
     let lastCompletedId = "";
     let lastMonitorPostId: string | number | null = null;
     let refreshSeq = 0;
-    let lastKnownRunningId: string | null = null;
     let lastDir: string | undefined;
-    let onboardingPrompted = false;
+    let lastSessionId: string | null = null;
 
+    const currentSessionId = () => ctx.sessions.current()?.id ?? null;
+    const activeForThisSession = () =>
+      rpcStatus().state === "connected" && sessionSwarmId() !== null;
     const currentDirectory = () => ctx.sessions.current()?.location?.directory ?? mountedDirectory();
     const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
     const getCallOptions = (timeoutMs = 8000) => {
@@ -221,7 +226,7 @@ export default Plugin.define({
       }
     };
 
-    const refresh = async (forceFollowActive = false) => {
+    const refresh = async () => {
       const mySeq = ++refreshSeq;
       try {
         const rpc = getRpc();
@@ -231,28 +236,19 @@ export default Plugin.define({
         const list = normalizeSwarmList(rawList);
         setSwarms(list);
 
-        const running = list.find((s) => s.status === "running" || s.status === "completing") ?? null;
-        if (running && (running.id !== lastKnownRunningId || forceFollowActive)) {
-          lastKnownRunningId = running.id;
-          setUserPinnedSwarmId(null);
-          setSelectedSwarmId(running.id);
-        } else if (!running) {
-          lastKnownRunningId = null;
-        }
-
+        // Selection is only ever set explicitly by the user (panel history browsing).
+        // Never auto-select a swarm from the list: a session without a swarm stays null.
         const currentSelected = selectedSwarmId();
         if (currentSelected && !list.some((s) => s.id === currentSelected)) {
           setSelectedSwarmId(null);
           setUserPinnedSwarmId(null);
         }
-        if (!selectedSwarmId() || (running && !userPinnedSwarmId() && selectedSwarmId() !== running.id)) {
-          setSelectedSwarmId(running?.id ?? list[0]?.id ?? null);
-        }
 
-        const targetId = selectedSwarmId();
-        const sessionId = ctx.sessions.current()?.id;
+        const sid = currentSessionId();
+        const pinnedId = sid ? userPinnedSwarmId() : null;
+        const viaSession = Boolean(sid) && !pinnedId;
         const rawSnap = await rpc.getSwarmSnapshot(
-          targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {},
+          pinnedId ? { swarmId: pinnedId } : sid ? { sessionId: sid } : {},
           opts
         );
         if (mySeq !== refreshSeq) return;
@@ -263,12 +259,21 @@ export default Plugin.define({
           (rawSnap as { boardUrl: string }).boardUrl
         ) {
           setBoardUrl((rawSnap as { boardUrl: string }).boardUrl);
+        } else {
+          setBoardUrl("");
         }
         const snap = normalizeSwarmSnapshot(rawSnap);
         setSnapshot(snap);
+        // Sticky summon evidence for the session: any non-null session-resolved
+        // snapshot means this session is a member of a swarm, whatever its status
+        // (running, completing, completed, interrupted). A pinned (history) fetch
+        // must not clear or overwrite it.
+        if (viaSession) {
+          setSessionSwarmId(snap ? snap.swarmId : null);
+        }
         setRpcStatus({ state: "connected" });
         void rpc
-          .getRoleConfig(targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {}, opts)
+          .getRoleConfig(pinnedId ? { swarmId: pinnedId } : sid ? { sessionId: sid } : {}, opts)
           .then((rawCfg) => {
             const cfg = (rawCfg && typeof rawCfg === "object" && "output" in rawCfg
               ? (rawCfg as { output?: SwarmRoleConfig }).output
@@ -278,10 +283,6 @@ export default Plugin.define({
             }
           })
           .catch(() => {});
-        if (!settings().onboardingComplete && !onboardingPrompted) {
-          onboardingPrompted = true;
-          queueMicrotask(() => openOnboardingWizard());
-        }
         if (snap) {
           maybeNotify(snap);
         }
@@ -299,15 +300,17 @@ export default Plugin.define({
 
     createEffect(() => {
       const dir = currentDirectory();
-      void ctx.sessions.current()?.id;
+      const sessionId = currentSessionId();
       void ctx.sessions.current()?.pending;
       selectedSwarmId();
-      if (dir !== lastDir) {
+      if (dir !== lastDir || sessionId !== lastSessionId) {
         lastDir = dir;
-        lastKnownRunningId = null;
+        lastSessionId = sessionId;
         setUserPinnedSwarmId(null);
         setSelectedSwarmId(null);
         setSnapshot(null);
+        setSessionSwarmId(null);
+        setBoardUrl("");
         setSwarms([]);
       }
       void refresh();
@@ -562,9 +565,9 @@ export default Plugin.define({
     }));
 
     safeAdd(TitlebarItem, () => {
+      if (!activeForThisSession()) return undefined;
       if (!settings().pillbarShow) return undefined;
       const snap = snapshot();
-      if (!snap && !settings().showWhenIdle) return undefined;
       const session = ctx.sessions.current();
       const pressed = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
       const c = counts();
@@ -593,9 +596,9 @@ export default Plugin.define({
         if (input.session.directory) {
           setMountedDirectory(input.session.directory);
         }
+        if (!activeForThisSession()) return undefined;
         if (!settings().composerPill) return undefined;
         const snap = snapshot();
-        if (!snap && !settings().showWhenIdle) return undefined;
         const c = counts();
         const verifier = (snap?.verifierStatus ?? "").toUpperCase();
         let tone: ComposerPillTone | undefined;
@@ -614,6 +617,7 @@ export default Plugin.define({
       at: "window.bottom" as const,
       render: () => {
         const shouldShow = () => {
+          if (!activeForThisSession()) return false;
           if (!settings().bottomStrip) return false;
           const session = ctx.sessions.current();
           const sideVisible = session ? ctx.layout.state(`${ctx.id}:swarm`, session) === "visible" : false;
@@ -640,6 +644,7 @@ export default Plugin.define({
     });
 
     safeAdd(MenuItem, () => {
+      if (!activeForThisSession()) return undefined;
       const session = ctx.sessions.current();
       const opened = session ? ctx.layout.state(`${ctx.id}:swarm`, session) !== "closed" : false;
       return {
@@ -694,7 +699,7 @@ export default Plugin.define({
     const swarmTab: PanelTab = {
       id: "swarm",
       title: "Swarm",
-      pinned: true,
+      pinned: false,
     };
 
     safeAdd(Panel, {
@@ -708,7 +713,7 @@ export default Plugin.define({
         cached: true,
       },
       list() {
-        return settings().sidebarShow ? [swarmTab] : [];
+        return activeForThisSession() && settings().sidebarShow ? [swarmTab] : [];
       },
       render(props) {
         if (props.session.directory) {
@@ -727,7 +732,7 @@ export default Plugin.define({
                 setUserPinnedSwarmId(id);
                 setSelectedSwarmId(id);
               }}
-              onRefresh={() => void refresh(true)}
+              onRefresh={() => void refresh()}
               onOpenSettings={openSwarmSettings}
               rpcError={() => {
                 const s = rpcStatus();

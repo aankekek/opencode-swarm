@@ -5,6 +5,99 @@ import { join } from "node:path";
 import { SWARM_RPC_DEF } from "../src/rpc.js";
 import { swarmRuntimePlugin } from "../src/plugin.js";
 
+type RpcHandler = (args?: Record<string, unknown>) => Promise<unknown>;
+type RegisteredTool = { name: string; execute: (args: Record<string, unknown>, ctx: unknown) => Promise<string> };
+
+async function createBridgeHarness(tempDir: string) {
+  let registeredHandlers: Record<string, RpcHandler> = {};
+  const emittedEvents: Array<{ event: string; payload: unknown }> = [];
+  const registeredTools = new Map<string, RegisteredTool>();
+  let disposed = false;
+
+  const mockCtx = {
+    location: { directory: tempDir },
+    directory: tempDir,
+    worktree: tempDir,
+    rpc: {
+      register: async (_def: unknown, handlers: Record<string, RpcHandler>) => {
+        registeredHandlers = handlers;
+        return {
+          events: {
+            emit: (event: string, payload: unknown) => {
+              emittedEvents.push({ event, payload });
+            },
+          },
+          dispose: () => {
+            disposed = true;
+          },
+        };
+      },
+    },
+    tool: {
+      transform: async (cb: (tools: { add: (t: RegisteredTool) => void }) => void) => {
+        cb({
+          add: (t) => {
+            registeredTools.set(t.name as string, t);
+          },
+        });
+      },
+      hook: async () => () => {},
+    },
+    command: {
+      transform: async () => {},
+    },
+    permission: {
+      hook: async () => () => {},
+    },
+    session: {
+      create: async () => ({ data: { id: "worker-sess-1" } }),
+      prompt: async () => ({}),
+      interrupt: async () => ({}),
+      update: async () => ({}),
+      hook: async () => () => {},
+    },
+    event: {
+      subscribe: () => () => {},
+    },
+    model: {
+      list: async () => ({ data: [] }),
+      default: async () => ({ data: undefined }),
+    },
+  };
+
+  const hooks = await (swarmRuntimePlugin as unknown as {
+    setup: (ctx: unknown, opts?: unknown) => Promise<unknown>;
+  }).setup(mockCtx, {
+    dbPath: join(tempDir, "board.db"),
+    boardPort: 0,
+  });
+
+  return { registeredHandlers, registeredTools, emittedEvents, hooks, isDisposed: () => disposed };
+}
+
+type BridgeHarness = Awaited<ReturnType<typeof createBridgeHarness>>;
+
+async function withBridgeHarness(fn: (harness: BridgeHarness) => Promise<void>) {
+  const tempDir = mkdtempSync(join(tmpdir(), "swarm-rpc-bridge-"));
+  const prevUserProfile = process.env.USERPROFILE;
+  const prevHome = process.env.HOME;
+  process.env.USERPROFILE = tempDir;
+  process.env.HOME = tempDir;
+  try {
+    const harness = await createBridgeHarness(tempDir);
+    await fn(harness);
+    await (harness.hooks as { dispose?: () => Promise<void> } | undefined)?.dispose?.();
+  } finally {
+    process.env.USERPROFILE = prevUserProfile;
+    process.env.HOME = prevHome;
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // Ignore Windows SQLite file lock on temp dir cleanup
+    }
+  }
+}
+
 describe("SWARM_RPC_DEF and RPC bridge", () => {
   test("SWARM_RPC_DEF defines id, 10 methods, and changed event", () => {
     expect(SWARM_RPC_DEF.id).toBe("local.opencode-swarm");
@@ -24,75 +117,7 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
   });
 
   test("registers all 5 RPC handlers and emits changed events", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "swarm-rpc-bridge-"));
-    const prevUserProfile = process.env.USERPROFILE;
-    const prevHome = process.env.HOME;
-    process.env.USERPROFILE = tempDir;
-    process.env.HOME = tempDir;
-    try {
-      let registeredHandlers: Record<string, (args?: Record<string, unknown>) => Promise<unknown>> = {};
-      const emittedEvents: Array<{ event: string; payload: unknown }> = [];
-      const registeredTools = new Map<string, { execute: (args: Record<string, unknown>, ctx: unknown) => Promise<string> }>();
-      let disposed = false;
-
-      const mockCtx = {
-        location: { directory: tempDir },
-        directory: tempDir,
-        worktree: tempDir,
-        rpc: {
-          register: async (_def: unknown, handlers: Record<string, (args?: Record<string, unknown>) => Promise<unknown>>) => {
-            registeredHandlers = handlers;
-            return {
-              events: {
-                emit: (event: string, payload: unknown) => {
-                  emittedEvents.push({ event, payload });
-                },
-              },
-              dispose: () => {
-                disposed = true;
-              },
-            };
-          },
-        },
-        tool: {
-          transform: async (cb: (tools: { add: (t: { name: string; execute: (args: Record<string, unknown>, ctx: unknown) => Promise<string> }) => void }) => void) => {
-            cb({
-              add: (t) => {
-                registeredTools.set(t.name, t);
-              },
-            });
-          },
-          hook: async () => () => {},
-        },
-        command: {
-          transform: async () => {},
-        },
-        permission: {
-          hook: async () => () => {},
-        },
-        session: {
-          create: async () => ({ data: { id: "worker-sess-1" } }),
-          prompt: async () => ({}),
-          interrupt: async () => ({}),
-          update: async () => ({}),
-          hook: async () => () => {},
-        },
-        event: {
-          subscribe: () => () => {},
-        },
-        model: {
-          list: async () => ({ data: [] }),
-          default: async () => ({ data: undefined }),
-        },
-      };
-
-      const hooks = await (swarmRuntimePlugin as unknown as {
-        setup: (ctx: unknown, opts?: unknown) => Promise<unknown>;
-      }).setup(mockCtx, {
-        dbPath: join(tempDir, "board.db"),
-        boardPort: 0,
-      });
-
+    await withBridgeHarness(async ({ registeredHandlers, registeredTools, emittedEvents }) => {
       // 1. Initially no active swarm
       const initialInfo = (await registeredHandlers.getBoardInfo()) as { swarmId: string; activeCount: number };
       expect(initialInfo.swarmId).toBe("");
@@ -186,16 +211,39 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
             (e.payload as { summary?: string }).summary === "All done",
         ),
       ).toBe(true);
+    });
+  });
 
-      await (hooks as { dispose?: () => Promise<void> } | undefined)?.dispose?.();
-    } finally {
-      process.env.USERPROFILE = prevUserProfile;
-      process.env.HOME = prevHome;
-      try {
-        rmSync(tempDir, { recursive: true, force: true });
-      } catch {
-        // Ignore Windows SQLite file lock on temp dir cleanup
-      }
-    }
+  test("resolves a swarm only via explicit swarmId or a member sessionId", async () => {
+    await withBridgeHarness(async ({ registeredHandlers, registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Historical Swarm" }, toolCtx);
+
+      // (c) positive control: a running swarm resolves through its coordinator sessionId
+      const running = (await registeredHandlers.getSwarmSnapshot({ sessionId: "coord-sess-1" })) as {
+        swarm: { id: string; status: string } | null;
+      };
+      expect(running.swarm?.status).toBe("running");
+      const swarmId = running.swarm!.id;
+
+      const completed = (await registeredHandlers.completeSwarm({ swarmId, summary: "done" })) as { ok: boolean };
+      expect(completed.ok).toBe(true);
+
+      // (a) a completed/historical swarm with no sessionId must not be invented by the GUI
+      const noIdentity = (await registeredHandlers.getSwarmSnapshot({})) as { swarm: unknown };
+      expect(noIdentity.swarm).toBeNull();
+
+      // (b) a session that is not a member must not attach to the historical swarm
+      const unrelated = (await registeredHandlers.getSwarmSnapshot({ sessionId: "not-a-member" })) as { swarm: unknown };
+      expect(unrelated.swarm).toBeNull();
+
+      // (d) explicit swarmId still browses history
+      const byId = (await registeredHandlers.getSwarmSnapshot({ swarmId })) as {
+        swarm: { id: string; status: string } | null;
+      };
+      expect(byId.swarm?.id).toBe(swarmId);
+      expect(byId.swarm?.status).toBe("completed");
+    });
   });
 });

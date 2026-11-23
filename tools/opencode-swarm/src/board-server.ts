@@ -240,7 +240,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
           ? deps.db.getSwarm(swarmIdParam)
           : convMember
             ? deps.db.getSwarm(convMember.swarm_id)
-            : activeSwarms[0] ?? deps.db.listSwarms(1)[0];
+            : activeSwarms[0];
 
         if (!swarm) {
           return sendJson(res, 200, { swarm: null });

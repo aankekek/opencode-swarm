@@ -8,6 +8,17 @@ import { cleanupMemberWorkspace } from "./workspace.js";
 
 type PluginContext = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0];
 
+function withSwarmId(boardUrl: string, swarmId: string): string {
+  if (!boardUrl || !swarmId) return boardUrl;
+  try {
+    const parsed = new URL(boardUrl);
+    parsed.searchParams.set("swarmId", swarmId);
+    return parsed.toString();
+  } catch {
+    return boardUrl;
+  }
+}
+
 function safeParseStringArray(raw: string | null | undefined): string[] {
   if (!raw) return [];
   try {
@@ -59,7 +70,7 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       const active = db.getActiveSwarms()[0];
       const members = active ? db.listMembers(active.id, false) : [];
       return {
-        url: deps.getBoardUrl(),
+        url: withSwarmId(deps.getBoardUrl(), active?.id ?? ""),
         token: deps.getBoardToken(),
         swarmId: active?.id ?? "",
         title: active?.title ?? "Swarm Board",
@@ -80,15 +91,9 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           swarm = db.getSwarm(member.swarm_id);
         }
       }
-      if (!swarm && !swarmIdArg) {
-        swarm = db.getActiveSwarms()[0];
-      }
-      if (!swarm && !swarmIdArg) {
-        const latestSummary = db.listSwarms(1)[0];
-        if (latestSummary) {
-          swarm = db.getSwarm(latestSummary.id);
-        }
-      }
+      // With no explicit swarmId, resolve only through sessionId. Never fall back
+      // to arbitrary historical swarms in the workspace DB, or a completed swarm
+      // from a previous session would resurrect the GUI.
       if (!swarm) {
         return {
           swarm: null,
@@ -156,7 +161,7 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           created_at: swarm.created_at,
           updated_at: swarm.updated_at,
         },
-        boardUrl: deps.getBoardUrl(),
+        boardUrl: withSwarmId(deps.getBoardUrl(), swarm.id),
         head,
         stalled,
         members,
