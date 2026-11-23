@@ -162,23 +162,31 @@ function isStrictlyInside(parent: string, child: string): boolean {
  * - Never throws; per-row failures are logged. Rows whose directory could
  *   not be removed are kept for a later retry.
  *
- * Child sessions are intentionally not deleted here (we cannot map a pending
- * row to a session reliably).
+ * Any child session recorded on a row that is recovered (its directory was
+ * cleaned up) or dropped (its directory lies outside our data dir) is
+ * returned in `orphanSessions` so the caller can best-effort delete it. The
+ * caller owns that side effect: this function never talks to the session API.
  */
 export function recoverPendingProvisions(
   db: SwarmBoardDB,
   dataDir: string,
   repoRoot: string,
-): number {
+): { recovered: number; orphanSessions: string[] } {
   let pending: PendingProvisionRow[];
   try {
     pending = db.listPendingProvisions();
   } catch (err) {
     console.warn("[opencode-swarm] Failed to read pending workspace provisions:", err);
-    return 0;
+    return { recovered: 0, orphanSessions: [] };
   }
 
   let recovered = 0;
+  const orphanSessions: string[] = [];
+  const recordOrphanSession = (row: PendingProvisionRow) => {
+    if (typeof row.session_id === "string" && row.session_id.length > 0) {
+      orphanSessions.push(row.session_id);
+    }
+  };
   for (const row of pending) {
     try {
       if (!isStrictlyInside(dataDir, row.workspace_dir)) {
@@ -187,6 +195,7 @@ export function recoverPendingProvisions(
         console.warn(
           `[opencode-swarm] Pending provisioning for @${row.member_name} (${row.swarm_id}) points outside the data dir (${row.workspace_dir}); skipping removal and dropping journal row.`,
         );
+        recordOrphanSession(row);
         db.deletePendingProvision(row.id);
         continue;
       }
@@ -220,6 +229,7 @@ export function recoverPendingProvisions(
       }
 
       db.deletePendingProvision(row.id);
+      recordOrphanSession(row);
       recovered++;
     } catch (err) {
       console.warn(
@@ -228,5 +238,5 @@ export function recoverPendingProvisions(
       );
     }
   }
-  return recovered;
+  return { recovered, orphanSessions };
 }

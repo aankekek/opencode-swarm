@@ -420,8 +420,9 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       expect(db.listPendingProvisions().map((r) => r.id)).toEqual([rowId]);
 
       // repoRoot is not a git repo here, so branch cleanup is skipped safely.
-      const recovered = recoverPendingProvisions(db, dir, dir);
+      const { recovered, orphanSessions } = recoverPendingProvisions(db, dir, dir);
       expect(recovered).toBe(1);
+      expect(orphanSessions).toEqual([]);
       expect(existsSync(ws)).toBe(false);
       expect(db.listPendingProvisions()).toEqual([]);
 
@@ -448,6 +449,7 @@ describe("SwarmBoardDB & Crash Recovery", () => {
         workspaceDir: outside,
         workspaceBranch: "swarm/sw_x/w_out",
       });
+      db.setPendingProvisionSession(rowId, "sess_dropped_outside");
       expect(rowId).toBeGreaterThan(0);
 
       const warnings: string[] = [];
@@ -456,14 +458,17 @@ describe("SwarmBoardDB & Crash Recovery", () => {
         warnings.push(parts.map(String).join(" "));
       };
       let recovered: number;
+      let orphanSessions: string[];
       try {
-        recovered = recoverPendingProvisions(db, dir, dir);
+        ({ recovered, orphanSessions } = recoverPendingProvisions(db, dir, dir));
       } finally {
         console.warn = originalWarn;
       }
 
       // Policy: skip removal and drop the row (we do not retry foreign paths).
       expect(recovered).toBe(0);
+      // Dropped rows still surface their child session for best-effort removal.
+      expect(orphanSessions).toEqual(["sess_dropped_outside"]);
       expect(existsSync(outside)).toBe(true);
       expect(existsSync(sentinel)).toBe(true);
       expect(readFileSync(sentinel, "utf8")).toBe("do not delete");
@@ -488,7 +493,7 @@ describe("SwarmBoardDB & Crash Recovery", () => {
 
       // Empty journal: no-op, returns 0, never throws.
       expect(() => recoverPendingProvisions(db, dir, dir)).not.toThrow();
-      expect(recoverPendingProvisions(db, dir, dir)).toBe(0);
+      expect(recoverPendingProvisions(db, dir, dir)).toEqual({ recovered: 0, orphanSessions: [] });
 
       // Row whose directory never materialized: row is cleaned up, no throw.
       db.insertPendingProvision({
@@ -500,10 +505,81 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       });
       let recovered = 0;
       expect(() => {
-        recovered = recoverPendingProvisions(db, dir, dir);
+        recovered = recoverPendingProvisions(db, dir, dir).recovered;
       }).not.toThrow();
       expect(recovered).toBe(1);
       expect(db.listPendingProvisions()).toEqual([]);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("setPendingProvisionSession updates the journal row", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-pending-session-"));
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(join(dir, "board.db")), dir);
+      const rowId = db.insertPendingProvision({
+        swarmId: "sw_x",
+        memberName: "w1",
+        workspaceMode: "share",
+        workspaceDir: join(dir, "worktrees", "sw_x", "w1"),
+        workspaceBranch: "swarm/sw_x/w1",
+      });
+      expect(db.listPendingProvisions()[0].session_id).toBeNull();
+
+      db.setPendingProvisionSession(rowId, "sess_child_1");
+
+      const rows = db.listPendingProvisions();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].id).toBe(rowId);
+      expect(rows[0].session_id).toBe("sess_child_1");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("recoverPendingProvisions surfaces a recovered row's session id in orphanSessions", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-recover-session-"));
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(join(dir, "board.db")), dir);
+      const ws = join(dir, "worktrees", "sw_x", "w1");
+      mkdirSync(ws, { recursive: true });
+
+      const rowId = db.insertPendingProvision({
+        swarmId: "sw_x",
+        memberName: "w1",
+        workspaceMode: "share",
+        workspaceDir: ws,
+        workspaceBranch: "swarm/sw_x/w1",
+      });
+      db.setPendingProvisionSession(rowId, "sess_orphan_1");
+
+      const { recovered, orphanSessions } = recoverPendingProvisions(db, dir, dir);
+      expect(recovered).toBe(1);
+      expect(orphanSessions).toEqual(["sess_orphan_1"]);
+      expect(existsSync(ws)).toBe(false);
+      expect(db.listPendingProvisions()).toEqual([]);
+
+      // A row without a session id yields an empty orphan list.
+      const rowId2 = db.insertPendingProvision({
+        swarmId: "sw_x",
+        memberName: "w2",
+        workspaceMode: "share",
+        workspaceDir: join(dir, "worktrees", "sw_x", "w2"),
+        workspaceBranch: "swarm/sw_x/w2",
+      });
+      expect(rowId2).toBeGreaterThan(0);
+      const second = recoverPendingProvisions(db, dir, dir);
+      expect(second.recovered).toBe(1);
+      expect(second.orphanSessions).toEqual([]);
 
       db.close();
     } finally {

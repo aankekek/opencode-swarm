@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
@@ -1222,6 +1222,48 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
     } finally {
       console.warn = originalWarn;
       SwarmBoardDB.prototype.reconcileStaleSwarmsOnStartup = originalReconcile;
+      if (cleanup) await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("startup removes child sessions left by orphaned pending provisions", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-plugin-orphan-session-"));
+    const repoDir = join(root, "repo");
+    const dataDir = join(root, "data");
+    const dbPath = join(dataDir, "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+
+    // Seed a pending journal row as a crash between session.create and insertMember
+    // would leave it: a live child session with no member row.
+    const seeded = new SwarmBoardDB(await openSqliteDatabase(dbPath), dataDir);
+    const ws = join(dataDir, "worktrees", "sw_orphan", "w1");
+    mkdirSync(ws, { recursive: true });
+    const rowId = seeded.insertPendingProvision({
+      swarmId: "sw_orphan",
+      memberName: "w1",
+      workspaceMode: "share",
+      workspaceDir: ws,
+      workspaceBranch: "swarm/sw_orphan/w1",
+    });
+    seeded.setPendingProvisionSession(rowId, "sess_orphan_child");
+    seeded.close();
+
+    const { ctx } = createMockContext(repoDir, dbPath);
+    const removedSessions: string[] = [];
+    (ctx.session as any).remove = async ({ sessionID }: { sessionID: string }) => {
+      removedSessions.push(sessionID);
+    };
+
+    let cleanup: (() => Promise<void>) | undefined;
+    try {
+      cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+      expect(removedSessions).toEqual(["sess_orphan_child"]);
+      expect(existsSync(ws)).toBe(false);
+    } finally {
       if (cleanup) await cleanup();
       try {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });

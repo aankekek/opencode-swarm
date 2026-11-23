@@ -193,9 +193,27 @@ export const swarmRuntimePlugin = Plugin.define({
     // (crash between provisioning and insertMember). Runs after stale-swarm
     // reconciliation so killed members are already marked. Never fatal.
     try {
-      const recovered = recoverPendingProvisions(db, dataDir, canonicalWorkspaceRoot);
+      const { recovered, orphanSessions } = recoverPendingProvisions(db, dataDir, canonicalWorkspaceRoot);
       if (recovered > 0) {
         console.warn(`[opencode-swarm] Recovered ${recovered} orphaned pending workspace provision(s) on startup.`);
+      }
+      // A crash after `session.create`/`fork` but before `insertMember` leaves a
+      // live child session with no member row. Remove those best effort; a
+      // failure here must never abort setup.
+      const sessionApi = ctx.session as unknown as {
+        remove?: (a: { sessionID: string }) => Promise<unknown>;
+      };
+      if (typeof sessionApi.remove === "function") {
+        for (const sessionID of orphanSessions) {
+          try {
+            await sessionApi.remove({ sessionID });
+          } catch (err) {
+            console.warn(
+              `[opencode-swarm] Failed to remove orphaned child session ${sessionID} on startup:`,
+              err,
+            );
+          }
+        }
       }
     } catch (err) {
       console.warn("[opencode-swarm] Pending workspace recovery failed; continuing:", err);
@@ -658,6 +676,17 @@ export const swarmRuntimePlugin = Plugin.define({
               : {}),
           });
           childSessionId = created.id;
+        }
+
+        // Journal the child session as soon as it exists so a crash before
+        // `insertMember` lets startup recovery remove it. Best effort: the
+        // journal row is deleted right after the member row is inserted.
+        if (pendingProvisionId !== undefined && childSessionId) {
+          try {
+            db.setPendingProvisionSession(pendingProvisionId, childSessionId);
+          } catch (err) {
+            console.warn("[opencode-swarm] Failed to record pending provision session id:", err);
+          }
         }
 
         const channels = args.channels && args.channels.length > 0 ? args.channels : ["main"];

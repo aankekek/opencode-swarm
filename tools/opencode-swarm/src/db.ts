@@ -34,6 +34,7 @@ export interface PendingProvisionRow {
   workspace_mode: WorkspaceMode;
   workspace_dir: string;
   workspace_branch: string | null;
+  session_id: string | null;
   created_at: number;
 }
 
@@ -194,6 +195,7 @@ export class SwarmBoardDB {
         workspace_mode TEXT NOT NULL,
         workspace_dir TEXT NOT NULL,
         workspace_branch TEXT,
+        session_id TEXT,
         created_at INTEGER NOT NULL
       );
 
@@ -214,6 +216,14 @@ export class SwarmBoardDB {
     // NULL; reconciliation falls back to pid liveness for those.
     try {
       this.db.exec("ALTER TABLE swarms ADD COLUMN owner_instance TEXT;");
+    } catch {
+      // Column already exists
+    }
+
+    // Safe migration for existing databases missing pending_provisions.session_id.
+    // Legacy rows keep NULL; recovery simply has no session to remove for them.
+    try {
+      this.db.exec("ALTER TABLE pending_provisions ADD COLUMN session_id TEXT;");
     } catch {
       // Column already exists
     }
@@ -1043,6 +1053,10 @@ export class SwarmBoardDB {
         now,
       );
     return Number(res.lastInsertRowid);
+  }
+
+  setPendingProvisionSession(id: number, sessionId: string): void {
+    this.db.prepare(`UPDATE pending_provisions SET session_id = ? WHERE id = ?`).run(sessionId, id);
   }
 
   deletePendingProvision(id: number): void {
