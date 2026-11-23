@@ -312,12 +312,12 @@ function listMatchingTempItems(tempDir: string): UninstallPlanItem[] {
 
   for (const entry of entries) {
     const name = entry.name;
+    // A bare "opencode" dir is not ours: it may be a user-owned temp folder.
     const matches =
       /^swarm-/i.test(name) ||
       /^dump_.*\.ts$/i.test(name) ||
       /^smoke.*\.ts$/i.test(name) ||
-      /^opencode-debug\.json$/i.test(name) ||
-      /^opencode$/i.test(name);
+      /^opencode-debug\.json$/i.test(name);
     if (!matches) continue;
 
     const full = join(tempDir, name);
@@ -480,7 +480,7 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
     {
       id: "tempFiles",
       title: "5. Temporary Files",
-      description: "Delete swarm-*, dump_*.ts, smoke*.ts, opencode-debug.json, and temp opencode/ directory.",
+      description: "Delete swarm-*, dump_*.ts, smoke*.ts, and opencode-debug.json (unrelated temp dirs are kept).",
       defaultChecked: true,
       items: tempItems,
     },

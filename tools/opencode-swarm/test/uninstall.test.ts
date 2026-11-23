@@ -113,7 +113,9 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       writeFileSync(join(tempDir, "dump_test.ts"), "console.log(1)\n", "utf8");
       writeFileSync(join(tempDir, "smoke1.ts"), "console.log(2)\n", "utf8");
       writeFileSync(join(tempDir, "opencode-debug.json"), "{}\n", "utf8");
-      mkdirSync(join(tempDir, "opencode"), { recursive: true });
+      // Unrelated user temp dir: must never be swept up by the uninstall plan.
+      const unrelatedTempDir = join(tempDir, "opencode");
+      mkdirSync(unrelatedTempDir, { recursive: true });
       const keepTempPath = join(tempDir, "keep-me.txt");
       writeFileSync(keepTempPath, "preserve\n", "utf8");
 
@@ -133,7 +135,8 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       expect(byId.get("gitWorktreesAndBranches")!.items.some((i) => i.kind === "git-branch" && i.path === "swarm/sw_1425c701/beta")).toBe(true);
       expect(byId.get("runtimeData")!.items.length).toBe(1);
       expect(byId.get("buildArtifacts")!.items.length).toBe(2);
-      expect(byId.get("tempFiles")!.items.length).toBe(5);
+      expect(byId.get("tempFiles")!.items.length).toBe(4);
+      expect(byId.get("tempFiles")!.items.some((i) => i.path === unrelatedTempDir)).toBe(false);
 
       // P0-5: Omitted/empty selection must be a safe no-op
       const noopRes = await executeUninstallPlan(plan, {}, { env });
@@ -170,6 +173,8 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       expect(existsSync(join(pluginRoot, "dist"))).toBe(false);
       expect(existsSync(join(pluginRoot, "package.json"))).toBe(true);
       expect(existsSync(keepTempPath)).toBe(true);
+      expect(existsSync(unrelatedTempDir)).toBe(true);
+      expect(existsSync(join(tempDir, "opencode-debug.json"))).toBe(false);
 
       const postChecks = await verifyUninstall(plan, fullSelection, env);
       expect(postChecks.every((c) => c.passed)).toBe(true);

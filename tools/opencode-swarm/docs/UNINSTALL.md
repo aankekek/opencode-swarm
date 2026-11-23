@@ -12,7 +12,7 @@ Use any of the three options below to review what will be removed and cleanly un
    - **2. Git Worktrees & Swarm Branches** (removes orphan `.opencode-swarm` worktrees, runs `git worktree prune`, deletes `swarm/*` branches)
    - **3. Runtime Data (`~/.opencode-swarm`)** (stops active board server & closes SQLite DBs before deleting all workspace hashes, WALs, clones, and `role-models.json`)
    - **4. Build Artifacts** (`tools/opencode-swarm/node_modules` and `tools/opencode-swarm/dist`)
-   - **5. Temporary Files** (`%TEMP%/swarm-*`, `dump_*.ts`, `smoke*.ts`, `opencode-debug.json`, `opencode/`)
+   - **5. Temporary Files** (`%TEMP%/swarm-*`, `dump_*.ts`, `smoke*.ts`, `opencode-debug.json`)
    - **6. Swarm GUI Settings Store** (resets saved GUI preferences and onboarding state)
 3. Click **Confirm & Remove Selected Items**, verify all green checks pass, then reload/restart OpenCode Desktop.
 
@@ -82,7 +82,6 @@ Useful CLI flags:
 - [ ] `<TEMP>/swarm-*` (probes, test dirs, board tests, RPC bridge tests)
 - [ ] `<TEMP>/dump_*.ts`, `<TEMP>/smoke*.ts`
 - [ ] `<TEMP>/opencode-debug.json`
-- [ ] `<TEMP>/opencode/`
 
 ### 5. Verification — All Must Pass
 
