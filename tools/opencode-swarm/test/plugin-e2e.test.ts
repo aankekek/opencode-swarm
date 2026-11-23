@@ -328,6 +328,87 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
     }
   });
 
+  test("completion contains a failing member teardown and always ends completed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-complete-fail-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    const originalSetMemberState = SwarmBoardDB.prototype.setMemberState;
+    let probe: SwarmBoardDB | undefined;
+
+    try {
+      const swarmTool = tools.get("swarm");
+
+      // Positive control: normal completion is unchanged.
+      await swarmTool.execute({ action: "title", title: "Completion positive control" }, { sessionID: "sess_coord" });
+      await swarmTool.execute({ action: "add", name: "worker-one", brief: "work" }, { sessionID: "sess_coord" });
+      await swarmTool.execute({ action: "add", name: "worker-two", brief: "work" }, { sessionID: "sess_coord" });
+      const claimOk = JSON.parse(
+        (await swarmTool.execute({ action: "claim", globs: ["src/**/*.ts"] }, { sessionID: "sess_coord" })).content,
+      );
+      expect(claimOk.ok).toBe(true);
+
+      const okRes = JSON.parse((await swarmTool.execute({ action: "complete" }, { sessionID: "sess_coord" })).content);
+      expect(okRes.ok).toBe(true);
+      expect(okRes.status).toBe("completed");
+      expect(typeof okRes.swarm_id).toBe("string");
+
+      probe = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      expect(probe.listLocks(okRes.swarm_id)).toEqual([]);
+      expect(probe.getActiveSwarms()).toEqual([]);
+      probe.close();
+      probe = undefined;
+
+      // Failure containment: a DB throw on the first child teardown must not abort
+      // completion or leave the swarm in 'completing' with locks held.
+      await swarmTool.execute({ action: "title", title: "Completion injected failure" }, { sessionID: "sess_coord" });
+      await swarmTool.execute({ action: "add", name: "worker-three", brief: "work" }, { sessionID: "sess_coord" });
+      await swarmTool.execute({ action: "add", name: "worker-four", brief: "work" }, { sessionID: "sess_coord" });
+      const claimFail = JSON.parse(
+        (await swarmTool.execute({ action: "claim", globs: ["src/**/*.ts"] }, { sessionID: "sess_coord" })).content,
+      );
+      expect(claimFail.ok).toBe(true);
+
+      let injected = false;
+      SwarmBoardDB.prototype.setMemberState = function patchedSetMemberState(
+        this: SwarmBoardDB,
+        ...args: Parameters<typeof originalSetMemberState>
+      ) {
+        if (!injected) {
+          injected = true;
+          throw new Error("injected setMemberState failure");
+        }
+        return originalSetMemberState.apply(this, args);
+      };
+
+      const failRes = JSON.parse((await swarmTool.execute({ action: "complete" }, { sessionID: "sess_coord" })).content);
+      expect(injected).toBe(true);
+      expect(failRes.ok).toBe(false);
+      expect(failRes.partial).toBe(true);
+      expect(failRes.status).toBe("completed");
+      expect(typeof failRes.swarm_id).toBe("string");
+      expect(failRes.error).toContain("injected setMemberState failure");
+
+      probe = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      expect(probe.getSwarm(failRes.swarm_id)?.status).toBe("completed");
+      expect(probe.listLocks(failRes.swarm_id)).toEqual([]);
+      expect(probe.getActiveSwarms()).toEqual([]);
+    } finally {
+      SwarmBoardDB.prototype.setMemberState = originalSetMemberState;
+      try {
+        probe?.close();
+      } catch {}
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
   test("role allowlist (SEC-C1) and control action gates (SEC-H6) in plugin tools", async () => {
     const root = mkdtempSync(join(tmpdir(), "swarm-gates-"));
     const repoDir = join(root, "repo");

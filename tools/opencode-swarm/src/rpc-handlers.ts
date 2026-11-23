@@ -189,27 +189,86 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           return { ok: false, error: "Only @coordinator may complete the swarm." };
         }
       }
-      db.setSwarmStatus(swarm.id, "completing");
-      const members = db.listMembers(swarm.id, false);
-      for (const m of members) {
-        deps.resolveWaiterAborted(m.id);
+      // Completion contract: teardown is best-effort per step and always attempts
+      // the terminal state. The swarm is marked `completing`, every member is torn
+      // down independently (one DB error must not skip the rest), and the
+      // finalization (release locks, mark `completed`, emit changed) runs in a
+      // `finally` with each step individually guarded. On any failure the result is
+      // `{ok:false, partial:true}` while the swarm still ends `completed` and its
+      // locks are released, so `getActiveSwarms()` never stays blocked.
+      const failures: string[] = [];
+      const recordFailure = (step: string, err: unknown) => {
+        failures.push(`${step}: ${err instanceof Error ? err.message : String(err)}`);
+      };
+      try {
         try {
-          await ctx.session.interrupt({ sessionID: m.session_id });
-        } catch {
-          // Ignore
+          db.setSwarmStatus(swarm.id, "completing");
+        } catch (err) {
+          recordFailure("setSwarmStatus(completing)", err);
         }
-        db.setMemberState(m.id, "killed");
-        cleanupMemberWorkspace({
-          mode: m.workspace_mode,
-          dir: m.workspace_dir,
-          branch: m.workspace_branch,
-          repoRoot: deps.canonicalWorkspaceRoot,
-        });
+        let members: ReturnType<SwarmBoardDB["listMembers"]> = [];
+        try {
+          members = db.listMembers(swarm.id, false);
+        } catch (err) {
+          recordFailure("listMembers", err);
+        }
+        for (const m of members) {
+          try {
+            deps.resolveWaiterAborted(m.id);
+          } catch (err) {
+            recordFailure(`resolveWaiterAborted(${m.name})`, err);
+          }
+          try {
+            await ctx.session.interrupt({ sessionID: m.session_id });
+          } catch {
+            // Ignore
+          }
+          try {
+            db.setMemberState(m.id, "killed");
+          } catch (err) {
+            recordFailure(`setMemberState(${m.name})`, err);
+          }
+          try {
+            cleanupMemberWorkspace({
+              mode: m.workspace_mode,
+              dir: m.workspace_dir,
+              branch: m.workspace_branch,
+              repoRoot: deps.canonicalWorkspaceRoot,
+            });
+          } catch (err) {
+            recordFailure(`cleanupMemberWorkspace(${m.name})`, err);
+          }
+        }
+      } catch (err) {
+        recordFailure("teardown", err);
+      } finally {
+        try {
+          db.releaseAllLocksForSwarm(swarm.id);
+        } catch (err) {
+          recordFailure("releaseAllLocksForSwarm", err);
+        }
+        try {
+          db.setSwarmStatus(swarm.id, "completed");
+        } catch (err) {
+          recordFailure("setSwarmStatus(completed)", err);
+        }
+        try {
+          deps.emitSwarmChanged({ swarmId: swarm.id, reason: "swarm_completed", summary });
+        } catch (err) {
+          recordFailure("emitSwarmChanged", err);
+        }
       }
-      db.releaseAllLocksForSwarm(swarm.id);
-      db.setSwarmStatus(swarm.id, "completed");
-      deps.emitSwarmChanged({ swarmId: swarm.id, reason: "swarm_completed", summary });
-      return { ok: true };
+
+      if (failures.length > 0) {
+        return {
+          ok: false,
+          error: failures.join("; "),
+          swarm_id: swarm.id,
+          status: "completed",
+          partial: true,
+        };
+      }
+      return { ok: true, swarm_id: swarm.id, status: "completed" };
     },
     killMember: async (args?: Record<string, unknown>) => {
       if (deps.isDbClosed()) return { ok: false, error: "Swarm database is closed." };

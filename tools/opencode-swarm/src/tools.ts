@@ -459,38 +459,100 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           if (caller.role !== "coordinator") {
             return toolJson({ ok: false, error: "Only @coordinator may complete the swarm." });
           }
-          db.setSwarmStatus(caller.swarm_id, "completing");
-          const children = db.listMembers(caller.swarm_id, false).filter((m) => m.role !== "coordinator");
-          for (const c of children) {
-            deps.resolveWaiterAborted(c.id);
-            try {
-              await ctx.session.interrupt({ sessionID: c.session_id });
-            } catch {
-              // Ignore
-            }
-            db.setMemberState(c.id, "killed");
-            cleanupMemberWorkspace({
-              mode: c.workspace_mode,
-              dir: c.workspace_dir,
-              branch: c.workspace_branch,
-              repoRoot: deps.canonicalWorkspaceRoot,
-            });
-          }
-          db.setMemberState(caller.id, "killed");
-          db.releaseAllLocksForSwarm(caller.swarm_id);
-          db.setSwarmStatus(caller.swarm_id, "completed");
-          emitSwarmChanged({ swarmId: caller.swarm_id, reason: "swarm_completed" });
-
-          // SEC-H7: Clear/restore coordinator session permissions
+          // Completion contract: teardown is best-effort per step and always attempts
+          // the terminal state. The swarm is marked `completing`, every child is torn
+          // down independently (one DB error must not skip the rest), and the
+          // finalization (kill coordinator, release locks, mark `completed`) runs in a
+          // `finally` with each step individually guarded. On any failure the result is
+          // `{ok:false, partial:true}` while the swarm still ends `completed` and its
+          // locks are released, so `getActiveSwarms()` never stays blocked.
+          const failures: string[] = [];
+          const recordFailure = (step: string, err: unknown) => {
+            failures.push(`${step}: ${err instanceof Error ? err.message : String(err)}`);
+          };
           try {
-            await ctx.session.update({
-              sessionID: caller.session_id,
-              permissions: [],
-            });
-          } catch {
-            // Ignore if session update unsupported
+            try {
+              db.setSwarmStatus(caller.swarm_id, "completing");
+            } catch (err) {
+              recordFailure("setSwarmStatus(completing)", err);
+            }
+            let children: MemberRow[] = [];
+            try {
+              children = db.listMembers(caller.swarm_id, false).filter((m) => m.role !== "coordinator");
+            } catch (err) {
+              recordFailure("listMembers", err);
+            }
+            for (const c of children) {
+              try {
+                deps.resolveWaiterAborted(c.id);
+              } catch (err) {
+                recordFailure(`resolveWaiterAborted(${c.name})`, err);
+              }
+              try {
+                await ctx.session.interrupt({ sessionID: c.session_id });
+              } catch {
+                // Ignore
+              }
+              try {
+                db.setMemberState(c.id, "killed");
+              } catch (err) {
+                recordFailure(`setMemberState(${c.name})`, err);
+              }
+              try {
+                cleanupMemberWorkspace({
+                  mode: c.workspace_mode,
+                  dir: c.workspace_dir,
+                  branch: c.workspace_branch,
+                  repoRoot: deps.canonicalWorkspaceRoot,
+                });
+              } catch (err) {
+                recordFailure(`cleanupMemberWorkspace(${c.name})`, err);
+              }
+            }
+          } catch (err) {
+            recordFailure("teardown", err);
+          } finally {
+            try {
+              db.setMemberState(caller.id, "killed");
+            } catch (err) {
+              recordFailure("setMemberState(coordinator)", err);
+            }
+            try {
+              db.releaseAllLocksForSwarm(caller.swarm_id);
+            } catch (err) {
+              recordFailure("releaseAllLocksForSwarm", err);
+            }
+            try {
+              db.setSwarmStatus(caller.swarm_id, "completed");
+            } catch (err) {
+              recordFailure("setSwarmStatus(completed)", err);
+            }
+            try {
+              emitSwarmChanged({ swarmId: caller.swarm_id, reason: "swarm_completed" });
+            } catch (err) {
+              recordFailure("emitSwarmChanged", err);
+            }
+
+            // SEC-H7: Clear/restore coordinator session permissions
+            try {
+              await ctx.session.update({
+                sessionID: caller.session_id,
+                permissions: [],
+              });
+            } catch {
+              // Ignore if session update unsupported
+            }
           }
 
+          if (failures.length > 0) {
+            return toolJson({
+              ok: false,
+              error: failures.join("; "),
+              swarm_id: caller.swarm_id,
+              status: "completed",
+              partial: true,
+            });
+          }
           return toolJson({ ok: true, swarm_id: caller.swarm_id, status: "completed" });
         }
 

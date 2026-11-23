@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SwarmBoardDB } from "../src/db.js";
 import { SWARM_RPC_DEF } from "../src/rpc.js";
 import { swarmRuntimePlugin } from "../src/plugin.js";
 
@@ -211,6 +212,66 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
             (e.payload as { summary?: string }).summary === "All done",
         ),
       ).toBe(true);
+    });
+  });
+
+  test("completeSwarm reaches completed and releases locks when a member teardown throws", async () => {
+    await withBridgeHarness(async ({ registeredHandlers, registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+
+      await swarmTool.execute({ action: "title", title: "RPC failure containment" }, toolCtx);
+      await swarmTool.execute({ action: "add", name: "worker-a", brief: "work" }, toolCtx);
+      const claim = JSON.parse(
+        ((await swarmTool.execute({ action: "claim", globs: ["src/**/*.ts"] }, toolCtx)) as unknown as { content: string })
+          .content,
+      );
+      expect(claim.ok).toBe(true);
+
+      const before = (await registeredHandlers.getSwarmSnapshot({ sessionId: "coord-sess-1" })) as {
+        swarm: { id: string; status: string };
+        file_locks: unknown[];
+      };
+      expect(before.swarm.status).toBe("running");
+      expect(before.file_locks.length).toBeGreaterThan(0);
+
+      const originalSetMemberState = SwarmBoardDB.prototype.setMemberState;
+      let injected = false;
+      try {
+        SwarmBoardDB.prototype.setMemberState = function patchedSetMemberState(
+          this: SwarmBoardDB,
+          ...args: Parameters<typeof originalSetMemberState>
+        ) {
+          if (!injected) {
+            injected = true;
+            throw new Error("injected setMemberState failure");
+          }
+          return originalSetMemberState.apply(this, args);
+        };
+
+        const res = (await registeredHandlers.completeSwarm({
+          swarmId: before.swarm.id,
+          summary: "partial",
+        })) as { ok: boolean; error?: string; swarm_id?: string; status?: string; partial?: boolean };
+
+        expect(injected).toBe(true);
+        expect(res.ok).toBe(false);
+        expect(res.partial).toBe(true);
+        expect(res.status).toBe("completed");
+        expect(res.swarm_id).toBe(before.swarm.id);
+        expect(res.error).toContain("injected setMemberState failure");
+      } finally {
+        SwarmBoardDB.prototype.setMemberState = originalSetMemberState;
+      }
+
+      const after = (await registeredHandlers.getSwarmSnapshot({ swarmId: before.swarm.id })) as {
+        swarm: { status: string };
+        file_locks: unknown[];
+      };
+      expect(after.swarm.status).toBe("completed");
+      expect(after.file_locks).toEqual([]);
+      const info = (await registeredHandlers.getBoardInfo()) as { activeCount: number };
+      expect(info.activeCount).toBe(0);
     });
   });
 
