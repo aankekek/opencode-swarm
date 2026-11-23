@@ -8,7 +8,7 @@ export const COORDINATOR_PROTOCOL = [
   "3. **Manual Model & Variant Rule:** Leave `model` and `variant` unset to inherit your own model/variant, UNLESS the user explicitly asks for a specific model or variant. Use `swarm{action:\"models\"}` to inspect available models and variants.",
   "4. **Workspace Isolation:** Use `workspace:\"share\"` (Git worktree) for authors editing in parallel, or `owned_globs` when sharing `inherit`. Leave readers/verifiers on `inherit`.",
   "5. **Addressing:** Use `@name` for one worker, `@all` only for broadcast rules, `@#channel` for channel-wide asks. Cite earlier posts by `#seq`.",
-  "6. **Finish:** Call `swarm_wait` or end your turn cleanly after spawning workers; once `@verifier` confirms PASS (or all worker tracks finish), post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
+  "6. **Finish:** Call `swarm_wait` or end your turn cleanly after spawning workers. Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` (a verifier is auto-spawned/requested once all worker tracks finish; if disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
 ].join("\n");
 
 export function buildMemberOpeningPrompt(args: {
@@ -54,6 +54,7 @@ export function buildMemberOpeningPrompt(args: {
       `- Report progress and handoffs via \`post_message\` with \`@mentions\` (start final completion post with \`[done]\`).`,
       `- You may spawn helpers via \`swarm{action:"add"}\` and manage only helpers you added.`,
       `- When waiting on another member, call \`swarm_wait\` or end your turn to sleep at 0 tokens.`,
+      `- Once \`@verifier\` posts \`PASS\`, do not post acknowledgment replies (stay idle unless \`@coordinator\` or \`@verifier\` requests follow-up edits).`,
     );
   }
 

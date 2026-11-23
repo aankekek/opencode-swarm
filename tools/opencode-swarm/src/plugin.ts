@@ -7,14 +7,14 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { startBoardServer, type BoardServerHandle } from "./board-server.js";
 import { SWARM_RPC_DEF, type SwarmChangedEvent, type UninstallSelection } from "./rpc.js";
-import { buildUninstallPlan, executeUninstallPlan } from "./uninstall.js";
 import { openSqliteDatabase, SwarmBoardDB } from "./db.js";
-import { checkPendingWakePosts, parseMentionsFromText, resolveWakeTargets } from "./mentions.js";
 import { formatModelSpec, listAvailableModels, parseModelSpec, resolveAndValidateModel } from "./models.js";
-import { hasFreshVerifierPass, isVerifierAuthor, startStallMonitor } from "./monitor.js";
+import { startStallMonitor } from "./monitor.js";
 import { buildRolePermissions, evaluateActionForMember, SHELL_TOOLS, WRITE_TOOLS } from "./policy.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "./prompts.js";
+import { createRpcHandlers } from "./rpc-handlers.js";
 import { extractTargetPaths, normalizeHandle, tightenEffect, validateMemberName } from "./security.js";
+import { registerSwarmTools } from "./tools.js";
 import type {
   BoardPostRow,
   CachedCall,
@@ -24,6 +24,7 @@ import type {
   PluginOptions,
   WorkspaceMode,
 } from "./types.js";
+import { createWakeController, type WaiterEntry } from "./wake.js";
 import { cleanupMemberWorkspace, provisionMemberWorkspace } from "./workspace.js";
 
 const IS_WINDOWS = process.platform === "win32";
@@ -74,6 +75,7 @@ export const swarmRuntimePlugin = Plugin.define({
     const monitorIntervalMs = options.monitorIntervalMs ?? 30_000;
     const debugEvents = options.debugEvents ?? false;
     const debugHooks = options.debugHooks ?? false;
+    let autoSpawnVerifier = options.autoSpawnVerifier !== false;
 
     const repoHash = createHash("sha256")
       .update(IS_WINDOWS ? canonicalWorkspaceRoot.toLowerCase() : canonicalWorkspaceRoot)
@@ -196,19 +198,8 @@ export const swarmRuntimePlugin = Plugin.define({
     }
 
     // Waiter resolvers for swarm_wait(since, mentions_only)
-    const waiters = new Map<
-      string,
-      {
-        resolve: (res: { posts: BoardPostRow[]; aborted?: boolean }) => void;
-        sinceSeq: number;
-        mentionsOnly: boolean;
-      }
-    >();
-    const lastCoordinatorWakeSeq = new Map<string, number>();
-    const lastWakeSeq = new Map<string, number>();
+    const waiters = new Map<string, WaiterEntry>();
     const spawningMembers = new Set<string>();
-    const autoVerifierSpawns = new Set<string>();
-    const lastVerificationRequestSeq = new Map<string, number>();
     const memberSwitchLocks = new Map<string, Promise<unknown>>();
     const activeToolCounts = new Map<string, number>();
     const quiesceResolvers = new Map<string, Array<() => void>>();
@@ -370,291 +361,21 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     };
 
-    async function wakeMember(member: MemberRow, triggerPost: BoardPostRow) {
-      const swarm = db.getSwarm(member.swarm_id);
-      if (!swarm || swarm.status !== "running") return;
-
-      // If member is parked on swarm_wait in-process, resolve its waiter directly
-      const waiter = waiters.get(member.id);
-      if (waiter) {
-        const matched = checkPendingWakePosts(db, member, waiter.sinceSeq, waiter.mentionsOnly);
-        if (matched.length > 0) {
-          waiters.delete(member.id);
-          db.setMemberState(member.id, "working");
-          const maxMatchedSeq = matched[matched.length - 1].swarm_seq;
-          lastWakeSeq.set(member.id, Math.max(lastWakeSeq.get(member.id) ?? 0, maxMatchedSeq));
-          if (!waiter.mentionsOnly) {
-            db.advanceReadCursor(member.id, maxMatchedSeq);
-          }
-          emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-          waiter.resolve({ posts: matched });
-          return;
-        }
-        // If the waiter did not match the trigger post (e.g. unsubscribed channel or not mentioned),
-        // do not fall through to session.prompt to avoid double-waking a parked member.
-        return;
-      }
-
-      // Never inject [SWARM BOARD WAKE-UP] prompts into the user's coordinator chat.
-      // When @coordinator is parked in swarm_wait, the waiter branch above wakes it silently.
-      if (member.role === "coordinator") {
-        return;
-      }
-
-      const fresh = db.getMemberById(member.id);
-      const effectiveWakeSeq = Math.max(fresh?.last_read_seq ?? 0, lastWakeSeq.get(member.id) ?? 0);
-      if (!fresh || fresh.state === "killed" || fresh.state === "working" || effectiveWakeSeq >= triggerPost.swarm_seq) {
-        return;
-      }
-
-      // Medium 7: channel-isolated fallback feed (no cross-channel leaks)
-      const isGlobal = fresh.role === "monitor" || fresh.role === "narrator";
-      const memberChannels = isGlobal ? "*" : db.getMemberChannels(fresh.swarm_id, fresh.id);
-      const { posts } = db.getPostsPage(fresh.swarm_id, effectiveWakeSeq, 25, memberChannels);
-      if (posts.length === 0) return;
-      const lastSeq = posts[posts.length - 1].swarm_seq;
-
-      const feed = posts
-        .map((p) => `[#${p.swarm_seq} #${p.channel}] @${p.author_name}:\n${p.body}`)
-        .join("\n\n");
-
-      const promptText = [
-        `[SWARM BOARD WAKE-UP for @${fresh.name} — Swarm ${fresh.swarm_id}]`,
-        `New board traffic:`,
-        feed,
-        ``,
-        `Act on your assignment and report via \`post_message\`.`,
-      ].join("\n");
-
-      db.setMemberState(fresh.id, "working");
-      emitSwarmChanged({ swarmId: fresh.swarm_id, reason: "member_state", handle: fresh.name });
-      try {
-        await ctx.session.prompt({
-          sessionID: fresh.session_id,
-          text: promptText,
-          delivery: "queue",
-        });
-        lastWakeSeq.set(fresh.id, Math.max(lastWakeSeq.get(fresh.id) ?? 0, lastSeq));
-        db.advanceReadCursor(fresh.id, lastSeq);
-      } catch (err) {
-        // Reset state to waiting on prompt failure so member is not stuck in working and can re-deliver
-        db.setMemberState(fresh.id, "waiting", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-        emitSwarmChanged({ swarmId: fresh.swarm_id, reason: "member_state", handle: fresh.name });
-        throw err;
-      }
-    }
-
-    async function ensureVerifierForCompletedWork(
-      swarmId: string,
-      coord: MemberRow,
-      latestPost: BoardPostRow,
-    ): Promise<"spawned" | "requested" | "in_progress" | "unavailable"> {
-      const liveVerifiers = db.listMembers(swarmId, false).filter((m) => m.role === "verifier");
-      if (liveVerifiers.length === 0) {
-        if (autoVerifierSpawns.has(swarmId)) return "in_progress";
-        autoVerifierSpawns.add(swarmId);
-        try {
-          let verifierName = "verifier";
-          if (db.getMemberByName(swarmId, verifierName)) {
-            let n = 2;
-            while (db.getMemberByName(swarmId, `verifier-${n}`)) n++;
-            verifierName = `verifier-${n}`;
-          }
-          const brief = [
-            `You are the swarm verifier. All worker tracks are complete (latest #${latestPost.swarm_seq} from ${latestPost.author_name}).`,
-            `Verify completed worker output against the swarm objective: read board with read_board, independently verify each finished track, inspect diffs and run concrete checks (tests/builds/file review).`,
-            `Then post PASS to @${coord.name} if all checks pass, or FAIL with exact file:line issues naming the responsible @worker.`,
-            `Read-only: do not edit workspace files.`,
-          ].join(" ");
-          await spawnSingleMember({
-            swarmId,
-            caller: coord,
-            name: verifierName,
-            role: "verifier",
-            brief,
-            workspace: "inherit",
-            channels: ["main"],
-          });
-          return "spawned";
-        } catch (err) {
-          autoVerifierSpawns.delete(swarmId);
-          console.warn("[opencode-swarm] auto-spawn verifier failed:", err instanceof Error ? err.message : String(err));
-          return "unavailable";
-        }
-      }
-
-      const anyWorkingVerifier = liveVerifiers.some((m) => db.getMemberById(m.id)?.state === "working" || m.state === "working");
-      if (anyWorkingVerifier) return "in_progress";
-      const waitingVerifier = liveVerifiers.find((m) => {
-        const fresh = db.getMemberById(m.id) ?? m;
-        return fresh.state === "waiting";
-      });
-      if (!waitingVerifier) return "unavailable";
-      const fresh = db.getMemberById(waitingVerifier.id) ?? waitingVerifier;
-      if (fresh.paused_quota === 1 || fresh.state === "stopped" || fresh.state === "killed") return "unavailable";
-      if (waiters.has(fresh.id)) return "in_progress";
-      if (lastVerificationRequestSeq.get(swarmId) === latestPost.swarm_seq) return "in_progress";
-      try {
-        await postToBoard(
-          swarmId,
-          coord.name,
-          "main",
-          `@${fresh.name} [verify] All worker tracks are complete (latest #${latestPost.swarm_seq}). Independently verify completed worker output against the swarm objective: read board with read_board, inspect diffs and run concrete checks, then post PASS to @${coord.name} or FAIL with exact file:line issues naming the responsible @worker.`,
-          new Set([coord.id]),
-        );
-        lastVerificationRequestSeq.set(swarmId, latestPost.swarm_seq);
-        return "requested";
-      } catch (err) {
-        console.warn("[opencode-swarm] verification request failed:", err instanceof Error ? err.message : String(err));
-        return "unavailable";
-      }
-    }
-
-    async function maybeWakeIdleCoordinator(swarmId: string, triggerPost?: BoardPostRow) {
-      const swarm = db.getSwarm(swarmId);
-      if (!swarm || swarm.status !== "running") return;
-
-      const members = db.listMembers(swarmId, false);
-      const coord = members.find((m) => m.role === "coordinator");
-      if (!coord) return;
-
-      const latestPost = triggerPost ?? db.getLatestPost(swarmId);
-      if (!latestPost || latestPost.author_name === coord.name) return;
-
-      const nonCoord = members.filter(
-        (m) => m.role !== "coordinator" && m.role !== "monitor" && m.role !== "narrator",
-      );
-      const anyWorking = nonCoord.some((m) => m.state === "working");
-      const workers = nonCoord.filter((m) => m.role === "worker");
-      const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
-      const latestAuthorMember = db.getMemberByName(swarmId, latestPost.author_name);
-      const isVerifierAuthorFlag = isVerifierAuthor(latestPost.author_name, latestAuthorMember);
-      const isVerifierReport = isVerifierAuthorFlag && /\b(PASS|FAIL)\b/i.test(latestPost.body);
-      const isMonitorStall = latestPost.author_name === "monitor";
-      const hasFreshPass = hasFreshVerifierPass(db, swarmId, members);
-
-      if (
-        options.autoSpawnVerifier !== false &&
-        allWorkersDone &&
-        !anyWorking &&
-        !isVerifierReport &&
-        !isMonitorStall &&
-        !hasFreshPass
-      ) {
-        const outcome = await ensureVerifierForCompletedWork(swarmId, coord, latestPost);
-        if (outcome === "spawned" || outcome === "requested" || outcome === "in_progress") return;
-      }
-
-      if (coord.state !== "waiting" || coord.paused_quota === 1 || waiters.has(coord.id)) {
-        return;
-      }
-
-      const prevCoordinatorWakeSeq = lastCoordinatorWakeSeq.get(swarmId) ?? 0;
-      if (coord.last_read_seq >= latestPost.swarm_seq || prevCoordinatorWakeSeq >= latestPost.swarm_seq) {
-        return;
-      }
-      let parsedMentions: string[] = [];
-      try {
-        parsedMentions = JSON.parse(latestPost.mentions_json || "[]") as string[];
-      } catch {
-        parsedMentions = [];
-      }
-      const mentionsCoord = parsedMentions.includes(coord.name);
-      const isExplicitHandoff =
-        mentionsCoord && /\[done\]|\[blocked\]|\[question\]|\bPASS\b|\bFAIL\b/i.test(latestPost.body);
-
-      const shouldWake =
-        (!anyWorking && (allWorkersDone || isVerifierReport)) ||
-        isMonitorStall ||
-        (!anyWorking && isExplicitHandoff);
-      if (!shouldWake) return;
-
-      const prevReadSeq = coord.last_read_seq;
-      lastCoordinatorWakeSeq.set(swarmId, latestPost.swarm_seq);
-      db.setMemberState(coord.id, "working");
-      emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
-
-      const completeReady = hasFreshPass && allWorkersDone && !anyWorking;
-
-      const handoffText = completeReady
-        ? `All swarm members finished (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Read board updates since #${prevReadSeq} with read_board, present the final summary to the user, and call swarm{action:"complete"}.`
-        : allWorkersDone && !anyWorking && !hasFreshPass && !isVerifierReport
-          ? `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Verification is NOT done: no verifier PASS yet. Call read_board(since: ${prevReadSeq}) to review, spawn or repair a verifier (@verifier) to independently verify worker output, and do NOT call swarm{action:"complete"} until a verifier posts PASS.`
-          : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
-
-      try {
-        await ctx.session.prompt({
-          sessionID: coord.session_id,
-          text: handoffText,
-          delivery: "queue",
-        });
-        db.advanceReadCursor(coord.id, latestPost.swarm_seq);
-      } catch (err) {
-        lastCoordinatorWakeSeq.set(swarmId, prevCoordinatorWakeSeq);
-        db.setMemberState(coord.id, "waiting", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-        emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
-      }
-    }
-
-    async function postToBoard(
-      swarmId: string,
-      authorName: string,
-      channel: string,
-      text: string,
-      excludeMemberIds?: Set<string>,
-    ): Promise<BoardPostRow> {
-      const ch = db.getChannel(swarmId, channel);
-      if (!ch) throw new Error(`Unknown channel "#${channel}".`);
-      if (ch.archived) throw new Error(`Channel "#${channel}" is archived.`);
-
-      // Medium 6: Channel isolation check on postToBoard
-      const author = db.getMemberByName(swarmId, authorName);
-      if (author) {
-        const isGlobal = author.role === "coordinator" || author.role === "monitor" || author.role === "narrator";
-        if (!isGlobal && channel !== "main") {
-          const authorChannels = db.getMemberChannels(swarmId, author.id);
-          if (!authorChannels.includes(channel)) {
-            throw new Error(`Member @${authorName} is not subscribed to channel "#${channel}".`);
-          }
-        }
-      }
-
-      const parsed = parseMentionsFromText(text);
-      const post = db.addPost({
-        swarmId,
-        authorName,
-        channel,
-        mentions: parsed.memberMentions,
-        channelMentions: parsed.channelMentions,
-        isAll: parsed.isAll,
-        body: text,
-      });
-      emitSwarmChanged({
-        swarmId,
-        reason: "board_post",
-        seq: post.swarm_seq,
-        handle: authorName,
-      });
-
-      const targets = resolveWakeTargets(db, swarmId, authorName, channel, parsed);
-      const isMonitorAuthor = authorName === "monitor";
-      for (const target of targets) {
-        if (excludeMemberIds?.has(target.id)) continue;
-        // RT-M5: Monitor nudges bypass paused_quota so stall breaks can proceed
-        if (target.paused_quota === 1 && !isMonitorAuthor) continue;
-        try {
-          await wakeMember(target, post);
-        } catch {
-          // Wake error recorded on member if needed
-        }
-      }
-
-      return post;
-    }
+    const wake = createWakeController({
+      db,
+      getAutoSpawnVerifier: () => autoSpawnVerifier,
+      waiters,
+      promptSession: (args) => ctx.session.prompt(args),
+      emitSwarmChanged,
+      spawnVerifier: (args) =>
+        spawnSingleMember({
+          ...args,
+          role: "verifier",
+          workspace: "inherit",
+          channels: ["main"],
+        }),
+    });
+    const { maybeWakeIdleCoordinator, postToBoard } = wake;
 
     async function switchMemberModelInPlace(
       swarmId: string,
@@ -895,7 +616,7 @@ export const swarmRuntimePlugin = Plugin.define({
           `@${cleanName} ${args.brief}`,
           new Set([insertedMember.id]),
         );
-        lastWakeSeq.set(insertedMember.id, spawnPost.swarm_seq);
+        wake.recordWakeSeq(insertedMember.id, spawnPost.swarm_seq);
         db.advanceReadCursor(insertedMember.id, spawnPost.swarm_seq);
         emitSwarmChanged({ swarmId: args.swarmId, reason: "member_spawned", handle: cleanName });
 
@@ -972,6 +693,56 @@ export const swarmRuntimePlugin = Plugin.define({
 
     let rpcCleanup: (() => Promise<void> | void) | undefined;
     try {
+      const rpcHandlers = createRpcHandlers({
+        ctx,
+        db,
+        isDbClosed: () => dbClosed,
+        getBoardUrl,
+        getBoardToken: () => boardServer?.token ?? "",
+        canonicalWorkspaceRoot,
+        roleModels,
+        persistRoleModels,
+        getAutoSpawnVerifier: () => autoSpawnVerifier,
+        setAutoSpawnVerifier: (enabled) => {
+          autoSpawnVerifier = enabled;
+        },
+        emitSwarmChanged,
+        resolveWaiterAborted,
+        waitForQuiesce,
+        pendingKillCleanup,
+        switchMemberModelInPlace,
+        beforeUninstallRuntimeDataDelete: async () => {
+          stopMonitor();
+          abortController.abort();
+          pendingCalls.clear();
+          waiters.clear();
+          wake.clearCoordinatorWakeSeq();
+          if (!dbClosed) {
+            for (const activeSwarm of db.getActiveSwarms()) {
+              for (const m of db.listMembers(activeSwarm.id, false)) {
+                try {
+                  await ctx.session.interrupt({ sessionID: m.session_id });
+                } catch {
+                  // Ignore
+                }
+              }
+              db.releaseAllLocksForSwarm(activeSwarm.id);
+            }
+          }
+          if (boardServer && !boardServerClosed) {
+            boardServerClosed = true;
+            await boardServer.close().catch(() => {});
+          }
+          if (!dbClosed) {
+            dbClosed = true;
+            try {
+              db.close();
+            } catch {
+              // Ignore
+            }
+          }
+        },
+      });
       rpcReg = await (ctx as unknown as {
         rpc?: {
           register?: (
@@ -979,434 +750,7 @@ export const swarmRuntimePlugin = Plugin.define({
             handlers: Record<string, (args?: Record<string, unknown>) => Promise<unknown>>,
           ) => Promise<RpcReg | void>;
         };
-      }).rpc?.register?.(SWARM_RPC_DEF, {
-        getBoardInfo: async () => {
-          if (dbClosed) {
-            return { url: "", token: "", swarmId: "", title: "Swarm Board", status: "idle", activeCount: 0 };
-          }
-          const active = db.getActiveSwarms()[0];
-          const members = active ? db.listMembers(active.id, false) : [];
-          return {
-            url: getBoardUrl(),
-            token: boardServer?.token ?? "",
-            swarmId: active?.id ?? "",
-            title: active?.title ?? "Swarm Board",
-            status: active?.status ?? "idle",
-            activeCount: members.length,
-          };
-        },
-        getSwarmSnapshot: async (args?: Record<string, unknown>) => {
-          if (dbClosed) {
-            return { swarm: null, boardUrl: "", head: 0, stalled: false, members: [], board_posts: [], file_locks: [] };
-          }
-          const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
-          const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
-          let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
-          if (!swarm && sessionIdArg) {
-            const member = db.getActiveMemberBySession(sessionIdArg) ?? db.getLatestMemberBySession(sessionIdArg);
-            if (member) {
-              swarm = db.getSwarm(member.swarm_id);
-            }
-          }
-          if (!swarm && !swarmIdArg) {
-            swarm = db.getActiveSwarms()[0];
-          }
-          if (!swarm && !swarmIdArg) {
-            const latestSummary = db.listSwarms(1)[0];
-            if (latestSummary) {
-              swarm = db.getSwarm(latestSummary.id);
-            }
-          }
-          if (!swarm) {
-            return {
-              swarm: null,
-              boardUrl: getBoardUrl(),
-              head: 0,
-              stalled: false,
-              members: [],
-              board_posts: [],
-              file_locks: [],
-            };
-          }
-          const rawLocks = db.listLocks(swarm.id);
-          const globsByMember = new Map<string, string[]>();
-          for (const l of rawLocks) {
-            const arr = globsByMember.get(l.owner_member_id) ?? [];
-            arr.push(l.glob_pattern);
-            globsByMember.set(l.owner_member_id, arr);
-          }
-          const members = db.listMembers(swarm.id, true).map((m) => ({
-            id: m.id,
-            handle: m.name,
-            name: m.name,
-            generation: m.generation,
-            role: m.role,
-            model: m.model_provider && m.model_id ? `${m.model_provider}/${m.model_id}` : "",
-            variant: m.model_variant ?? null,
-            state: m.state,
-            paused_quota: Boolean(m.paused_quota),
-            track_status: m.track_status,
-            session_id: m.session_id ?? null,
-            owned_globs: globsByMember.get(m.id) ?? [],
-            workspace_mode: m.workspace_mode,
-            last_active_at: m.last_active_at ?? null,
-            activity: m.activity ?? null,
-          }));
-          const board_posts = db.getLatestPostsWindow(swarm.id, 500, "*").posts.map((p) => ({
-            seq: p.swarm_seq,
-            channel: p.channel,
-            author: p.author_name,
-            mentions: safeParseStringArray(p.mentions_json),
-            channel_mentions: safeParseStringArray(p.channel_mentions_json),
-            is_all: Boolean(p.is_all),
-            body: p.body,
-            created_at: p.created_at,
-          }));
-          const latest = db.getLatestPost(swarm.id);
-          const head = latest?.swarm_seq ?? 0;
-          const stalled =
-            swarm.status === "running" &&
-            swarm.monitor_nudge_count > 0 &&
-            head <= swarm.last_monitor_nudge_seq;
-          const file_locks = rawLocks.map((l) => ({
-            id: l.id,
-            glob_pattern: l.glob_pattern,
-            owner_handle: l.owner_name,
-            owner_member_id: l.owner_member_id,
-            claimed_at: l.claimed_at,
-          }));
-          return {
-            swarm: {
-              id: swarm.id,
-              title: swarm.title,
-              objective: swarm.objective ?? null,
-              status: swarm.status,
-              created_at: swarm.created_at,
-              updated_at: swarm.updated_at,
-            },
-            boardUrl: getBoardUrl(),
-            head,
-            stalled,
-            members,
-            board_posts,
-            file_locks,
-          };
-        },
-        listSwarms: async (args?: Record<string, unknown>) => {
-          if (dbClosed) return { swarms: [] };
-          const limit = typeof args?.limit === "number" ? args.limit : 50;
-          return { swarms: db.listSwarms(limit) };
-        },
-        completeSwarm: async (args?: Record<string, unknown>) => {
-          if (dbClosed) return { ok: false, error: "Swarm database is closed." };
-          const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
-          const summary = typeof args?.summary === "string" ? args.summary : undefined;
-          const callerSessionId = typeof args?.callerSessionId === "string" ? args.callerSessionId : undefined;
-          const swarm = db.getSwarm(swarmId);
-          if (!swarm) {
-            return { ok: false, error: `Swarm '${swarmId}' not found.` };
-          }
-          if (callerSessionId) {
-            const caller = db.getActiveMemberBySession(callerSessionId);
-            if (!caller || caller.swarm_id !== swarm.id || caller.role !== "coordinator") {
-              return { ok: false, error: "Only @coordinator may complete the swarm." };
-            }
-          }
-          db.setSwarmStatus(swarm.id, "completing");
-          const members = db.listMembers(swarm.id, false);
-          for (const m of members) {
-            resolveWaiterAborted(m.id);
-            try {
-              await ctx.session.interrupt({ sessionID: m.session_id });
-            } catch {
-              // Ignore
-            }
-            db.setMemberState(m.id, "killed");
-            cleanupMemberWorkspace({
-              mode: m.workspace_mode,
-              dir: m.workspace_dir,
-              branch: m.workspace_branch,
-              repoRoot: canonicalWorkspaceRoot,
-            });
-          }
-          db.releaseAllLocksForSwarm(swarm.id);
-          db.setSwarmStatus(swarm.id, "completed");
-          emitSwarmChanged({ swarmId: swarm.id, reason: "swarm_completed", summary });
-          return { ok: true };
-        },
-        killMember: async (args?: Record<string, unknown>) => {
-          if (dbClosed) return { ok: false, error: "Swarm database is closed." };
-          const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
-          const handle = typeof args?.handle === "string" ? args.handle : "";
-          const reason = typeof args?.reason === "string" ? args.reason : undefined;
-          const callerSessionId = typeof args?.callerSessionId === "string" ? args.callerSessionId : undefined;
-          const swarm = db.getSwarm(swarmId);
-          if (!swarm) {
-            return { ok: false, error: `Swarm '${swarmId}' not found.` };
-          }
-          const target = db
-            .listMembers(swarm.id, false)
-            .find((m) => m.name === handle);
-          if (!target) {
-            return { ok: false, error: `Active member '${handle}' not found in swarm '${swarmId}'.` };
-          }
-          if (target.role === "coordinator") {
-            return { ok: false, error: "Cannot kill @coordinator." };
-          }
-          if (callerSessionId) {
-            const caller = db.getActiveMemberBySession(callerSessionId);
-            if (!caller || caller.swarm_id !== swarm.id || (caller.role !== "coordinator" && target.added_by !== caller.name)) {
-              return { ok: false, error: `Only @coordinator or the member that added @${target.name} may kill it.` };
-            }
-          }
-          db.setMemberState(target.id, "killed");
-          resolveWaiterAborted(target.id);
-          try {
-            await ctx.session.interrupt({ sessionID: target.session_id });
-          } catch {
-            // Already idle
-          }
-          const finishKillCleanup = () => {
-            db.releaseLocksForMember(target.id);
-            cleanupMemberWorkspace({
-              mode: target.workspace_mode,
-              dir: target.workspace_dir,
-              branch: target.workspace_branch,
-              repoRoot: canonicalWorkspaceRoot,
-            });
-          };
-          const quiesced = await waitForQuiesce(target.session_id, 400);
-          if (quiesced) {
-            finishKillCleanup();
-          } else {
-            pendingKillCleanup.set(target.session_id, finishKillCleanup);
-          }
-          emitSwarmChanged({ swarmId: swarm.id, reason: "member_killed", handle: target.name, summary: reason });
-          return { ok: true };
-        },
-        getRoleConfig: async (args?: Record<string, unknown>) => {
-          if (dbClosed) {
-            return {
-              swarmId: null,
-              swarmTitle: null,
-              swarmStatus: "idle",
-              roleModels: {
-                coordinator: roleModels.coordinator ?? "",
-                worker: roleModels.worker ?? "",
-                verifier: roleModels.verifier ?? "",
-                monitor: roleModels.monitor ?? "",
-              },
-              models: [],
-            };
-          }
-          const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
-          const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
-          let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
-          if (!swarm && sessionIdArg) {
-            const member = db.getActiveMemberBySession(sessionIdArg) ?? db.getLatestMemberBySession(sessionIdArg);
-            if (member) {
-              swarm = db.getSwarm(member.swarm_id);
-            }
-          }
-          if (!swarm && !swarmIdArg) {
-            swarm = db.getActiveSwarms()[0];
-          }
-          if (!swarm && !swarmIdArg) {
-            const latestSummary = db.listSwarms(1)[0];
-            if (latestSummary) swarm = db.getSwarm(latestSummary.id);
-          }
-
-          const catalog = await listAvailableModels(ctx, { all: false });
-          const defaultSpec = catalog.defaultModel
-            ? `${catalog.defaultModel.providerID}/${catalog.defaultModel.modelID}`
-            : catalog.models[0]
-              ? `${catalog.models[0].providerID}/${catalog.models[0].id}`
-              : "";
-          const liveMembers = swarm ? db.listMembers(swarm.id, false) : [];
-          const pickRoleModel = (role: "coordinator" | "worker" | "verifier" | "monitor") => {
-            const member = liveMembers.find((m) => m.role === role);
-            if (member?.model_provider && member?.model_id) {
-              return formatModelSpec({
-                providerID: member.model_provider,
-                id: member.model_id,
-                ...(member.model_variant ? { variant: member.model_variant } : {}),
-              });
-            }
-            return roleModels[role] ?? defaultSpec;
-          };
-
-          return {
-            swarmId: swarm?.id ?? null,
-            swarmTitle: swarm?.title ?? null,
-            swarmStatus: swarm?.status ?? "idle",
-            roleModels: {
-              coordinator: pickRoleModel("coordinator"),
-              worker: pickRoleModel("worker"),
-              verifier: pickRoleModel("verifier"),
-              monitor: pickRoleModel("monitor"),
-            },
-            models: catalog.models.map((m) => ({
-              providerID: m.providerID,
-              id: m.id,
-              variants: m.variants,
-            })),
-          };
-        },
-        setRoleModel: async (args?: Record<string, unknown>) => {
-          const roleArg = typeof args?.role === "string" ? args.role.trim().toLowerCase() : "";
-          const modelArg = typeof args?.model === "string" ? args.model.trim() : "";
-          const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
-          const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
-
-          if (!["coordinator", "worker", "verifier", "monitor"].includes(roleArg)) {
-            return {
-              ok: false,
-              role: roleArg,
-              model: modelArg,
-              switchedMembers: [],
-              rerunMembers: [],
-              error: `Unsupported role "${roleArg}".`,
-            };
-          }
-
-          let resolved: ModelSelection | undefined;
-          try {
-            resolved = await resolveAndValidateModel(ctx, modelArg, undefined, undefined);
-          } catch (err) {
-            return {
-              ok: false,
-              role: roleArg,
-              model: modelArg,
-              switchedMembers: [],
-              rerunMembers: [],
-              error: err instanceof Error ? err.message : String(err),
-            };
-          }
-          if (!resolved) {
-            return {
-              ok: false,
-              role: roleArg,
-              model: modelArg,
-              switchedMembers: [],
-              rerunMembers: [],
-              error: "Model must be specified.",
-            };
-          }
-
-          const spec = formatModelSpec(resolved);
-          roleModels[roleArg as MemberRole] = spec;
-          persistRoleModels();
-
-          let swarm = swarmIdArg ? db.getSwarm(swarmIdArg) : undefined;
-          if (!swarm && sessionIdArg) {
-            const member = db.getActiveMemberBySession(sessionIdArg);
-            if (member) swarm = db.getSwarm(member.swarm_id);
-          }
-          if (!swarm && !swarmIdArg) {
-            swarm = db.getActiveSwarms()[0];
-          }
-
-          const switchedMembers: string[] = [];
-          const rerunMembers: string[] = [];
-          if (swarm) {
-            const liveRoleMembers = db
-              .listMembers(swarm.id, false)
-              .filter((m) => m.role === roleArg);
-            for (const m of liveRoleMembers) {
-              const res = await switchMemberModelInPlace(swarm.id, m.name, spec, undefined, {
-                interruptAndRerunIfWorking: true,
-              });
-              switchedMembers.push(m.name);
-              if (res.rerun) {
-                rerunMembers.push(m.name);
-              }
-            }
-          }
-
-          if (roleArg === "coordinator" && switchedMembers.length === 0 && sessionIdArg) {
-            await ctx.session
-              .switchModel({
-                sessionID: sessionIdArg,
-                model: {
-                  providerID: resolved.providerID,
-                  id: resolved.id,
-                  ...(resolved.variant ? { variant: resolved.variant } : {}),
-                },
-              })
-              .catch(() => {});
-          }
-
-          emitSwarmChanged({
-            swarmId: swarm?.id ?? "",
-            reason: "role_model_changed",
-            handle: roleArg,
-            summary: spec,
-          });
-
-          return {
-            ok: true,
-            role: roleArg,
-            model: spec,
-            switchedMembers,
-            rerunMembers,
-          };
-        },
-        previewUninstall: async () => {
-          return buildUninstallPlan({
-            workspaceRoot: canonicalWorkspaceRoot,
-            boardUrl: boardServerClosed ? undefined : boardServer?.url,
-          });
-        },
-        executeUninstall: async (args?: Record<string, unknown>) => {
-          const categories = (
-            args?.categories && typeof args.categories === "object" && !Array.isArray(args.categories)
-              ? args.categories
-              : {}
-          ) as Partial<UninstallSelection>;
-          const prevBoardUrl = boardServerClosed ? undefined : boardServer?.url;
-          const plan = buildUninstallPlan({
-            workspaceRoot: canonicalWorkspaceRoot,
-            boardUrl: prevBoardUrl,
-          });
-          return await executeUninstallPlan(plan, categories, {
-            env: {
-              workspaceRoot: canonicalWorkspaceRoot,
-              boardUrl: prevBoardUrl,
-            },
-            beforeRuntimeDataDelete: async () => {
-              stopMonitor();
-              abortController.abort();
-              pendingCalls.clear();
-              waiters.clear();
-              lastCoordinatorWakeSeq.clear();
-              if (!dbClosed) {
-                for (const activeSwarm of db.getActiveSwarms()) {
-                  for (const m of db.listMembers(activeSwarm.id, false)) {
-                    try {
-                      await ctx.session.interrupt({ sessionID: m.session_id });
-                    } catch {
-                      // Ignore
-                    }
-                  }
-                  db.releaseAllLocksForSwarm(activeSwarm.id);
-                }
-              }
-              if (boardServer && !boardServerClosed) {
-                boardServerClosed = true;
-                await boardServer.close().catch(() => {});
-              }
-              if (!dbClosed) {
-                dbClosed = true;
-                try {
-                  db.close();
-                } catch {
-                  // Ignore
-                }
-              }
-            },
-          });
-        },
-      }) ?? undefined;
+      }).rpc?.register?.(SWARM_RPC_DEF, rpcHandlers) ?? undefined;
       if (rpcReg && typeof rpcReg === "object" && "dispose" in rpcReg && typeof rpcReg.dispose === "function") {
         rpcCleanup = () => rpcReg!.dispose!();
       }
@@ -1417,640 +761,23 @@ export const swarmRuntimePlugin = Plugin.define({
     // -----------------------------------------------------------------------
     // 1. Register 4 Antigravity Core Tools: swarm, post_message, read_board, swarm_wait
     // -----------------------------------------------------------------------
-    await ctx.tool.transform((tools) => {
-      tools.add({
-        name: "swarm",
-        description:
-          "Manage the swarm: status, models (list models + variants), add (spawn worker/group), model (live in-place model/variant switch), kill, title, channel, claim, complete.",
-        input: {
-          type: "object",
-          required: ["action"],
-          properties: {
-            action: {
-              type: "string",
-              enum: ["status", "models", "add", "model", "kill", "title", "channel", "claim", "complete"],
-            },
-            all: { type: "boolean", description: "For models: include disabled/deprecated models." },
-            name: { type: "string", description: "Worker name for add, model, or kill." },
-            role: { type: "string", enum: ["worker", "verifier", "monitor", "narrator"] },
-            brief: { type: "string", description: "Assignment brief for add." },
-            model: { type: "string", description: "Manual 'providerID/modelID' or 'providerID/modelID#variant'." },
-            variant: { type: "string", description: "Optional reasoning/effort variant ID." },
-            workspace: { type: "string", enum: ["inherit", "share", "branch"] },
-            fork: { type: "string", description: "Fork conversation history from member name or 'coordinator'." },
-            n: { type: "number", description: "Spawn N homogeneous copies (<name>-1..<name>-N)." },
-            tasks: { type: "array", items: { type: "string" }, description: "Per-worker slice targets." },
-            channels: { type: "array", items: { type: "string" } },
-            owned_globs: { type: "array", items: { type: "string" } },
-            title: { type: "string", description: "Swarm title for action:'title'." },
-            op: { type: "string", enum: ["create", "subscribe", "unsubscribe", "list", "archive"] },
-            channel: { type: "string" },
-            topic: { type: "string" },
-            globs: { type: "array", items: { type: "string" } },
-            summary: { type: "string" },
-          },
-        },
-        options: { codemode: false },
-        async execute(rawInput, toolCtx) {
-          const input = rawInput as Record<string, unknown>;
-          const action = String(input.action ?? "");
-
-          if (action === "models") {
-            const catalog = await listAvailableModels(ctx, { all: Boolean(input.all) });
-            return toolJson({
-              ok: true,
-              default_model: catalog.defaultModel,
-              role_defaults: roleModels,
-              models: catalog.models,
-            });
-          }
-
-          if (action === "title") {
-            const title = String(input.title ?? "").trim();
-            if (!title) return toolJson({ ok: false, error: "title is required." });
-            const { swarmId, coordinator } = await ensureCoordinator(toolCtx.sessionID, title);
-            const caller = db.getActiveMemberBySession(toolCtx.sessionID) ?? coordinator;
-            if (caller.role !== "coordinator") {
-              return toolJson({ ok: false, error: "Only @coordinator may change the swarm title." });
-            }
-            db.setSwarmTitle(swarmId, title);
-            emitSwarmChanged({ swarmId, reason: "swarm_updated", summary: title });
-            return toolJson({ ok: true, swarm_id: swarmId, title, open_board: getBoardUrl() });
-          }
-
-          if (action === "status") {
-            const caller = db.getLatestMemberBySession(toolCtx.sessionID);
-            if (!caller) {
-              return toolJson({ ok: true, swarm: null, open_board: "" });
-            }
-            const swarm = db.getSwarm(caller.swarm_id);
-            const members = db.listMembers(caller.swarm_id, true);
-            const locks = db.listLocks(caller.swarm_id);
-            return toolJson({
-              ok: true,
-              swarm,
-              open_board: caller.role === "coordinator" ? getBoardUrl() : "",
-              members: members.map((m) => ({
-                name: m.name,
-                role: m.role,
-                state: m.state,
-                paused_quota: m.paused_quota === 1,
-                model: formatModelSpec(
-                  m.model_provider && m.model_id
-                    ? { providerID: m.model_provider, id: m.model_id, variant: m.model_variant ?? undefined }
-                    : undefined,
-                ),
-                workspace: m.workspace_mode,
-                workspace_dir: m.workspace_dir,
-                channels: db.getMemberChannels(caller.swarm_id, m.id),
-                owned_globs: locks.filter((l) => l.owner_member_id === m.id).map((l) => l.glob_pattern),
-                added_by: m.added_by,
-              })),
-            });
-          }
-
-          if (action === "add") {
-            const { swarmId, coordinator } = await ensureCoordinator(toolCtx.sessionID);
-            const caller = db.getActiveMemberBySession(toolCtx.sessionID) ?? coordinator;
-            if (caller.role !== "coordinator") {
-              return toolJson({ ok: false, error: "Only @coordinator may spawn swarm members." });
-            }
-            const baseName = String(input.name ?? "").trim();
-            const brief = String(input.brief ?? "").trim();
-            if (!baseName || !brief) {
-              return toolJson({ ok: false, error: "name and brief are required for action:'add'." });
-            }
-
-            const rawRole = input.role !== undefined ? String(input.role).trim().toLowerCase() : "worker";
-            const allowedRoles: MemberRole[] = ["worker", "verifier", "monitor", "narrator"];
-            if (!allowedRoles.includes(rawRole as MemberRole)) {
-              return toolJson({
-                ok: false,
-                error: `Invalid role "${rawRole}". Allowed roles for spawn: ${allowedRoles.join(", ")}. Coordinator cannot be spawned.`,
-              });
-            }
-            const role = rawRole as MemberRole;
-            const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
-            const n = typeof input.n === "number" && input.n > 1 ? Math.floor(input.n) : undefined;
-            const count = tasks ? tasks.length : n;
-
-            const spawned: Array<{ name: string; session_id: string; model: string; workspace: string }> = [];
-            const spawnedMembers: MemberRow[] = [];
-            try {
-              if (count && count > 1) {
-                const wsMode = (input.workspace as WorkspaceMode | undefined) ?? "inherit";
-                const globs = (input.owned_globs as string[] | undefined) ?? [];
-                if (globs.length > 0 && wsMode === "inherit") {
-                  return toolJson({
-                    ok: false,
-                    error:
-                      "Cannot assign identical owned_globs to multiple inherit-mode shards; spawn individually with disjoint owned_globs or use workspace:'share'.",
-                  });
-                }
-                for (let i = 0; i < count; i++) {
-                  const shardName = validateMemberName(`${baseName}-${i + 1}`, role);
-                  const existing = db.getMemberByName(swarmId, shardName);
-                  if (existing) {
-                    return toolJson({
-                      ok: false,
-                      error: `Member @${shardName} already exists in swarm ${swarmId} (state: ${existing.state}).`,
-                    });
-                  }
-                }
-                const normalizedPrefix = normalizeHandle(baseName);
-                for (let i = 0; i < count; i++) {
-                  const sliceBrief = tasks ? `${brief}\n\nAssigned slice: ${tasks[i]}` : brief;
-                  const m = await spawnSingleMember({
-                    swarmId,
-                    caller,
-                    name: `${baseName}-${i + 1}`,
-                    role,
-                    brief: sliceBrief,
-                    model: input.model as string | undefined,
-                    variant: input.variant as string | undefined,
-                    workspace: input.workspace as WorkspaceMode | undefined,
-                    fork: input.fork as string | undefined,
-                    channels: input.channels as string[] | undefined,
-                    ownedGlobs: input.owned_globs as string[] | undefined,
-                    groupPrefix: normalizedPrefix,
-                  });
-                  spawnedMembers.push(m);
-                  spawned.push({
-                    name: m.name,
-                    session_id: m.session_id,
-                    model: formatModelSpec(
-                      m.model_provider && m.model_id
-                        ? { providerID: m.model_provider, id: m.model_id, variant: m.model_variant ?? undefined }
-                        : undefined,
-                    ),
-                    workspace: m.workspace_mode,
-                  });
-                }
-              } else {
-                const m = await spawnSingleMember({
-                  swarmId,
-                  caller,
-                  name: baseName,
-                  role,
-                  brief,
-                  model: input.model as string | undefined,
-                  variant: input.variant as string | undefined,
-                  workspace: input.workspace as WorkspaceMode | undefined,
-                  fork: input.fork as string | undefined,
-                  channels: input.channels as string[] | undefined,
-                  ownedGlobs: input.owned_globs as string[] | undefined,
-                });
-                spawnedMembers.push(m);
-                spawned.push({
-                  name: m.name,
-                  session_id: m.session_id,
-                  model: formatModelSpec(
-                    m.model_provider && m.model_id
-                      ? { providerID: m.model_provider, id: m.model_id, variant: m.model_variant ?? undefined }
-                      : undefined,
-                  ),
-                  workspace: m.workspace_mode,
-                });
-              }
-              return toolJson({ ok: true, swarm_id: swarmId, spawned, open_board: getBoardUrl() });
-            } catch (err) {
-              for (const m of spawnedMembers) {
-                await ctx.session.interrupt({ sessionID: m.session_id }).catch(() => {});
-                db.setMemberState(m.id, "killed");
-                db.releaseLocksForMember(m.id);
-                cleanupMemberWorkspace({
-                  mode: m.workspace_mode,
-                  dir: m.workspace_dir,
-                  branch: m.workspace_branch,
-                  repoRoot: canonicalWorkspaceRoot,
-                });
-              }
-              return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
-            }
-          }
-
-          const caller = db.getActiveMemberBySession(toolCtx.sessionID);
-          if (!caller) {
-            return toolJson({ ok: false, error: "Session is not part of an active swarm." });
-          }
-
-          if (action === "model") {
-            const targetName = String(input.name ?? caller.name).trim();
-            if (caller.role !== "coordinator" && targetName !== caller.name) {
-              const target = db.getMemberByName(caller.swarm_id, targetName);
-              if (!target || target.added_by !== caller.name) {
-                return toolJson({
-                  ok: false,
-                  error: `Only @coordinator or the member that added @${targetName} may switch its model.`,
-                });
-              }
-            }
-            try {
-              const res = await switchMemberModelInPlace(
-                caller.swarm_id,
-                targetName,
-                input.model as string | undefined,
-                input.variant as string | undefined,
-              );
-              return toolJson({ ok: true, ...res });
-            } catch (err) {
-              return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
-            }
-          }
-
-          if (action === "kill") {
-            const rawTargetName = String(input.name ?? "").trim();
-            if (!rawTargetName) return toolJson({ ok: false, error: "name is required for action:'kill'." });
-            let targetName: string;
-            try {
-              targetName = normalizeHandle(rawTargetName);
-            } catch {
-              targetName = rawTargetName.toLowerCase();
-            }
-            const allMembers = db.listMembers(caller.swarm_id, false);
-            const targets = allMembers.filter(
-              (m) => m.name === targetName || m.group_prefix === targetName,
-            );
-            if (targets.length === 0) {
-              return toolJson({ ok: false, error: `No live member found for "${rawTargetName}".` });
-            }
-            const killed: string[] = [];
-            for (const t of targets) {
-              if (t.role === "coordinator") {
-                return toolJson({ ok: false, error: "Cannot kill @coordinator." });
-              }
-              if (caller.role !== "coordinator" && t.added_by !== caller.name) {
-                return toolJson({
-                  ok: false,
-                  error: `@${caller.name} can only kill helpers it added (not @${t.name}).`,
-                });
-              }
-              db.setMemberState(t.id, "killed");
-              resolveWaiterAborted(t.id);
-              try {
-                await ctx.session.interrupt({ sessionID: t.session_id });
-              } catch {
-                // Already idle
-              }
-              const finishKillCleanup = () => {
-                db.releaseLocksForMember(t.id);
-                cleanupMemberWorkspace({
-                  mode: t.workspace_mode,
-                  dir: t.workspace_dir,
-                  branch: t.workspace_branch,
-                  repoRoot: canonicalWorkspaceRoot,
-                });
-              };
-              const quiesced = await waitForQuiesce(t.session_id, 400);
-              if (quiesced) {
-                finishKillCleanup();
-              } else {
-                pendingKillCleanup.set(t.session_id, finishKillCleanup);
-              }
-              emitSwarmChanged({
-                swarmId: t.swarm_id,
-                reason: "member_killed",
-                handle: t.name,
-              });
-              killed.push(t.name);
-            }
-            if (killed.length > 0) {
-              emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_killed" });
-            }
-            return toolJson({ ok: true, killed });
-          }
-
-          if (action === "channel") {
-            const op = String(input.op ?? "list");
-            const chName = String(input.channel ?? "");
-            try {
-              if (op === "list") {
-                return toolJson({ ok: true, channels: db.listChannels(caller.swarm_id) });
-              }
-              if (op === "create") {
-                if (caller.role !== "coordinator") {
-                  return toolJson({ ok: false, error: "Only @coordinator may create channels." });
-                }
-                const created = db.createChannel(caller.swarm_id, chName, String(input.topic ?? ""), caller.name);
-                return toolJson({ ok: true, channel: created });
-              }
-              if (op === "archive") {
-                if (caller.role !== "coordinator") {
-                  return toolJson({ ok: false, error: "Only @coordinator may archive channels." });
-                }
-                db.archiveChannel(caller.swarm_id, chName);
-                return toolJson({ ok: true, archived: chName });
-              }
-              if (op === "subscribe" || op === "unsubscribe") {
-                const targetName = String(input.name ?? caller.name);
-                const target = db.getMemberByName(caller.swarm_id, targetName);
-                if (!target) return toolJson({ ok: false, error: `Member "${targetName}" not found.` });
-                if (op === "subscribe") {
-                  if (caller.role !== "coordinator") {
-                    return toolJson({ ok: false, error: "Only @coordinator may subscribe members to channels." });
-                  }
-                  db.subscribeMemberToChannel(caller.swarm_id, chName, target.id);
-                } else {
-                  if (caller.role !== "coordinator" && target.id !== caller.id) {
-                    return toolJson({ ok: false, error: `Only @coordinator or @${target.name} may unsubscribe @${target.name}.` });
-                  }
-                  db.unsubscribeMemberFromChannel(caller.swarm_id, chName, target.id);
-                }
-                return toolJson({ ok: true, member: target.name, channels: db.getMemberChannels(caller.swarm_id, target.id) });
-              }
-              return toolJson({ ok: false, error: `Unknown channel op "${op}".` });
-            } catch (err) {
-              return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
-            }
-          }
-
-          if (action === "claim") {
-            if (caller.role !== "coordinator" && caller.role !== "worker") {
-              return toolJson({ ok: false, error: `Member @${caller.name} with role '${caller.role}' cannot claim locks.` });
-            }
-            if (caller.workspace_mode !== "inherit") {
-              return toolJson({
-                ok: false,
-                error: `action:'claim' is only supported in workspace:'inherit' mode (got '${caller.workspace_mode}').`,
-              });
-            }
-            const globs = Array.isArray(input.globs) ? (input.globs as string[]) : [];
-            if (globs.length === 0) return toolJson({ ok: false, error: "globs array is required." });
-            try {
-              const res = db.claimLocksAtomic(caller.swarm_id, caller.id, caller.name, globs);
-              if (res.claimed.length > 0) {
-                emitSwarmChanged({
-                  swarmId: caller.swarm_id,
-                  reason: "lock_changed",
-                  handle: caller.name,
-                });
-              }
-              if (res.conflicts.length > 0) return toolJson({ ok: false, conflicts: res.conflicts });
-              return toolJson({ ok: true, claimed: res.claimed });
-            } catch (err) {
-              return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
-            }
-          }
-
-          if (action === "complete") {
-            if (caller.role !== "coordinator") {
-              return toolJson({ ok: false, error: "Only @coordinator may complete the swarm." });
-            }
-            db.setSwarmStatus(caller.swarm_id, "completing");
-            const children = db.listMembers(caller.swarm_id, false).filter((m) => m.role !== "coordinator");
-            for (const c of children) {
-              resolveWaiterAborted(c.id);
-              try {
-                await ctx.session.interrupt({ sessionID: c.session_id });
-              } catch {
-                // Ignore
-              }
-              db.setMemberState(c.id, "killed");
-              cleanupMemberWorkspace({
-                mode: c.workspace_mode,
-                dir: c.workspace_dir,
-                branch: c.workspace_branch,
-                repoRoot: canonicalWorkspaceRoot,
-              });
-            }
-            db.setMemberState(caller.id, "killed");
-            db.releaseAllLocksForSwarm(caller.swarm_id);
-            db.setSwarmStatus(caller.swarm_id, "completed");
-            emitSwarmChanged({ swarmId: caller.swarm_id, reason: "swarm_completed" });
-
-            // SEC-H7: Clear/restore coordinator session permissions
-            try {
-              await ctx.session.update({
-                sessionID: caller.session_id,
-                permissions: [],
-              });
-            } catch {
-              // Ignore if session update unsupported
-            }
-
-            return toolJson({ ok: true, swarm_id: caller.swarm_id, status: "completed" });
-          }
-
-          return toolJson({ ok: false, error: `Unknown swarm action "${action}".` });
-        },
-      });
-
-      tools.add({
-        name: "post_message",
-        description: "Post a message to the shared swarm board and wake @mentioned members.",
-        input: {
-          type: "object",
-          required: ["text"],
-          properties: {
-            text: { type: "string" },
-            channel: { type: "string", description: "Target channel (defaults to 'main')." },
-            mark_done: { type: "boolean" },
-          },
-        },
-        options: { codemode: false },
-        async execute(rawInput, toolCtx) {
-          if (toolCtx.signal?.aborted) {
-            return toolJson({ woken: false, aborted: true, posts: [] });
-          }
-          const caller = db.getActiveMemberBySession(toolCtx.sessionID);
-          if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
-          const input = rawInput as { text: string; channel?: string; mark_done?: boolean };
-          const isDonePost =
-            Boolean(input.mark_done) ||
-            /^\s*\[done\]/i.test(input.text) ||
-            /@\S+\s+\[done\]/i.test(input.text);
-          const isVerifierPass = caller.role === "verifier" && /\bPASS\b/i.test(input.text);
-          const isVerifierFail = caller.role === "verifier" && /\bFAIL\b/i.test(input.text);
-
-          if (isDonePost || isVerifierPass) {
-            db.setTrackStatus(caller.id, "done");
-          }
-          if (caller.role !== "coordinator" && (isDonePost || isVerifierPass || isVerifierFail)) {
-            db.setMemberState(caller.id, "waiting", { activity: null, pausedQuota: false });
-            emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
-          }
-          try {
-            const post = await postToBoard(caller.swarm_id, caller.name, input.channel ?? "main", input.text);
-            lastWakeSeq.set(caller.id, Math.max(lastWakeSeq.get(caller.id) ?? 0, post.swarm_seq));
-            await maybeWakeIdleCoordinator(caller.swarm_id, post);
-            return toolJson({ ok: true, seq: post.swarm_seq, channel: post.channel });
-          } catch (err) {
-            return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
-          }
-        },
-      });
-
-      tools.add({
-        name: "read_board",
-        description: "Read posts from the shared swarm board or inspect member status.",
-        input: {
-          type: "object",
-          properties: {
-            since: { type: "number" },
-            limit: { type: "number" },
-            channel: { type: "string", description: "Filter by channel name or '*' for all." },
-            status: { type: "boolean", description: "Return member status summary instead of posts." },
-          },
-        },
-        options: { codemode: false },
-        async execute(rawInput, toolCtx) {
-          const caller = db.getLatestMemberBySession(toolCtx.sessionID);
-          if (!caller) return toolJson({ ok: false, error: "Session is not registered in any swarm." });
-          const input = (rawInput ?? {}) as { since?: number; limit?: number; channel?: string; status?: boolean };
-
-          if (input.status) {
-            const members = db.listMembers(caller.swarm_id, true);
-            return toolJson({
-              swarm_id: caller.swarm_id,
-              members: members.map((m) => ({
-                name: m.name,
-                role: m.role,
-                state: m.state,
-                wake_mode: m.wake_mode,
-                wait_since: m.wait_since,
-                last_read_seq: m.last_read_seq,
-                last_post_seq: m.last_post_seq,
-                channels: db.getMemberChannels(caller.swarm_id, m.id),
-              })),
-            });
-          }
-
-          const since = typeof input.since === "number" ? input.since : caller.last_read_seq;
-          const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
-          const isGlobal = caller.role === "coordinator" || caller.role === "monitor" || caller.role === "narrator";
-          const myChannels = db.getMemberChannels(caller.swarm_id, caller.id);
-
-          // Medium 6: Channel isolation on read_board
-          let filter: string[] | "*";
-          if (isGlobal) {
-            filter = input.channel === "*" || !input.channel ? "*" : [normalizeHandle(input.channel)];
-          } else {
-            if (input.channel === "*") {
-              filter = myChannels;
-            } else if (input.channel) {
-              const reqChan = normalizeHandle(input.channel);
-              if (!myChannels.includes(reqChan)) {
-                return toolJson({ ok: false, error: `Member @${caller.name} is not subscribed to channel "#${reqChan}".` });
-              }
-              filter = [reqChan];
-            } else {
-              filter = myChannels;
-            }
-          }
-
-          const { posts, hasMore } = db.getPostsPage(caller.swarm_id, since, limit, filter);
-          const readingAllVisible = !input.channel || input.channel === "*";
-          if (posts.length > 0 && readingAllVisible) {
-            db.advanceReadCursor(caller.id, posts[posts.length - 1].swarm_seq);
-          }
-          return toolJson({
-            swarm_id: caller.swarm_id,
-            has_more: hasMore,
-            posts: posts.map((p) => ({
-              seq: p.swarm_seq,
-              channel: p.channel,
-              author: p.author_name,
-              text: p.body,
-              time: new Date(p.created_at).toISOString(),
-            })),
-          });
-        },
-      });
-
-      tools.add({
-        name: "swarm_wait",
-        description: "Sleep at 0 tokens until a matching post arrives on the board after `since`.",
-        input: {
-          type: "object",
-          properties: {
-            since: { type: "number" },
-            mentions_only: { type: "boolean" },
-          },
-        },
-        options: { codemode: false },
-        async execute(rawInput, toolCtx) {
-          if (toolCtx.signal?.aborted) {
-            return toolJson({ woken: false, aborted: true, posts: [] });
-          }
-          const caller = db.getActiveMemberBySession(toolCtx.sessionID);
-          if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
-          const input = (rawInput ?? {}) as { since?: number; mentions_only?: boolean };
-          const mentionsOnly = input.mentions_only ?? true;
-          const sinceSeq =
-            typeof input.since === "number"
-              ? input.since
-              : Math.max(caller.last_read_seq, mentionsOnly ? (lastWakeSeq.get(caller.id) ?? 0) : 0);
-
-          // Race-free check: if matching posts already exist after sinceSeq, return immediately
-          const immediate = checkPendingWakePosts(db, caller, sinceSeq, mentionsOnly);
-          if (immediate.length > 0) {
-            const maxSeq = immediate[immediate.length - 1].swarm_seq;
-            lastWakeSeq.set(caller.id, Math.max(lastWakeSeq.get(caller.id) ?? 0, maxSeq));
-            if (!mentionsOnly) {
-              db.advanceReadCursor(caller.id, maxSeq);
-            }
-            return toolJson({
-              woken: true,
-              posts: immediate.map((p) => ({
-                seq: p.swarm_seq,
-                channel: p.channel,
-                author: p.author_name,
-                text: p.body,
-              })),
-            });
-          }
-
-          const prevWaiter = waiters.get(caller.id);
-          if (prevWaiter) {
-            waiters.delete(caller.id);
-            prevWaiter.resolve({ posts: [], aborted: true });
-          }
-
-          db.setMemberWait(caller.id, mentionsOnly ? "mentions" : "any", sinceSeq);
-          emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
-          if (caller.role !== "coordinator") {
-            void maybeWakeIdleCoordinator(caller.swarm_id).catch((err) => {
-              console.warn("[opencode-swarm] coordinator wake error:", err);
-            });
-          }
-
-          const waitResult = await new Promise<{ posts: BoardPostRow[]; aborted?: boolean }>((resolveWait) => {
-            const onAbort = () => {
-              waiters.delete(caller.id);
-              resolveWait({ posts: [], aborted: true });
-            };
-            toolCtx.signal?.addEventListener("abort", onAbort, { once: true });
-            waiters.set(caller.id, {
-              sinceSeq,
-              mentionsOnly,
-              resolve: (res) => {
-                toolCtx.signal?.removeEventListener("abort", onAbort);
-                resolveWait(res);
-              },
-            });
-          });
-
-          const wokenPosts = waitResult.posts;
-          if (wokenPosts.length > 0) {
-            const maxSeq = wokenPosts[wokenPosts.length - 1].swarm_seq;
-            lastWakeSeq.set(caller.id, Math.max(lastWakeSeq.get(caller.id) ?? 0, maxSeq));
-            if (!mentionsOnly) {
-              db.advanceReadCursor(caller.id, maxSeq);
-            }
-          }
-
-          return toolJson({
-            woken: wokenPosts.length > 0,
-            ...(waitResult.aborted ? { aborted: true } : {}),
-            posts: wokenPosts.map((p) => ({
-              seq: p.swarm_seq,
-              channel: p.channel,
-              author: p.author_name,
-              text: p.body,
-            })),
-          });
-        },
-      });
+    await registerSwarmTools(ctx, {
+      db,
+      canonicalWorkspaceRoot,
+      roleModels,
+      waiters,
+      pendingKillCleanup,
+      getBoardUrl,
+      emitSwarmChanged,
+      ensureCoordinator,
+      spawnSingleMember,
+      switchMemberModelInPlace,
+      postToBoard,
+      maybeWakeIdleCoordinator,
+      getLastWakeSeq: wake.getLastWakeSeq,
+      recordWakeSeq: wake.recordWakeSeq,
+      resolveWaiterAborted,
+      waitForQuiesce,
     });
 
     // -----------------------------------------------------------------------
@@ -2413,11 +1140,8 @@ export const swarmRuntimePlugin = Plugin.define({
       abortController.abort();
       pendingCalls.clear();
       waiters.clear();
-      lastCoordinatorWakeSeq.clear();
-      lastWakeSeq.clear();
+      wake.clearState();
       spawningMembers.clear();
-      autoVerifierSpawns.clear();
-      lastVerificationRequestSeq.clear();
       activeToolCounts.clear();
       quiesceResolvers.clear();
       pendingKillCleanup.clear();

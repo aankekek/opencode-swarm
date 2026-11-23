@@ -12,6 +12,8 @@ export interface SwarmSettingsViewProps {
   updateSetting: <K extends keyof SwarmSettings>(key: K, value: SwarmSettings[K]) => void;
   rpcStatus: () => SwarmRpcStatus;
   activeSwarmCount: () => number;
+  autoSpawnVerifier?: () => boolean;
+  onToggleAutoSpawnVerifier?: (enabled: boolean) => void;
   onOpenPanel: () => void;
   onOpenSetupWizard?: () => void;
   onOpenUninstall?: () => void;
@@ -142,6 +144,22 @@ export function SwarmSettingsView(props: SwarmSettingsViewProps) {
               hideLabel
               checked={props.settings().toastEnabled}
               onChange={(checked: boolean) => props.updateSetting("toastEnabled", checked)}
+            />
+          </SettingsRow>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection title="Verification">
+        <div data-action="swarm-board.autoSpawnVerifier">
+          <SettingsRow
+            title="Auto-spawn verifier"
+            description="Automatically spawn or wake @verifier when all worker tracks finish before allowing swarm completion"
+          >
+            <Switch
+              label="Auto-spawn verifier"
+              hideLabel
+              checked={props.autoSpawnVerifier?.() ?? true}
+              onChange={(checked: boolean) => props.onToggleAutoSpawnVerifier?.(checked)}
             />
           </SettingsRow>
         </div>

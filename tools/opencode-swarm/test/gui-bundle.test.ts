@@ -61,6 +61,8 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     expect(code).toContain("onboardingComplete");
     expect(code).toContain("getRoleConfig");
     expect(code).toContain("setRoleModel");
+    expect(code).toContain("setAutoSpawnVerifier");
+    expect(code).toContain("Auto-spawn verifier");
     expect(code).toContain("previewUninstall");
     expect(code).toContain("executeUninstall");
     expect(code).toContain("Uninstall Swarm Plugin");

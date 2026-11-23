@@ -6,7 +6,7 @@ import { SWARM_RPC_DEF } from "../src/rpc.js";
 import { swarmRuntimePlugin } from "../src/plugin.js";
 
 describe("SWARM_RPC_DEF and RPC bridge", () => {
-  test("SWARM_RPC_DEF defines id, 9 methods, and changed event", () => {
+  test("SWARM_RPC_DEF defines id, 10 methods, and changed event", () => {
     expect(SWARM_RPC_DEF.id).toBe("local.opencode-swarm");
     expect(Object.keys(SWARM_RPC_DEF.methods)).toEqual([
       "getBoardInfo",
@@ -16,6 +16,7 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       "killMember",
       "getRoleConfig",
       "setRoleModel",
+      "setAutoSpawnVerifier",
       "previewUninstall",
       "executeUninstall",
     ]);
@@ -78,6 +79,10 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
         },
         event: {
           subscribe: () => () => {},
+        },
+        model: {
+          list: async () => ({ data: [] }),
+          default: async () => ({ data: undefined }),
         },
       };
 
@@ -151,7 +156,23 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       expect(killMissing.ok).toBe(false);
       expect(killMissing.error).toBeDefined();
 
-      // 7. completeSwarm
+      // 7. setAutoSpawnVerifier toggles runtime flag and reflects in getRoleConfig
+      const initialCfg = (await registeredHandlers.getRoleConfig({})) as { autoSpawnVerifier?: boolean };
+      expect(initialCfg.autoSpawnVerifier).toBe(true);
+      const disabledRes = (await registeredHandlers.setAutoSpawnVerifier({ enabled: false })) as {
+        ok: boolean;
+        autoSpawnVerifier: boolean;
+      };
+      expect(disabledRes).toEqual({ ok: true, autoSpawnVerifier: false });
+      const disabledCfg = (await registeredHandlers.getRoleConfig({})) as { autoSpawnVerifier?: boolean };
+      expect(disabledCfg.autoSpawnVerifier).toBe(false);
+      const reenabledRes = (await registeredHandlers.setAutoSpawnVerifier({ enabled: true })) as {
+        ok: boolean;
+        autoSpawnVerifier: boolean;
+      };
+      expect(reenabledRes).toEqual({ ok: true, autoSpawnVerifier: true });
+
+      // 8. completeSwarm
       const completed = (await registeredHandlers.completeSwarm({
         swarmId: info.swarmId,
         summary: "All done",

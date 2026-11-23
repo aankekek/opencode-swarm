@@ -92,6 +92,7 @@ export interface SwarmRoleConfig {
   swarmId: string | null;
   swarmTitle: string | null;
   swarmStatus: string;
+  autoSpawnVerifier?: boolean;
   roleModels: {
     coordinator: string;
     worker: string;
@@ -278,6 +279,16 @@ export const SWARM_RPC_DEF = {
       }),
       output: standardSchema<SetRoleModelResult>((v) =>
         isObject(v) && typeof v.ok === "boolean" ? null : "output must be SetRoleModelResult",
+      ),
+    },
+    setAutoSpawnVerifier: {
+      input: optionalObjectSchema<{ enabled: boolean }>((v) =>
+        typeof v.enabled === "boolean" ? null : "enabled must be a boolean",
+      ),
+      output: standardSchema<{ ok: boolean; autoSpawnVerifier: boolean }>((v) =>
+        isObject(v) && typeof v.ok === "boolean" && typeof v.autoSpawnVerifier === "boolean"
+          ? null
+          : "output must contain ok and autoSpawnVerifier booleans",
       ),
     },
     previewUninstall: {

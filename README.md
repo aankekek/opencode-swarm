@@ -32,7 +32,7 @@ Models and variants are **never** auto-selected. By default, workers inherit the
    ```
 3. Fully quit and restart **OpenCode Desktop**, then start a swarm with `/swarm <your task>` (or list models/variants with `/swarm-models`).
 
-> **Note:** `overrideShellAllow: true` (default in `.opencode/opencode.jsonc`) allows shell commands without repeated prompts while keeping `edit` and `external_directory` fenced.
+> **Note:** `overrideShellAllow: true` (default in `.opencode/opencode.jsonc`) allows shell commands without repeated prompts while keeping `edit` and `external_directory` fenced. `autoSpawnVerifier: true` (default) automatically spawns or wakes `@verifier` when all worker tracks finish before allowing `swarm{action:"complete"}`; disable via `options.autoSpawnVerifier: false` or **Settings → Swarm Board → Auto-spawn verifier**.
 
 ## Development & Tests
 ```bash

@@ -89,6 +89,12 @@ const SETTINGS_ENTRIES: readonly SettingEntry[] = [
     keywords: "swarm toast notifications",
   },
   {
+    id: "swarm-board.autoSpawnVerifier",
+    title: "Auto-spawn verifier",
+    description: "Automatically spawn or wake @verifier when all worker tracks finish",
+    keywords: "swarm verifier auto spawn gate verification",
+  },
+  {
     id: "swarm-board.status",
     title: "Setup Role Models",
     description: "Choose recommended or custom models for Coordinator, Worker, Verifier, and Monitor",
@@ -144,6 +150,7 @@ export default Plugin.define({
     const [boardUrl, setBoardUrl] = createSignal<string>("");
     const [mountedDirectory, setMountedDirectory] = createSignal<string | undefined>(undefined);
     const [rpcStatus, setRpcStatus] = createSignal<SwarmRpcStatus>({ state: "connected" });
+    const [autoSpawnVerifier, setAutoSpawnVerifier] = createSignal<boolean>(true);
 
     let lastPausedQuota = false;
     let lastVerifierStatus = "";
@@ -260,6 +267,17 @@ export default Plugin.define({
         const snap = normalizeSwarmSnapshot(rawSnap);
         setSnapshot(snap);
         setRpcStatus({ state: "connected" });
+        void rpc
+          .getRoleConfig(targetId ? { swarmId: targetId } : sessionId ? { sessionId } : {}, opts)
+          .then((rawCfg) => {
+            const cfg = (rawCfg && typeof rawCfg === "object" && "output" in rawCfg
+              ? (rawCfg as { output?: SwarmRoleConfig }).output
+              : rawCfg) as SwarmRoleConfig | undefined;
+            if (typeof cfg?.autoSpawnVerifier === "boolean") {
+              setAutoSpawnVerifier(cfg.autoSpawnVerifier);
+            }
+          })
+          .catch(() => {});
         if (!settings().onboardingComplete && !onboardingPrompted) {
           onboardingPrompted = true;
           queueMicrotask(() => openOnboardingWizard());
@@ -513,6 +531,27 @@ export default Plugin.define({
           updateSetting={updateSetting}
           rpcStatus={rpcStatus}
           activeSwarmCount={() => swarms().length}
+          autoSpawnVerifier={autoSpawnVerifier}
+          onToggleAutoSpawnVerifier={async (enabled: boolean) => {
+            const prev = autoSpawnVerifier();
+            setAutoSpawnVerifier(enabled);
+            try {
+              const res = await getRpc().setAutoSpawnVerifier({ enabled }, getCallOptions());
+              const out = (res && typeof res === "object" && "output" in res
+                ? (res as { output?: { autoSpawnVerifier?: boolean } }).output
+                : res) as { autoSpawnVerifier?: boolean } | undefined;
+              if (typeof out?.autoSpawnVerifier === "boolean") {
+                setAutoSpawnVerifier(out.autoSpawnVerifier);
+              }
+            } catch (err) {
+              setAutoSpawnVerifier(prev);
+              ctx.toast.show({
+                title: "Failed to update Auto-spawn verifier",
+                description: err instanceof Error ? err.message : String(err),
+                variant: "error",
+              });
+            }
+          }}
           onOpenPanel={() => openSwarmPanel(false)}
           onOpenSetupWizard={openOnboardingWizard}
           onOpenUninstall={openUninstallModal}

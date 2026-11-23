@@ -6,6 +6,7 @@ import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
 import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
 import { hasFreshVerifierPass } from "../src/monitor.js";
+import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "../src/prompts.js";
 
 function createHarness(repoDir: string, dbPath: string) {
   const tools = new Map<string, any>();
@@ -891,5 +892,34 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
       } catch {}
     }
+  });
+
+  test("J: prompts align coordinator and worker rules with the auto-verifier gate", () => {
+    expect(COORDINATOR_PROTOCOL).not.toContain("(or all worker tracks finish)");
+    expect(COORDINATOR_PROTOCOL).toMatch(/Do not call `swarm\{action:"complete"\}` until `@verifier` confirms `PASS`/);
+
+    const workerPrompt = buildMemberOpeningPrompt({
+      swarmId: "sw_test",
+      name: "w1",
+      role: "worker",
+      brief: "Do work",
+      workspaceMode: "inherit",
+      workspaceDir: "/repo",
+      ownedGlobs: [],
+      channels: ["main"],
+    });
+    expect(workerPrompt).toContain("do not post acknowledgment replies");
+
+    const verifierPrompt = buildMemberOpeningPrompt({
+      swarmId: "sw_test",
+      name: "verifier",
+      role: "verifier",
+      brief: "Verify work",
+      workspaceMode: "inherit",
+      workspaceDir: "/repo",
+      ownedGlobs: [],
+      channels: ["main"],
+    });
+    expect(verifierPrompt).not.toContain("do not post acknowledgment replies");
   });
 });
