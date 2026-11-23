@@ -196,9 +196,10 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       mkdirSync(dirname(cfgPath), { recursive: true });
       writeFileSync(cfgPath, JSON.stringify({ plugins: ["@slkiser/opencode-quota"] }, null, 2), "utf8");
 
-      const first = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
+      const pluginRoot = join(root, "tools", "opencode-swarm");
+      const first = registerSwarmInGlobalConfig(cfgPath, pluginRoot);
       expect(first.changed).toBe(true);
-      const second = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
+      const second = registerSwarmInGlobalConfig(cfgPath, pluginRoot);
       expect(second.changed).toBe(false);
 
       const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
@@ -234,6 +235,8 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
     const root = mkdtempSync(join(tmpdir(), "swarm-install-migrate-"));
     try {
       const cfgPath = join(root, ".config", "opencode", "opencode.json");
+      const oldPluginRoot = join(root, "tools", "swarm-runtime");
+      const newPluginRoot = join(root, "tools", "opencode-swarm");
       mkdirSync(dirname(cfgPath), { recursive: true });
       writeFileSync(
         cfgPath,
@@ -242,7 +245,7 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
             plugins: [
               "@slkiser/opencode-quota",
               {
-                package: "C:\\fake\\tools\\swarm-runtime",
+                package: oldPluginRoot,
                 options: { stallTimeoutMs: 42000, boardServer: false },
               },
               "../tools/swarm-runtime",
@@ -254,19 +257,19 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
         "utf8",
       );
 
-      const migrated = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
+      const migrated = registerSwarmInGlobalConfig(cfgPath, newPluginRoot);
       expect(migrated.changed).toBe(true);
 
       const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
       expect(parsed.plugins).toEqual([
         "@slkiser/opencode-quota",
         {
-          package: "C:\\fake\\tools\\opencode-swarm",
+          package: newPluginRoot,
           options: { stallTimeoutMs: 42000, boardServer: false },
         },
       ]);
 
-      const again = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
+      const again = registerSwarmInGlobalConfig(cfgPath, newPluginRoot);
       expect(again.changed).toBe(false);
     } finally {
       try {
