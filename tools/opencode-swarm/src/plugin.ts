@@ -1338,13 +1338,6 @@ export const swarmRuntimePlugin = Plugin.define({
         }
       }
     };
-    // Test observability: lets regression tests seed a spy and assert the
-    // deferred-cleanup map is drained during dispose. Non-enumerable so it
-    // never leaks into host serialization of the returned function.
-    Object.defineProperty(cleanup, "pendingKillCleanup", {
-      value: pendingKillCleanup,
-      enumerable: false,
-    });
     activePluginInstances.set(instanceKey, cleanup);
     return cleanup;
   },

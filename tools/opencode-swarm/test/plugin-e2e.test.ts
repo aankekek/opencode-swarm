@@ -867,17 +867,10 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
 
     const stream = createEventStream();
     const { ctx, tools, hooks, commands } = createMockContext(repoDir, dbPath, {}, () => stream);
-    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as (() => Promise<void>) & {
-      pendingKillCleanup: Map<string, () => void>;
-    };
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
     let reader: SwarmBoardDB | undefined;
 
     try {
-      // The deferred-cleanup map is exposed on the returned cleanup so the test
-      // can seed a spy and assert dispose drains it.
-      const deferredKills = cleanup.pendingKillCleanup;
-      expect(deferredKills).toBeInstanceOf(Map);
-
       const swarmTool = tools.get("swarm");
       await commands.get("swarm").execute({
         sessionID: "sess_coord",
@@ -900,7 +893,7 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       expect(claimRes.ok).toBe(true);
 
       // An in-flight tool makes the kill's waitForQuiesce time out, deferring
-      // the lock release + workspace cleanup into pendingKillCleanup.
+      // the lock release (no workspace in inherit mode) to a later quiesce.
       await hooks["tool.execute.before"]({
         id: "call_dispose_1",
         tool: "write",
@@ -912,33 +905,23 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       );
       expect(killRes.ok).toBe(true);
 
-      const originalCleanup = deferredKills.get(workerSession);
-      expect(typeof originalCleanup).toBe("function");
-      let ran = 0;
-      deferredKills.set(workerSession, () => {
-        ran += 1;
-        originalCleanup!();
-      });
-      expect(deferredKills.size).toBe(1);
-
-      // Before dispose the deferred cleanup has NOT run: the lock is still held.
+      // The deferred entry has not run yet: the killed member still owns its lock.
       reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
       const swarmId = reader.getActiveSwarms()[0].id;
       expect(reader.listLocks(swarmId)).toHaveLength(1);
       reader.close();
       reader = undefined;
 
-      // Dispose invokes the deferred cleanup while the DB is still open.
+      // Dispose must drain the deferred cleanup while the DB is still open;
+      // clearing without invoking it would leave the lock orphaned forever.
       await cleanup();
-      expect(ran).toBe(1);
-      expect(deferredKills.size).toBe(0);
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      expect(reader.listLocks(swarmId)).toHaveLength(0);
+      reader.close();
+      reader = undefined;
 
-      // A second dispose is a no-op and must not run the entry again.
-      await cleanup();
-      expect(ran).toBe(1);
-      expect(deferredKills.size).toBe(0);
-
-      // The lock release really reached the DB before it closed.
+      // A second dispose is a no-op: it must not throw or run cleanup again.
+      await expect(cleanup()).resolves.toBeUndefined();
       reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
       expect(reader.listLocks(swarmId)).toHaveLength(0);
       stream.end();
