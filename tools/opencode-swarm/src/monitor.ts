@@ -43,6 +43,13 @@ export function hasFreshVerifierPass(db: SwarmBoardDB, swarmId: string, members?
   return false;
 }
 
+export function buildVerificationIncompleteNudge(swarmId: string, verifier?: MemberRow): string {
+  if (verifier) {
+    return `@coordinator [stall] Swarm '${swarmId}' is idle with all tracks done, but verification is incomplete: @${verifier.name} exists (state: ${verifier.state}) and has not posted PASS. Repair or await the verifier, and do not mark the swarm complete until it posts PASS.`;
+  }
+  return `@coordinator [stall] Swarm '${swarmId}' is idle with all tracks done, but verification is incomplete: no live verifier exists. Spawn a verifier to independently verify the finished work, and do not mark the swarm complete until it posts PASS.`;
+}
+
 export function startStallMonitor(
   db: SwarmBoardDB,
   config: MonitorConfig,
@@ -88,6 +95,7 @@ export function startStallMonitor(
           const coordinator = members.find((m) => m.role === "coordinator");
           const openWorkers = members.filter((m) => m.role === "worker" && m.track_status === "open");
           const verifier = members.find((m) => m.role === "verifier");
+          const hasPass = hasFreshVerifierPass(db, swarm.id, members);
 
           let nudgeMessage: string;
           if (coordinator && latestPost && latestPost.swarm_seq > coordinator.last_read_seq) {
@@ -97,8 +105,10 @@ export function startStallMonitor(
               .map((w: MemberRow) => `@${w.name} (${w.paused_quota ? "paused_quota" : w.state})`)
               .join(", ");
             nudgeMessage = `@coordinator [stall] All members idle >${Math.round(config.stallTimeoutMs / 1000)}s with open tracks: ${summary}.`;
-          } else if (verifier && verifier.state === "waiting" && !hasFreshVerifierPass(db, swarm.id, members)) {
+          } else if (verifier && verifier.state === "waiting" && !hasPass) {
             nudgeMessage = `@verifier [stall] All worker tracks are done; please verify pending work or post PASS to @coordinator.`;
+          } else if (!hasPass) {
+            nudgeMessage = buildVerificationIncompleteNudge(swarm.id, verifier);
           } else {
             nudgeMessage = `@coordinator [stall] Swarm '${swarm.id}' is idle with all tracks done; call swarm{action:"complete"} when ready.`;
           }

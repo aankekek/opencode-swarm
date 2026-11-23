@@ -4,6 +4,8 @@ import { hasFreshVerifierPass, isVerifierAuthor } from "./monitor.js";
 import type { SwarmChangedEvent } from "./rpc.js";
 import type { BoardPostRow, MemberRow } from "./types.js";
 
+const MAX_AUTO_VERIFIER_SPAWNS = 3;
+
 export interface WaiterEntry {
   resolve: (res: { posts: BoardPostRow[]; aborted?: boolean; handoff?: string }) => void;
   sinceSeq: number;
@@ -45,7 +47,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
   const { db, waiters, emitSwarmChanged } = deps;
   const lastCoordinatorWakeSeq = new Map<string, number>();
   const lastWakeSeq = new Map<string, number>();
-  const autoVerifierSpawns = new Set<string>();
+  const autoVerifierSpawnAttempts = new Map<string, number>();
   const lastVerificationRequestSeq = new Map<string, number>();
 
   function getLastWakeSeq(memberId: string): number {
@@ -67,7 +69,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
   function clearState(): void {
     lastCoordinatorWakeSeq.clear();
     lastWakeSeq.clear();
-    autoVerifierSpawns.clear();
+    autoVerifierSpawnAttempts.clear();
     lastVerificationRequestSeq.clear();
   }
 
@@ -154,8 +156,9 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
   ): Promise<"spawned" | "requested" | "in_progress" | "unavailable"> {
     const liveVerifiers = db.listMembers(swarmId, false).filter((m) => m.role === "verifier");
     if (liveVerifiers.length === 0) {
-      if (autoVerifierSpawns.has(swarmId)) return "in_progress";
-      autoVerifierSpawns.add(swarmId);
+      const attempts = autoVerifierSpawnAttempts.get(swarmId) ?? 0;
+      if (attempts >= MAX_AUTO_VERIFIER_SPAWNS) return "unavailable";
+      autoVerifierSpawnAttempts.set(swarmId, attempts + 1);
       try {
         let verifierName = "verifier";
         if (db.getMemberByName(swarmId, verifierName)) {
@@ -177,7 +180,9 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
         });
         return "spawned";
       } catch (err) {
-        autoVerifierSpawns.delete(swarmId);
+        // Restore the previous attempt count so a failed spawn does not burn an attempt.
+        if (attempts <= 0) autoVerifierSpawnAttempts.delete(swarmId);
+        else autoVerifierSpawnAttempts.set(swarmId, attempts);
         console.warn("[opencode-swarm] auto-spawn verifier failed:", err instanceof Error ? err.message : String(err));
         return "unavailable";
       }
@@ -234,6 +239,10 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     const isVerifierReport = isVerifierAuthorFlag && /\b(PASS|FAIL)\b/i.test(latestPost.body);
     const isMonitorStall = latestPost.author_name === "monitor";
     const hasFreshPass = hasFreshVerifierPass(db, swarmId, members);
+    if (hasFreshPass) {
+      // A PASS closes the verification cycle: allow a later work cycle to auto-verify again.
+      autoVerifierSpawnAttempts.delete(swarmId);
+    }
 
     if (
       deps.getAutoSpawnVerifier() &&

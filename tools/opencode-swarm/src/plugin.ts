@@ -790,6 +790,102 @@ export const swarmRuntimePlugin = Plugin.define({
     // -----------------------------------------------------------------------
     // 2. Register V2 Slash Commands: /swarm and /swarm-models
     // -----------------------------------------------------------------------
+    // Identify an active swarm that blocks this session from becoming a coordinator.
+    // A swarm blocks us unless its *live* coordinator is this very session. A running
+    // swarm with no live coordinator row is also blocking (it is a pure orphan).
+    const findBlockingSwarm = (sessionID: string) => {
+      for (const swarm of db.getActiveSwarms()) {
+        const coordinator = db
+          .listMembers(swarm.id, false)
+          .find((m) => m.role === "coordinator");
+        if (!coordinator || coordinator.session_id !== sessionID) {
+          return { swarm, coordinator };
+        }
+      }
+      return undefined;
+    };
+
+    const sendSwarmStartFailure = async (
+      sessionID: string,
+      blocking: { swarm: { id: string; title: string } } | undefined,
+      reason: string,
+    ) => {
+      const lines = blocking
+        ? [
+            `[swarm] Cannot start a new swarm: this workspace already has active swarm '${blocking.swarm.id}' ("${blocking.swarm.title}").`,
+            `Reason: ${reason}.`,
+            "",
+            "Recovery:",
+            `- From that swarm's coordinator session (if it still exists), run swarm{action:"complete"} to finish it, then run /swarm again.`,
+            `- Or let it go idle (no working members for ${Math.round(stallTimeoutMs / 1000)}s) so /swarm can reclaim it automatically.`,
+          ]
+        : [
+            `[swarm] Cannot start a new swarm: ${reason}.`,
+            "Complete any active swarm with swarm{action:\"complete\"} and try /swarm again.",
+          ];
+      const text = lines.join("\n");
+      await ctx.session.synthetic({ sessionID, text });
+    };
+
+    // Try to reclaim an orphaned active swarm (no live coordinator for this session, no
+    // worker still running, idle past the stall threshold) so /swarm can proceed. Never
+    // deletes worktrees or branches: only mark state, release locks, and post a notice.
+    const tryReclaimOrphanedSwarm = async (
+      blocking: {
+        swarm: { id: string; title: string; updated_at: number };
+        coordinator?: { session_id: string | null };
+      },
+    ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      const swarmId = blocking.swarm.id;
+      const liveMembers = db.listMembers(swarmId, false);
+      // The coordinator's own `working` state is not a signal: nothing transitions it
+      // when its session disappears, so stale rows would never be reclaimable. The
+      // coordinator is instead protected by the idle threshold below.
+      const workingMember = liveMembers.find((m) => m.role !== "coordinator" && m.state === "working");
+      if (workingMember) {
+        return { ok: false, reason: `a worker ('${workingMember.name}') is still working` };
+      }
+      const latestPost = db.getLatestPost(swarmId);
+      const lastActivity = Math.max(
+        blocking.swarm.updated_at,
+        latestPost?.created_at ?? 0,
+        ...liveMembers.map((m) => m.last_active_at ?? 0),
+      );
+      const idleMs = Date.now() - lastActivity;
+      if (idleMs < stallTimeoutMs) {
+        return {
+          ok: false,
+          reason: `active only ${Math.round(idleMs / 1000)}s ago (needs ${Math.round(stallTimeoutMs / 1000)}s idle)`,
+        };
+      }
+
+      for (const member of liveMembers) {
+        if (member.role === "coordinator" || !member.session_id) continue;
+        try {
+          await ctx.session.interrupt({ sessionID: member.session_id });
+        } catch {
+          // Best effort: the session may already be gone.
+        }
+      }
+      for (const member of liveMembers) {
+        db.setMemberState(member.id, "killed");
+      }
+      db.releaseAllLocksForSwarm(swarmId);
+      db.setSwarmStatus(swarmId, "interrupted");
+      const shortSession = blocking.coordinator?.session_id?.slice(0, 12) ?? "unknown";
+      db.addPost({
+        swarmId,
+        authorName: "monitor",
+        channel: "main",
+        mentions: [],
+        channelMentions: [],
+        isAll: false,
+        body: `Reclaimed as orphaned by a new /swarm in session ${shortSession}; no working members and idle > ${Math.round(stallTimeoutMs / 1000)}s; worktrees left in place.`,
+      });
+      emitSwarmChanged({ swarmId, reason: "swarm_interrupted" });
+      return { ok: true };
+    };
+
     await ctx.command.transform((cmds) => {
       cmds.add({
         name: "swarm",
@@ -803,11 +899,37 @@ export const swarmRuntimePlugin = Plugin.define({
                 ? String((rawPrompt as { text?: unknown }).text ?? "")
                 : JSON.stringify(rawPrompt ?? "");
           const cleanTitle = text.trim().split(/\r?\n/)[0]?.slice(0, 64) || "Swarm";
+
+          // Clear stale rows owned by dead processes before touching coordinator state.
+          db.reconcileStaleSwarmsOnStartup();
+
           try {
             await ensureCoordinator(invocation.sessionID, cleanTitle);
-          } catch {
-            // Ignore if session already belongs to an active swarm or cannot initialize yet
+          } catch (err) {
+            const failure = err instanceof Error ? err.message : String(err);
+            const blocking = findBlockingSwarm(invocation.sessionID);
+            if (!blocking) {
+              await sendSwarmStartFailure(invocation.sessionID, undefined, failure);
+              return;
+            }
+            const reclaimed = await tryReclaimOrphanedSwarm(blocking);
+            if (!reclaimed.ok) {
+              await sendSwarmStartFailure(invocation.sessionID, blocking, reclaimed.reason);
+              return;
+            }
+            try {
+              await ensureCoordinator(invocation.sessionID, cleanTitle);
+            } catch (retryErr) {
+              const retryFailure = retryErr instanceof Error ? retryErr.message : String(retryErr);
+              await sendSwarmStartFailure(
+                invocation.sessionID,
+                undefined,
+                `reclaimed orphaned swarm '${blocking.swarm.id}' but creating a new swarm still failed: ${retryFailure}`,
+              );
+              return;
+            }
           }
+
           await ctx.session.prompt({
             sessionID: invocation.sessionID,
             text: `${COORDINATOR_PROTOCOL}\n\nUser request:\n${text}`,

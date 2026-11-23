@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
 import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
-import { hasFreshVerifierPass } from "../src/monitor.js";
+import { buildVerificationIncompleteNudge, hasFreshVerifierPass } from "../src/monitor.js";
 import { parseMentionsFromText } from "../src/mentions.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "../src/prompts.js";
 
@@ -1030,6 +1030,193 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       expect(lateWaitRes.woken).toBe(true);
       expect(lateWaitRes.handoff).toContain('swarm{action:"complete"}');
       expect(lateWaitRes.posts.some((p: any) => p.text.includes("PASS"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("N: killed auto-spawned verifier is respawned on new completed work without duplicates", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-auto-v-n-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature N" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+
+      await postTool.execute({ text: "[done] finished feature N" }, { sessionID: w1Sess });
+
+      let snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      let liveVerifiers = snap.members.filter((m: any) => m.role === "verifier" && m.state !== "killed");
+      expect(liveVerifiers.length).toBe(1);
+      expect(liveVerifiers[0].name).toBe("verifier");
+
+      // Kill the auto-spawned verifier before it posts PASS.
+      const killRes = JSON.parse(
+        (await swarmTool.execute({ action: "kill", name: "verifier" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(killRes.ok).toBe(true);
+      expect(killRes.killed).toContain("verifier");
+
+      // New completed work must auto-verify again (previously blocked by the permanent Set).
+      await postTool.execute({ text: "[done] finished feature N round 2" }, { sessionID: w1Sess });
+
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      liveVerifiers = snap.members.filter((m: any) => m.role === "verifier" && m.state !== "killed");
+      expect(liveVerifiers.length).toBe(1);
+      expect(liveVerifiers[0].name).toBe("verifier-2");
+      expect(snap.members.filter((m: any) => m.name === "verifier-2").length).toBe(1);
+
+      // An extra idle event while verifier-2 is live must not duplicate it.
+      pushEvent({ type: "session.status", data: { sessionID: w1Sess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 40));
+
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snap.members.filter((m: any) => m.name === "verifier-2").length).toBe(1);
+      expect(snap.members.filter((m: any) => m.role === "verifier").length).toBe(2);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("O: auto-verifier respawn attempts are bounded and hand off verification-missing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-auto-v-o-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature O" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+
+      const killVerifier = async (name: string) => {
+        const res = JSON.parse(
+          (await swarmTool.execute({ action: "kill", name }, { sessionID: "sess_coord" })).content,
+        );
+        expect(res.ok).toBe(true);
+        expect(res.killed).toContain(name);
+      };
+
+      // Spawns 1..3, each killed before PASS, then one more completed-work post.
+      await postTool.execute({ text: "[done] finished feature O round 1" }, { sessionID: w1Sess });
+      await killVerifier("verifier");
+      await postTool.execute({ text: "[done] finished feature O round 2" }, { sessionID: w1Sess });
+      await killVerifier("verifier-2");
+      await postTool.execute({ text: "[done] finished feature O round 3" }, { sessionID: w1Sess });
+      await killVerifier("verifier-3");
+      await postTool.execute({ text: "[done] finished feature O round 4" }, { sessionID: w1Sess });
+
+      const snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifierMembers = snap.members.filter((m: any) => m.role === "verifier");
+      expect(verifierMembers.map((m: any) => m.name)).toEqual(["verifier", "verifier-2", "verifier-3"]);
+      expect(verifierMembers.every((m: any) => m.state === "killed")).toBe(true);
+      expect(snap.members.filter((m: any) => m.role === "verifier" && m.state !== "killed").length).toBe(0);
+
+      // Once the coordinator goes idle, it gets a verification-missing handoff, not completion.
+      pushEvent({ type: "session.status", data: { sessionID: "sess_coord", status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 40));
+
+      const coordPrompts = prompts.filter((p) => p.sessionID === "sess_coord");
+      expect(coordPrompts.length).toBe(1);
+      expect(coordPrompts[0].text).toMatch(/Verification is NOT done|verification.*(missing|incomplete)/i);
+      expect(coordPrompts[0].text).toMatch(/verifier/i);
+      expect(coordPrompts[0].text).not.toContain("All swarm members finished");
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("P: monitor stall without verifier PASS never invites completion", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-mon-no-pass-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    (ctx as any).options.stallTimeoutMs = 40;
+    (ctx as any).options.monitorIntervalMs = 20;
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const readTool = tools.get("read_board");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature P" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+      await postTool.execute({ text: "[done] finished feature P" }, { sessionID: w1Sess });
+
+      let snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifier = snap.members.find((m: any) => m.role === "verifier");
+      expect(verifier).toBeDefined();
+
+      // Kill the verifier before PASS so no live verifier remains.
+      const killRes = JSON.parse(
+        (await swarmTool.execute({ action: "kill", name: verifier.name }, { sessionID: "sess_coord" })).content,
+      );
+      expect(killRes.ok).toBe(true);
+
+      // Coordinator catches up so the monitor does not take the "unread post" branch.
+      await readTool.execute({ since: 0 }, { sessionID: "sess_coord" });
+
+      await new Promise((r) => setTimeout(r, 120));
+
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snap.members.filter((m: any) => m.role === "verifier" && m.state !== "killed").length).toBe(0);
+
+      const monitorPosts = snap.board_posts.filter((p: any) => p.author === "monitor");
+      expect(monitorPosts.length).toBeGreaterThanOrEqual(1);
+      for (const p of monitorPosts) {
+        expect(p.body).not.toContain('call swarm{action:"complete"}');
+        expect(p.body).not.toContain("call swarm{action:'complete'}");
+      }
+      expect(monitorPosts[0].body).toContain("@coordinator");
+      expect(monitorPosts[0].body).toContain("verifier");
+      expect(monitorPosts[0].body).toContain("no live verifier");
+
+      // Pure helper: both variants must describe the missing verification without inviting complete.
+      const noVerifier = buildVerificationIncompleteNudge("sw_demo");
+      expect(noVerifier).toContain("no live verifier");
+      expect(noVerifier).not.toContain('call swarm{action:"complete"}');
+      expect(noVerifier).not.toContain("call swarm{action:'complete'}");
+
+      const stalledVerifier = buildVerificationIncompleteNudge("sw_demo", {
+        name: "verifier-2",
+        state: "stopped",
+      } as any);
+      expect(stalledVerifier).toContain("verifier-2");
+      expect(stalledVerifier).toContain("stopped");
+      expect(stalledVerifier).not.toContain("no live verifier");
+      expect(stalledVerifier).not.toContain('call swarm{action:"complete"}');
+      expect(stalledVerifier).not.toContain("call swarm{action:'complete'}");
     } finally {
       await cleanup();
       try {

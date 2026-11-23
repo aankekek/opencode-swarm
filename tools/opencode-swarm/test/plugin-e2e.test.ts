@@ -2,14 +2,54 @@ import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
+import { openSqliteDatabase, SwarmBoardDB } from "../src/db.js";
+
+async function seedOrphanSwarm(
+  dbPath: string,
+  repoDir: string,
+  opts: { coordinatorState?: "waiting" | "working" | "killed"; workingWorkers?: number } = {},
+): Promise<{ seeded: SwarmBoardDB; swarmId: string }> {
+  const seeded = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+  const created = seeded.createSwarmWithCoordinator({
+    title: "Orphaned swarm",
+    objective: "old work",
+    coordinatorSessionId: "sess_orphan",
+    workspaceDir: repoDir,
+  });
+  if (opts.coordinatorState && opts.coordinatorState !== "working") {
+    seeded.setMemberState(created.coordinator.id, opts.coordinatorState);
+  }
+  for (let i = 0; i < (opts.workingWorkers ?? 0); i += 1) {
+    seeded.insertMember({
+      swarmId: created.swarm.id,
+      name: `worker${i + 1}`,
+      sessionId: `sess_worker${i + 1}`,
+      role: "worker",
+      addedBy: "coordinator",
+      workspaceMode: "inherit",
+      workspaceDir: repoDir,
+      brief: "old work",
+      state: "working",
+    });
+  }
+  const old = Date.now() - 10 * 60 * 1000;
+  const raw = (seeded as unknown as { db: any }).db;
+  raw.prepare("UPDATE swarms SET updated_at = ? WHERE id = ?").run(old, created.swarm.id);
+  raw.prepare("UPDATE members SET last_active_at = ? WHERE swarm_id = ?").run(old, created.swarm.id);
+  return { seeded, swarmId: created.swarm.id };
+}
 
 function createMockContext(repoDir: string, dbPath: string, extraOptions: Record<string, unknown> = {}) {
   const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
   const hooks: Record<string, Function> = {};
   const sessions = new Map<string, any>();
   const switchModelCalls: any[] = [];
+  const promptCalls: any[] = [];
+  const syntheticCalls: any[] = [];
+  const interruptCalls: any[] = [];
   let seqCounter = 1;
 
   sessions.set("sess_coord", {
@@ -63,7 +103,13 @@ function createMockContext(repoDir: string, dbPath: string, extraOptions: Record
       },
     },
     command: {
-      async transform() {},
+      async transform(fn: Function) {
+        fn({
+          add(def: any) {
+            commands.set(def.name, def);
+          },
+        });
+      },
     },
     permission: {
       async hook(name: string, fn: Function) {
@@ -80,9 +126,15 @@ function createMockContext(repoDir: string, dbPath: string, extraOptions: Record
         return sessions.get(sessionID);
       },
       async update() {},
-      async prompt() {},
-      async interrupt() {},
-      async synthetic() {},
+      async prompt(input: any) {
+        promptCalls.push(input);
+      },
+      async interrupt(input: any) {
+        interruptCalls.push(input);
+      },
+      async synthetic(input: any) {
+        syntheticCalls.push(input);
+      },
       async switchModel(input: any) {
         switchModelCalls.push(input);
       },
@@ -99,7 +151,7 @@ function createMockContext(repoDir: string, dbPath: string, extraOptions: Record
     },
   };
 
-  return { ctx, tools, hooks, sessions, switchModelCalls };
+  return { ctx, tools, commands, hooks, sessions, switchModelCalls, promptCalls, syntheticCalls, interruptCalls };
 }
 
 describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
@@ -402,6 +454,190 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
         await cleanupBad();
       }
     } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("/swarm reclaims an orphaned idle swarm whose coordinator row is still 'working'", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-reclaim-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, commands, promptCalls, syntheticCalls } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let seeded: SwarmBoardDB | undefined;
+
+    try {
+      // Realistic orphan: createSwarmWithCoordinator leaves the coordinator in state
+      // 'working' and nothing transitions it after the session disappears.
+      const seededOrphan = await seedOrphanSwarm(dbPath, repoDir);
+      seeded = seededOrphan.seeded;
+      expect(
+        seeded.listMembers(seededOrphan.swarmId, false).find((m) => m.role === "coordinator")!.state,
+      ).toBe("working");
+      const swarmCmd = commands.get("swarm");
+      expect(swarmCmd).toBeDefined();
+
+      await swarmCmd.execute({
+        sessionID: "sess_coord",
+        prompt: "Build feature X",
+        delivery: "queue",
+      });
+
+      // Old swarm reclaimed as interrupted with a monitor notice.
+      expect(seeded.getSwarm(seededOrphan.swarmId)!.status).toBe("interrupted");
+      const posts = seeded.getLatestPostsWindow(seededOrphan.swarmId, 50, "*").posts;
+      expect(posts.some((p) => /Reclaimed as orphaned/.test(p.body))).toBe(true);
+      expect(posts.find((p) => /Reclaimed as orphaned/.test(p.body))!.author_name).toBe("monitor");
+      expect(posts.some((p) => /worktrees left in place/.test(p.body))).toBe(true);
+
+      // A brand-new swarm was created for this session.
+      const active = seeded.getActiveSwarms();
+      expect(active).toHaveLength(1);
+      expect(active[0].id).not.toBe(seededOrphan.swarmId);
+      expect(active[0].title).toBe("Build feature X");
+
+      // Coordinator prompt delivered, no failure notice.
+      expect(syntheticCalls).toHaveLength(0);
+      expect(promptCalls).toHaveLength(1);
+      expect(promptCalls[0].sessionID).toBe("sess_coord");
+      expect(promptCalls[0].text).toContain("User request:");
+      expect(promptCalls[0].text).toContain("Build feature X");
+    } finally {
+      seeded?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("/swarm refuses to reclaim an orphaned swarm while a worker is working", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-noclaim-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, commands, promptCalls, syntheticCalls } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let seeded: SwarmBoardDB | undefined;
+
+    try {
+      // Coordinator is stale-'working' too, but a non-coordinator worker is genuinely
+      // running: that must block reclaim.
+      const seededOrphan = await seedOrphanSwarm(dbPath, repoDir, { workingWorkers: 2 });
+      seeded = seededOrphan.seeded;
+      const swarmCmd = commands.get("swarm");
+
+      await swarmCmd.execute({
+        sessionID: "sess_coord",
+        prompt: "Build feature Y",
+        delivery: "queue",
+      });
+
+      // Old swarm untouched.
+      expect(seeded.getSwarm(seededOrphan.swarmId)!.status).toBe("running");
+      const active = seeded.getActiveSwarms();
+      expect(active).toHaveLength(1);
+      expect(active[0].id).toBe(seededOrphan.swarmId);
+
+      // No coordinator prompt; a precise synthetic message instead.
+      expect(promptCalls).toHaveLength(0);
+      expect(syntheticCalls).toHaveLength(1);
+      const notice = syntheticCalls[0].text as string;
+      expect(notice).toContain(seededOrphan.swarmId);
+      expect(notice).toContain("Orphaned swarm");
+      expect(notice).toContain("a worker (");
+      expect(notice).toContain("still working");
+      expect(notice).toContain('swarm{action:"complete"}');
+    } finally {
+      seeded?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("/swarm reclaims a running swarm with no live coordinator row", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-nocoor-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, commands, promptCalls, syntheticCalls } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let seeded: SwarmBoardDB | undefined;
+
+    try {
+      const seededOrphan = await seedOrphanSwarm(dbPath, repoDir, { coordinatorState: "killed" });
+      seeded = seededOrphan.seeded;
+      expect(
+        seeded.listMembers(seededOrphan.swarmId, false).some((m) => m.role === "coordinator"),
+      ).toBe(false);
+      const swarmCmd = commands.get("swarm");
+
+      await swarmCmd.execute({
+        sessionID: "sess_coord",
+        prompt: "Recovered work",
+        delivery: "queue",
+      });
+
+      // Reclaimed with a monitor post that names the unknown coordinator.
+      expect(seeded.getSwarm(seededOrphan.swarmId)!.status).toBe("interrupted");
+      const posts = seeded.getLatestPostsWindow(seededOrphan.swarmId, 50, "*").posts;
+      const reclaimPost = posts.find((p) => /Reclaimed as orphaned/.test(p.body));
+      expect(reclaimPost).toBeDefined();
+      expect(reclaimPost!.body).toContain("session unknown");
+
+      // Creation retried: new swarm exists and the coordinator prompt went out.
+      const active = seeded.getActiveSwarms();
+      expect(active).toHaveLength(1);
+      expect(active[0].id).not.toBe(seededOrphan.swarmId);
+      expect(active[0].title).toBe("Recovered work");
+      expect(syntheticCalls).toHaveLength(0);
+      expect(promptCalls).toHaveLength(1);
+      expect(promptCalls[0].text).toContain("Recovered work");
+    } finally {
+      seeded?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("/swarm happy path creates a swarm and sends the coordinator prompt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-happy-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, commands, promptCalls, syntheticCalls } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let reader: SwarmBoardDB | undefined;
+
+    try {
+      const swarmCmd = commands.get("swarm");
+      await swarmCmd.execute({
+        sessionID: "sess_coord",
+        prompt: "Fresh swarm",
+        delivery: "queue",
+      });
+
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      const active = reader.getActiveSwarms();
+      expect(active).toHaveLength(1);
+      expect(active[0].title).toBe("Fresh swarm");
+      expect(syntheticCalls).toHaveLength(0);
+      expect(promptCalls).toHaveLength(1);
+      expect(promptCalls[0].text).toContain("Fresh swarm");
+    } finally {
+      reader?.close();
       await cleanup();
       try {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
