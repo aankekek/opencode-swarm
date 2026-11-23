@@ -53,3 +53,21 @@ describe("gui.tsx stale role-config guard", () => {
     expect(source).toContain(".catch(() => {});");
   });
 });
+
+describe("gui.tsx event subscription re-arm", () => {
+  const guiPath = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "gui.tsx");
+  const source = readFileSync(guiPath, "utf8");
+
+  test("forceEventResubscribe exists and aborts then re-subscribes", () => {
+    const helper =
+      /function\s+forceEventResubscribe\s*\(\s*\)\s*\{[\s\S]{0,300}?eventAbort\?\.abort\(\)[\s\S]{0,200}?subscribedClient\s*=\s*null[\s\S]{0,200}?ensureEventSubscription\(\)/;
+    expect(helper.test(source)).toBe(true);
+  });
+
+  test("the connected transition re-arms the subscription exactly once in refresh", () => {
+    const transition =
+      /if\s*\(\s*currentRpc\.state\s*!==\s*"connected"\s*\)\s*\{\s*setRpcStatus\(\{\s*state:\s*"connected"\s*\}\);[\s\S]{0,300}?forceEventResubscribe\(\);/;
+    expect(transition.test(source)).toBe(true);
+    expect(source.match(/forceEventResubscribe\(\)/g)?.length).toBe(2);
+  });
+});

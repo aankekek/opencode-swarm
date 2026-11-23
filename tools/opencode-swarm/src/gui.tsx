@@ -283,6 +283,9 @@ export default Plugin.define({
         const currentRpc = rpcStatus();
         if (currentRpc.state !== "connected") {
           setRpcStatus({ state: "connected" });
+          // Re-arm push events after a transport recovery: the underlying event
+          // stream may have ended while `ctx.client` stayed identical.
+          forceEventResubscribe();
         }
         void rpc
           .getRoleConfig(pinnedId ? { swarmId: pinnedId } : sid ? { sessionId: sid } : {}, opts)
@@ -356,6 +359,15 @@ export default Plugin.define({
         // Ignore if event subscription is unavailable at startup
       }
     };
+    function forceEventResubscribe() {
+      try {
+        eventAbort?.abort();
+        subscribedClient = null;
+        ensureEventSubscription();
+      } catch {
+        // Ignore if event resubscription fails; the poll keeps the UI alive.
+      }
+    }
     ensureEventSubscription();
 
     createEffect(() => {
