@@ -998,4 +998,63 @@ describe("Swarm unit plan", () => {
       } catch {}
     }
   });
+
+  test("releaseTasksForMember reopens only the units assigned to that member", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-plan-"));
+    try {
+      const sqlite = await openSqliteDatabase(join(dir, "board.db"));
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm, coordinator } = db.createSwarmWithCoordinator({
+        title: "Plan Release",
+        objective: "Release assigned units",
+        coordinatorSessionId: "sess_plan_release",
+        workspaceDir: dir,
+      });
+      const workerA = db.insertMember({
+        swarmId: swarm.id,
+        name: "worker-a",
+        sessionId: "sess_release_a",
+        role: "worker",
+        addedBy: coordinator.name,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        brief: "work a",
+      });
+      const workerB = db.insertMember({
+        swarmId: swarm.id,
+        name: "worker-b",
+        sessionId: "sess_release_b",
+        role: "worker",
+        addedBy: coordinator.name,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        brief: "work b",
+      });
+
+      const [t1, t2, t3] = db.createPlan(swarm.id, ["a", "b", "c"]);
+      db.assignTasks(swarm.id, workerA.id, workerA.name, [t1.id, t2.id]);
+      db.assignTasks(swarm.id, workerB.id, workerB.name, [t3.id]);
+      expect(db.getTaskCounts(swarm.id)).toEqual({ total: 3, open: 0, assigned: 3, done: 0 });
+
+      expect(db.releaseTasksForMember(workerA.id)).toBe(2);
+      expect(db.getTaskCounts(swarm.id)).toEqual({ total: 3, open: 2, assigned: 1, done: 0 });
+
+      const rows = db.listTasks(swarm.id);
+      const released = rows.filter((t) => t.id === t1.id || t.id === t2.id);
+      expect(released.every((t) => t.status === "open")).toBe(true);
+      expect(released.every((t) => t.assignee_member_id === null && t.assignee_name === null)).toBe(true);
+      const kept = rows.find((t) => t.id === t3.id);
+      expect(kept?.status).toBe("assigned");
+      expect(kept?.assignee_member_id).toBe(workerB.id);
+      expect(kept?.assignee_name).toBe(workerB.name);
+
+      expect(db.releaseTasksForMember(workerA.id)).toBe(0);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

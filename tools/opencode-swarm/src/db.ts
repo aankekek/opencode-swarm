@@ -1178,6 +1178,17 @@ export class SwarmBoardDB {
     return Number(res.changes);
   }
 
+  releaseTasksForMember(memberId: string): number {
+    const res = this.db
+      .prepare(
+        `UPDATE swarm_tasks
+            SET status = 'open', assignee_member_id = NULL, assignee_name = NULL, updated_at = ?
+          WHERE assignee_member_id = ?`,
+      )
+      .run(Date.now(), memberId);
+    return Number(res.changes);
+  }
+
   private appendBoardJsonl(post: BoardPostRow) {
     try {
       appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), formatBoardJsonlLine(post) + "\n", "utf8");

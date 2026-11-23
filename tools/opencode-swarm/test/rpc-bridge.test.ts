@@ -691,6 +691,75 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
     });
   });
 
+  test("add rejects an explicit empty tasks array before spawning", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Empty slices" }, toolCtx);
+
+      const bare = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "none", brief: "work", tasks: [] }, toolCtx),
+      );
+      expect(bare.ok).toBe(false);
+      expect(String(bare.error)).toContain("tasks must contain at least one slice");
+
+      await swarmTool.execute({ action: "plan", tasks: ["one", "two"] }, toolCtx);
+      const withPlan = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "none-2", brief: "work", tasks: [] }, toolCtx),
+      );
+      expect(withPlan.ok).toBe(false);
+      expect(String(withPlan.error)).toContain("tasks must contain at least one slice");
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.members.filter((m: { role: string }) => m.role === "worker")).toHaveLength(0);
+      expect(status.assigned_units).toBe(0);
+      expect(status.open_units).toBe(2);
+    });
+  });
+
+  test("add rolls back earlier unit assignments when a later assign fails", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Assign rollback" }, toolCtx);
+      await swarmTool.execute({ action: "plan", tasks: ["first", "second"] }, toolCtx);
+
+      const original = SwarmBoardDB.prototype.assignTasks;
+      let calls = 0;
+      SwarmBoardDB.prototype.assignTasks = function (
+        this: SwarmBoardDB,
+        ...args: Parameters<typeof original>
+      ) {
+        calls += 1;
+        if (calls === 2) throw new Error("injected assign failure");
+        return original.apply(this, args);
+      };
+      let res: Record<string, any>;
+      try {
+        res = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "pair", brief: "work", tasks: ["a", "b"] }, toolCtx),
+        );
+      } finally {
+        SwarmBoardDB.prototype.assignTasks = original;
+      }
+      expect(calls).toBe(2);
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toContain("injected assign failure");
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      const members = status.members.filter(
+        (m: { name: string }) => m.name === "pair-1" || m.name === "pair-2",
+      );
+      expect(members).toHaveLength(2);
+      expect(members.every((m: { state: string }) => m.state === "killed")).toBe(true);
+      expect(status.tasks.map((t: { status: string }) => t.status)).toEqual(["open", "open"]);
+      expect(status.tasks.every((t: { assignee: string | null }) => t.assignee === null)).toBe(true);
+      expect(status.assigned_units).toBe(0);
+      expect(status.open_units).toBe(2);
+      expect(status.unassigned_units).toBe(2);
+    });
+  });
+
   test("invalid worker and shard options fall back to defaults", async () => {
     await withBridgeHarness(
       async ({ registeredTools }) => {

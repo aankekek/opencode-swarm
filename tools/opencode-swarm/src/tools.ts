@@ -274,6 +274,12 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           }
           const role = rawRole as MemberRole;
           const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
+          if (tasks && tasks.length === 0) {
+            return toolJson({
+              ok: false,
+              error: "tasks must contain at least one slice; omit it for a single worker.",
+            });
+          }
           const n = typeof input.n === "number" && input.n > 1 ? Math.floor(input.n) : undefined;
           const count = tasks ? tasks.length : n;
           let requestedTaskIds: number[] | undefined;
@@ -465,6 +471,11 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               await ctx.session.interrupt({ sessionID: m.session_id }).catch(() => {});
               db.setMemberState(m.id, "killed");
               db.releaseLocksForMember(m.id);
+              try {
+                db.releaseTasksForMember(m.id);
+              } catch (releaseErr) {
+                console.warn("[opencode-swarm] Failed to release plan units for member:", releaseErr);
+              }
               cleanupMemberWorkspace({
                 mode: m.workspace_mode,
                 dir: m.workspace_dir,
