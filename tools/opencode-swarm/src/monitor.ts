@@ -56,6 +56,10 @@ export function startStallMonitor(
   onPost: (swarmId: string, authorName: string, channel: string, text: string) => Promise<BoardPostRow>,
 ): () => void {
   const inFlightSwarms = new Set<string>();
+  // Tracks posts that have been issued but not yet settled by the real post,
+  // independently of the race timeout. Prevents a later tick from starting a
+  // second nudge while a slow post is still pending.
+  const pendingPosts = new Set<string>();
   const postTimeoutMs = Math.max(100, Math.min(config.monitorIntervalMs, 15_000));
 
   const timer = setInterval(async () => {
@@ -64,7 +68,7 @@ export function startStallMonitor(
       for (const swarm of db.getActiveSwarms()) {
         if (swarm.status !== "running") continue;
         if (swarm.owner_pid && swarm.owner_pid !== process.pid) continue;
-        if (inFlightSwarms.has(swarm.id)) continue;
+        if (inFlightSwarms.has(swarm.id) || pendingPosts.has(swarm.id)) continue;
 
         inFlightSwarms.add(swarm.id);
         try {
@@ -115,16 +119,30 @@ export function startStallMonitor(
 
           const nextCount = latestSeq <= swarm.last_monitor_nudge_seq ? swarm.monitor_nudge_count + 1 : 1;
           db.updateMonitorNudge(swarm.id, latestSeq, nextCount);
+          // Bookkeeping must follow the REAL post, not whichever side wins the
+          // race below. The underlying promise stays pending after a timeout and
+          // still commits its post, so it owns the seq update and the pending flag.
+          pendingPosts.add(swarm.id);
+          const postPromise = onPost(swarm.id, "monitor", "main", nudgeMessage)
+            .then((post) => {
+              db.updateMonitorNudge(swarm.id, post.swarm_seq, nextCount);
+              return post;
+            })
+            .finally(() => {
+              pendingPosts.delete(swarm.id);
+            });
+          // A late rejection (after the race already timed out) must not surface
+          // as an unhandled rejection.
+          postPromise.catch(() => {});
           let timeoutId: ReturnType<typeof setTimeout> | undefined;
-          const post = await Promise.race([
-            onPost(swarm.id, "monitor", "main", nudgeMessage),
+          await Promise.race([
+            postPromise,
             new Promise<never>((_, reject) => {
               timeoutId = setTimeout(() => reject(new Error(`Monitor nudge timed out after ${postTimeoutMs}ms`)), postTimeoutMs);
             }),
           ]).finally(() => {
             if (timeoutId) clearTimeout(timeoutId);
           });
-          db.updateMonitorNudge(swarm.id, post.swarm_seq, nextCount);
         } catch (err) {
           console.error(`[opencode-swarm] monitor error for swarm ${swarm.id}:`, err);
         } finally {
