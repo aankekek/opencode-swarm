@@ -11,7 +11,7 @@ import { buildUninstallPlan, executeUninstallPlan } from "./uninstall.js";
 import { openSqliteDatabase, SwarmBoardDB } from "./db.js";
 import { checkPendingWakePosts, parseMentionsFromText, resolveWakeTargets } from "./mentions.js";
 import { formatModelSpec, listAvailableModels, parseModelSpec, resolveAndValidateModel } from "./models.js";
-import { startStallMonitor } from "./monitor.js";
+import { hasFreshVerifierPass, isVerifierAuthor, startStallMonitor } from "./monitor.js";
 import { buildRolePermissions, evaluateActionForMember, SHELL_TOOLS, WRITE_TOOLS } from "./policy.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "./prompts.js";
 import { extractTargetPaths, normalizeHandle, tightenEffect, validateMemberName } from "./security.js";
@@ -60,6 +60,8 @@ function cloneToolInput(input: unknown): Record<string, unknown> | undefined {
   }
 }
 
+const activePluginInstances = new Map<string, () => Promise<void>>();
+
 export const swarmRuntimePlugin = Plugin.define({
   id: "local.opencode-swarm",
 
@@ -81,6 +83,19 @@ export const swarmRuntimePlugin = Plugin.define({
       ? dirname(resolve(options.dbPath))
       : join(homedir(), ".opencode-swarm", repoHash);
     const dbPath = options.dbPath ? resolve(options.dbPath) : join(dataDir, "board.db");
+    const instanceKey = IS_WINDOWS ? dbPath.toLowerCase() : dbPath;
+    if (activePluginInstances.has(instanceKey)) {
+      const prevCleanup = activePluginInstances.get(instanceKey)!;
+      activePluginInstances.delete(instanceKey);
+      console.warn(
+        `[opencode-swarm] Duplicate plugin load detected for ${canonicalWorkspaceRoot}; disposing previous instance.`,
+      );
+      try {
+        await prevCleanup();
+      } catch (err) {
+        console.warn("[opencode-swarm] Error disposing previous instance:", err);
+      }
+    }
     mkdirSync(dataDir, { recursive: true });
 
     const roleModelsPath = options.dbPath
@@ -515,14 +530,19 @@ export const swarmRuntimePlugin = Plugin.define({
       const workers = nonCoord.filter((m) => m.role === "worker");
       const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
       const latestAuthorMember = db.getMemberByName(swarmId, latestPost.author_name);
-      const isVerifierAuthor =
-        latestAuthorMember?.role === "verifier" ||
-        latestPost.author_name === "verifier" ||
-        /^verifier(-\d+)?$/i.test(latestPost.author_name);
-      const isVerifierReport = isVerifierAuthor && /\b(PASS|FAIL)\b/i.test(latestPost.body);
+      const isVerifierAuthorFlag = isVerifierAuthor(latestPost.author_name, latestAuthorMember);
+      const isVerifierReport = isVerifierAuthorFlag && /\b(PASS|FAIL)\b/i.test(latestPost.body);
       const isMonitorStall = latestPost.author_name === "monitor";
+      const hasFreshPass = hasFreshVerifierPass(db, swarmId, members);
 
-      if (options.autoSpawnVerifier !== false && allWorkersDone && !anyWorking && !isVerifierReport) {
+      if (
+        options.autoSpawnVerifier !== false &&
+        allWorkersDone &&
+        !anyWorking &&
+        !isVerifierReport &&
+        !isMonitorStall &&
+        !hasFreshPass
+      ) {
         const outcome = await ensureVerifierForCompletedWork(swarmId, coord, latestPost);
         if (outcome === "spawned" || outcome === "requested" || outcome === "in_progress") return;
       }
@@ -556,12 +576,11 @@ export const swarmRuntimePlugin = Plugin.define({
       db.setMemberState(coord.id, "working");
       emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
 
-      const isVerifierPassReport = isVerifierReport && /\bPASS\b/i.test(latestPost.body);
-      const completeReady = isVerifierPassReport && allWorkersDone && !anyWorking;
+      const completeReady = hasFreshPass && allWorkersDone && !anyWorking;
 
       const handoffText = completeReady
         ? `All swarm members finished (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Read board updates since #${prevReadSeq} with read_board, present the final summary to the user, and call swarm{action:"complete"}.`
-        : allWorkersDone && !anyWorking && !isVerifierReport
+        : allWorkersDone && !anyWorking && !hasFreshPass && !isVerifierReport
           ? `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Verification is NOT done: no verifier PASS yet. Call read_board(since: ${prevReadSeq}) to review, spawn or repair a verifier (@verifier) to independently verify worker output, and do NOT call swarm{action:"complete"} until a verifier posts PASS.`
           : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
 
@@ -2383,7 +2402,13 @@ export const swarmRuntimePlugin = Plugin.define({
       (swarmId, authorName, channel, text) => postToBoard(swarmId, authorName, channel, text),
     );
 
-    return async () => {
+    let cleanedUp = false;
+    const cleanup = async () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (activePluginInstances.get(instanceKey) === cleanup) {
+        activePluginInstances.delete(instanceKey);
+      }
       stopMonitor();
       abortController.abort();
       pendingCalls.clear();
@@ -2420,6 +2445,8 @@ export const swarmRuntimePlugin = Plugin.define({
         }
       }
     };
+    activePluginInstances.set(instanceKey, cleanup);
+    return cleanup;
   },
 });
 

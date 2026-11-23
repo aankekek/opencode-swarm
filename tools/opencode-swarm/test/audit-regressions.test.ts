@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
 import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
+import { hasFreshVerifierPass } from "../src/monitor.js";
 
 function createHarness(repoDir: string, dbPath: string) {
   const tools = new Map<string, any>();
@@ -697,6 +698,195 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       expect(coordPrompts[0].text).not.toContain("All swarm members finished");
     } finally {
       await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("F: monitor stall after verifier PASS nudges coordinator, not verifier, and does not re-trigger [verify]", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-no-reverify-mon-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    (ctx as any).options.stallTimeoutMs = 40;
+    (ctx as any).options.monitorIntervalMs = 20;
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const readTool = tools.get("read_board");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature F" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+      await postTool.execute({ text: "[done] finished feature F" }, { sessionID: w1Sess });
+
+      let snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifier = snap.members.find((m: any) => m.role === "verifier");
+      expect(verifier).toBeDefined();
+      const verSess = verifier.session_id as string;
+
+      await postTool.execute({ text: "@coordinator PASS all checks green" }, { sessionID: verSess });
+      // Coordinator reads the PASS post and goes idle without completing yet
+      await readTool.execute({ since: 0 }, { sessionID: "sess_coord" });
+      pushEvent({ type: "session.status", data: { sessionID: "sess_coord", status: { type: "idle" } } });
+
+      // Wait for monitor to fire at least once
+      await new Promise((r) => setTimeout(r, 120));
+
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snap.members.filter((m: any) => m.role === "verifier").length).toBe(1);
+
+      const monitorPosts = snap.board_posts.filter((p: any) => p.author === "monitor");
+      expect(monitorPosts.length).toBeGreaterThanOrEqual(1);
+      expect(monitorPosts[0].body).toContain("@coordinator");
+      expect(monitorPosts[0].body).not.toContain("@verifier");
+
+      const verifyPosts = snap.board_posts.filter((p: any) => /\[verify\]/i.test(p.body));
+      expect(verifyPosts.length).toBe(0);
+      void prompts;
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("G: worker PASS-acknowledgment after verifier PASS does not re-trigger [verify]", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-no-reverify-ack-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature G" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+      await postTool.execute({ text: "[done] finished feature G" }, { sessionID: w1Sess });
+
+      let snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifier = snap.members.find((m: any) => m.role === "verifier");
+      const verSess = verifier.session_id as string;
+
+      await postTool.execute({ text: "@coordinator PASS all checks green" }, { sessionID: verSess });
+      await postTool.execute(
+        { text: "[done] @coordinator — PASS acknowledged. No further action open on my side." },
+        { sessionID: w1Sess },
+      );
+
+      pushEvent({ type: "session.status", data: { sessionID: "sess_coord", status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 40));
+
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifyPosts = snap.board_posts.filter((p: any) => /\[verify\]/i.test(p.body));
+      expect(verifyPosts.length).toBe(0);
+
+      const coordPrompts = prompts.filter((p) => p.sessionID === "sess_coord");
+      expect(coordPrompts.some((p) => p.text.includes("complete"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("H: substantive worker post after verifier PASS re-triggers [verify]", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-reverify-fix-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Build feature H" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+      await postTool.execute({ text: "[done] finished feature H" }, { sessionID: w1Sess });
+
+      let snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifier = snap.members.find((m: any) => m.role === "verifier");
+      const verSess = verifier.session_id as string;
+
+      await postTool.execute({ text: "@coordinator PASS initial check" }, { sessionID: verSess });
+      // Wait for verifier to be idle so it can be woken by [verify]
+      pushEvent({ type: "session.status", data: { sessionID: verSess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 20));
+
+      await postTool.execute({ text: "[done] fixed edge case in parser.ts" }, { sessionID: w1Sess });
+      await new Promise((r) => setTimeout(r, 30));
+
+      snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifyPosts = snap.board_posts.filter((p: any) => /\[verify\]/i.test(p.body));
+      expect(verifyPosts.length).toBe(1);
+      void hasFreshVerifierPass;
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("I: double-load guard disposes previous active instance for the same dbPath", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-double-load-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const h1 = createHarness(repoDir, dbPath);
+    let rpc1Disposed = false;
+    const origRegister1 = h1.ctx.rpc.register;
+    h1.ctx.rpc.register = async (def: any, handlers: any) => {
+      const reg = await origRegister1(def, handlers);
+      return {
+        ...reg,
+        dispose: () => {
+          rpc1Disposed = true;
+        },
+      };
+    };
+
+    const cleanup1 = (await swarmRuntimePlugin.setup(h1.ctx)) as () => Promise<void>;
+    const h2 = createHarness(repoDir, dbPath);
+    const cleanup2 = (await swarmRuntimePlugin.setup(h2.ctx)) as () => Promise<void>;
+
+    try {
+      expect(rpc1Disposed).toBe(true);
+      const swarmTool2 = h2.tools.get("swarm");
+      const titleRes = JSON.parse(
+        (await swarmTool2.execute({ action: "title", title: "Second Instance" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(titleRes.ok).toBe(true);
+
+      // Calling cleanup1 again must be a safe no-op
+      await cleanup1();
+      const statusRes = JSON.parse(
+        (await swarmTool2.execute({ action: "status" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(statusRes.swarm.title).toBe("Second Instance");
+    } finally {
+      await cleanup2();
+      await cleanup1();
       try {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
       } catch {}

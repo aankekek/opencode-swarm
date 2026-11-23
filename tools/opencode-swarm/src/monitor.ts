@@ -6,6 +6,43 @@ export interface MonitorConfig {
   monitorIntervalMs: number;
 }
 
+export function isVerifierAuthor(authorName: string, member?: MemberRow): boolean {
+  return (
+    member?.role === "verifier" ||
+    authorName === "verifier" ||
+    /^verifier(-\d+)?$/i.test(authorName)
+  );
+}
+
+export function isPassAcknowledgementPost(body: string): boolean {
+  return (
+    /\bPASS\b[\s\S]{0,40}acknowledg|acknowledg[\s\S]{0,40}\bPASS\b|no further action|no action open/i.test(body) &&
+    !/\[fixed\]|\bfixed\b|\bpatched\b|\bupdated\b|\bimplemented\b/i.test(body)
+  );
+}
+
+export function hasFreshVerifierPass(db: SwarmBoardDB, swarmId: string, members?: MemberRow[]): boolean {
+  const memberList = members ?? db.listMembers(swarmId, false);
+  const byName = new Map<string, MemberRow>();
+  for (const m of memberList) byName.set(m.name, m);
+
+  const { posts } = db.getLatestPostsWindow(swarmId, 200);
+  for (let i = posts.length - 1; i >= 0; i--) {
+    const post = posts[i];
+    const member = byName.get(post.author_name);
+    if (isVerifierAuthor(post.author_name, member)) {
+      if (/\bFAIL\b/i.test(post.body)) return false;
+      if (/\bPASS\b/i.test(post.body)) return true;
+      continue;
+    }
+    if (post.author_name === "monitor" || post.author_name === "narrator") continue;
+    if (member?.role === "coordinator" || post.author_name === "coordinator") continue;
+    if (isPassAcknowledgementPost(post.body)) continue;
+    return false;
+  }
+  return false;
+}
+
 export function startStallMonitor(
   db: SwarmBoardDB,
   config: MonitorConfig,
@@ -60,7 +97,7 @@ export function startStallMonitor(
               .map((w: MemberRow) => `@${w.name} (${w.paused_quota ? "paused_quota" : w.state})`)
               .join(", ");
             nudgeMessage = `@coordinator [stall] All members idle >${Math.round(config.stallTimeoutMs / 1000)}s with open tracks: ${summary}.`;
-          } else if (verifier && verifier.state === "waiting") {
+          } else if (verifier && verifier.state === "waiting" && !hasFreshVerifierPass(db, swarm.id, members)) {
             nudgeMessage = `@verifier [stall] All worker tracks are done; please verify pending work or post PASS to @coordinator.`;
           } else {
             nudgeMessage = `@coordinator [stall] Swarm '${swarm.id}' is idle with all tracks done; call swarm{action:"complete"} when ready.`;
