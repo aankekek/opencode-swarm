@@ -201,6 +201,16 @@ export const swarmRuntimePlugin = Plugin.define({
       console.warn("[opencode-swarm] Pending workspace recovery failed; continuing:", err);
     }
 
+    // Repair the human/tooling-facing JSON mirrors from authoritative SQLite rows.
+    // A crash between a DB commit and the mirror write can leave members.json
+    // truncated or board.jsonl missing its last line; this converges both back.
+    // Cheap on an empty DB and never fatal.
+    try {
+      db.rebuildMirrors();
+    } catch (err) {
+      console.warn("[opencode-swarm] Mirror rebuild failed; continuing:", err);
+    }
+
     // Bounded call-ID cache bridging tool.execute.before -> permission.evaluate
     const pendingCalls = new Map<string, CachedCall>();
     const MAX_PENDING_CALLS = 500;

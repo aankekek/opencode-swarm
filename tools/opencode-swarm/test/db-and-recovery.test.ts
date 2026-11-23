@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqliteDatabase, SwarmBoardDB } from "../src/db.js";
@@ -661,6 +661,171 @@ describe("SwarmBoardDB & Crash Recovery", () => {
         )
         .run();
       sqlite.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("syncMembersJson writes valid JSON atomically and leaves no temp files", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-mirror-atomic-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Mirror Atomic Swarm",
+        objective: "Mirror durability",
+        coordinatorSessionId: "coord_mirror_atomic",
+        workspaceDir: dir,
+      });
+
+      const swarmDir = db.getSwarmDir(swarm.id);
+      const membersPath = join(swarmDir, "members.json");
+      const raw = readFileSync(membersPath, "utf8");
+      const parsed = JSON.parse(raw) as { title: string; members: Record<string, unknown> };
+      expect(parsed.title).toBe("Mirror Atomic Swarm");
+      expect(Object.keys(parsed.members)).toEqual(["coordinator"]);
+
+      // A fresh sync replaces the file in place and must not leave temp files.
+      db.syncMembersJson(swarm.id);
+      expect(JSON.parse(readFileSync(membersPath, "utf8")).title).toBe("Mirror Atomic Swarm");
+      const leftovers = readdirSync(swarmDir).filter((name) => name.includes(".tmp-"));
+      expect(leftovers).toEqual([]);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("rebuildMirrors repairs a truncated members.json from the DB", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-mirror-repair-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Mirror Repair Swarm",
+        objective: "Repair members.json",
+        coordinatorSessionId: "coord_mirror_repair",
+        workspaceDir: dir,
+      });
+      db.insertMember({
+        swarmId: swarm.id,
+        name: "worker-1",
+        sessionId: "sess_worker_1",
+        role: "worker",
+        addedBy: "coordinator",
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        brief: "worker",
+      });
+
+      const membersPath = join(db.getSwarmDir(swarm.id), "members.json");
+      // Simulate a crash mid-write: truncated, unparseable JSON.
+      writeFileSync(membersPath, '{"title": "Mirror Rep', "utf8");
+      expect(() => JSON.parse(readFileSync(membersPath, "utf8"))).toThrow();
+
+      db.rebuildMirrors();
+
+      const repaired = JSON.parse(readFileSync(membersPath, "utf8")) as {
+        members: Record<string, unknown>;
+      };
+      const dbNames = db
+        .listMembers(swarm.id, true)
+        .map((m) => m.name)
+        .sort();
+      expect(Object.keys(repaired.members).sort()).toEqual(dbNames);
+      expect(dbNames).toEqual(["coordinator", "worker-1"]);
+
+      const leftovers = readdirSync(db.getSwarmDir(swarm.id)).filter((name) => name.includes(".tmp-"));
+      expect(leftovers).toEqual([]);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("rebuildMirrors restores a board.jsonl line lost after commit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-mirror-board-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Mirror Board Swarm",
+        objective: "Repair board.jsonl",
+        coordinatorSessionId: "coord_mirror_board",
+        workspaceDir: dir,
+      });
+
+      for (let i = 1; i <= 3; i++) {
+        db.addPost({
+          swarmId: swarm.id,
+          authorName: "coordinator",
+          channel: "main",
+          mentions: [],
+          channelMentions: [],
+          isAll: false,
+          body: `post ${i}`,
+        });
+      }
+
+      const boardPath = join(db.getSwarmDir(swarm.id), "board.jsonl");
+      const lines = readFileSync(boardPath, "utf8").split("\n").filter((l) => l.length > 0);
+      expect(lines.length).toBe(3);
+      // Simulate a crash between COMMIT and the append of the last post.
+      writeFileSync(boardPath, lines.slice(0, -1).join("\n") + "\n", "utf8");
+
+      db.rebuildMirrors();
+
+      const rebuilt = readFileSync(boardPath, "utf8").split("\n").filter((l) => l.length > 0);
+      const count = (
+        sqlite.prepare(`SELECT COUNT(*) AS n FROM board_posts WHERE swarm_id = ?`).get(swarm.id) as {
+          n: number;
+        }
+      ).n;
+      expect(rebuilt.length).toBe(count);
+      expect(count).toBe(3);
+      const parsed = rebuilt.map((l) => JSON.parse(l) as { seq: number; text: string });
+      expect(parsed.map((p) => p.seq)).toEqual([1, 2, 3]);
+      expect(parsed.map((p) => p.text)).toEqual(["post 1", "post 2", "post 3"]);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("rebuildMirrors does not throw on an empty DB or a missing data dir", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-mirror-empty-"));
+    const dbPath = join(dir, "board.db");
+    const missingDataDir = join(dir, "missing-data-dir");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, missingDataDir);
+      expect(() => db.rebuildMirrors()).not.toThrow();
+
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Mirror Missing Dir Swarm",
+        objective: "Missing data dir",
+        coordinatorSessionId: "coord_mirror_missing",
+        workspaceDir: dir,
+      });
+      expect(() => db.rebuildMirrors()).not.toThrow();
+      expect(existsSync(join(missingDataDir, "swarms", swarm.id, "members.json"))).toBe(true);
+      expect(existsSync(join(missingDataDir, "swarms", swarm.id, "board.jsonl"))).toBe(true);
+
+      db.close();
     } finally {
       try {
         rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });

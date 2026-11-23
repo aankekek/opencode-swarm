@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
   BoardPostRow,
@@ -52,6 +52,38 @@ export interface SqliteDb {
 export async function openSqliteDatabase(dbPath: string): Promise<SqliteDb> {
   const mod = (await import("node:sqlite")) as { DatabaseSync: new (path: string) => SqliteDb };
   return new mod.DatabaseSync(dbPath);
+}
+
+/**
+ * Write `contents` to `targetPath` atomically: write a sibling temp file, then
+ * rename it over the target. A crash mid-write can therefore never leave a
+ * truncated/invalid file at the target path. The temp file is removed if the
+ * write or rename fails.
+ */
+function writeFileAtomic(targetPath: string, contents: string): void {
+  const tmpPath = `${targetPath}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    writeFileSync(tmpPath, contents, "utf8");
+    renameSync(tmpPath, targetPath);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Temp file may not exist; nothing to clean up.
+    }
+    throw err;
+  }
+}
+
+/** One board.jsonl line. Shared by the append path and the mirror rebuild. */
+function formatBoardJsonlLine(post: BoardPostRow): string {
+  return JSON.stringify({
+    seq: post.swarm_seq,
+    channel: post.channel,
+    agent: post.author_name,
+    text: post.body,
+    time: new Date(post.created_at).toISOString(),
+  });
 }
 
 export class SwarmBoardDB {
@@ -911,31 +943,76 @@ export class SwarmBoardDB {
 
   syncMembersJson(swarmId: string) {
     try {
-      const swarm = this.getSwarm(swarmId);
-      if (!swarm) return;
-      const members = this.listMembers(swarmId, true);
-      const record: Record<string, unknown> = {};
-      for (const m of members) {
-        record[m.name] = {
-          conversation_id: m.session_id,
-          role: m.role,
-          model: m.model_provider && m.model_id ? `${m.model_provider}/${m.model_id}${m.model_variant ? `#${m.model_variant}` : ""}` : null,
-          workspace: m.workspace_mode,
-          workspace_dir: m.workspace_dir,
-          channels: this.getMemberChannels(swarmId, m.id),
-          wake_mode: m.wake_mode,
-          wait_since: m.wait_since,
-          last_read_seq: m.last_read_seq,
-          killed: m.state === "killed",
-        };
-      }
-      writeFileSync(
-        join(this.getSwarmDir(swarmId), "members.json"),
-        JSON.stringify({ title: swarm.title, status: swarm.status, members: record }, null, 2),
-        "utf8",
-      );
+      const payload = this.serializeMembersJson(swarmId);
+      if (payload === null) return;
+      writeFileAtomic(join(this.getSwarmDir(swarmId), "members.json"), payload);
     } catch (err) {
       console.warn("[opencode-swarm] Failed to sync members.json:", err);
+    }
+  }
+
+  /**
+   * Serialize the members.json mirror for a swarm, or null when the swarm does
+   * not exist. Kept separate so syncMembersJson and rebuildMirrors share exactly
+   * the same JSON shape.
+   */
+  private serializeMembersJson(swarmId: string): string | null {
+    const swarm = this.getSwarm(swarmId);
+    if (!swarm) return null;
+    const members = this.listMembers(swarmId, true);
+    const record: Record<string, unknown> = {};
+    for (const m of members) {
+      record[m.name] = {
+        conversation_id: m.session_id,
+        role: m.role,
+        model: m.model_provider && m.model_id ? `${m.model_provider}/${m.model_id}${m.model_variant ? `#${m.model_variant}` : ""}` : null,
+        workspace: m.workspace_mode,
+        workspace_dir: m.workspace_dir,
+        channels: this.getMemberChannels(swarmId, m.id),
+        wake_mode: m.wake_mode,
+        wait_since: m.wait_since,
+        last_read_seq: m.last_read_seq,
+        killed: m.state === "killed",
+      };
+    }
+    return JSON.stringify({ title: swarm.title, status: swarm.status, members: record }, null, 2);
+  }
+
+  /**
+   * Rewrite both JSON mirrors (members.json and board.jsonl) for every swarm in
+   * the database from authoritative SQLite rows. Repair path for mirrors that
+   * were truncated by a crash or lost a board line. Never throws.
+   */
+  rebuildMirrors(): void {
+    let swarms: SwarmRow[];
+    try {
+      swarms = this.db
+        .prepare(`SELECT * FROM swarms ORDER BY created_at ASC, rowid ASC`)
+        .all() as unknown as SwarmRow[];
+    } catch (err) {
+      console.warn("[opencode-swarm] Failed to load swarms for mirror rebuild:", err);
+      return;
+    }
+
+    for (const swarm of swarms) {
+      try {
+        const payload = this.serializeMembersJson(swarm.id);
+        if (payload !== null) {
+          writeFileAtomic(join(this.getSwarmDir(swarm.id), "members.json"), payload);
+        }
+      } catch (err) {
+        console.warn(`[opencode-swarm] Failed to rebuild members.json for ${swarm.id}:`, err);
+      }
+
+      try {
+        const rows = this.db
+          .prepare(`SELECT * FROM board_posts WHERE swarm_id = ? ORDER BY seq ASC`)
+          .all(swarm.id) as unknown as BoardPostRow[];
+        const body = rows.map((row) => formatBoardJsonlLine(row) + "\n").join("");
+        writeFileAtomic(join(this.getSwarmDir(swarm.id), "board.jsonl"), body);
+      } catch (err) {
+        console.warn(`[opencode-swarm] Failed to rebuild board.jsonl for ${swarm.id}:`, err);
+      }
     }
   }
 
@@ -980,14 +1057,7 @@ export class SwarmBoardDB {
 
   private appendBoardJsonl(post: BoardPostRow) {
     try {
-      const line = JSON.stringify({
-        seq: post.swarm_seq,
-        channel: post.channel,
-        agent: post.author_name,
-        text: post.body,
-        time: new Date(post.created_at).toISOString(),
-      });
-      appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), line + "\n", "utf8");
+      appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), formatBoardJsonlLine(post) + "\n", "utf8");
     } catch (err) {
       console.warn("[opencode-swarm] Failed to append board.jsonl:", err);
     }
