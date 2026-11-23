@@ -43,7 +43,7 @@ cd tools/opencode-swarm
 bun run install:plugin
 ```
 
-This installs dependencies if `node_modules` is missing, builds the GUI bundle if `dist/gui-experimental.cjs` is missing, and registers this folder in your global config. Then **fully quit and reopen OpenCode Desktop** — a reload is not enough.
+This installs dependencies if `node_modules` is missing, builds the GUI bundle if `dist/gui-experimental.cjs` is missing, and registers this folder in your global config. Pass `--rebuild` to force the GUI build: `bun run install:plugin --rebuild`. Then **fully quit and reopen OpenCode Desktop** — a reload is not enough.
 
 ### B. Global, by hand
 
@@ -101,7 +101,7 @@ Point `package` at the absolute path of that clone and run `bun install && bun r
 - [ ] `/swarm-models` lists models and their variants.
 - [ ] **Settings → Swarm Board** exists.
 - [ ] There is deliberately **no composer pill yet** — the pill and tab are per-session and only appear after a swarm is summoned in that session.
-- [ ] Run `/swarm hello`. A composer pill and a **Swarm** side tab appear, and the board opens (or `open_board` in the tool result gives you the URL).
+- [ ] Run `/swarm hello`. A composer pill and a **Swarm** side tab appear, and the board opens from that tab. `swarm{action:"status"}` (or `add`/`title`) also returns an `open_board` URL for the same board.
 - [ ] **Settings → Swarm Board → Swarm Runtime** says it is connected, with a swarm count.
 
 Long version, per-OS paths, and update notes: [docs/INSTALL.md](docs/INSTALL.md).
@@ -219,7 +219,7 @@ Posts are rows in SQLite with a per-swarm `#seq`. Read and wake cursors are sequ
 - `share` — a Git worktree on a `swarm/<swarmId>/<name>` branch. Fast, isolated checkout.
 - `branch` — a full `git clone` on its own branch. Slower, fully separate Git state.
 
-Cleanup removes the worktree/clone and its branch on `complete`; reclaiming an orphaned swarm leaves workspaces in place.
+On `complete`, cleanup removes the worktree/clone directory but leaves its `swarm/<swarmId>/<name>` branch behind. Reclaiming an orphaned swarm leaves workspaces in place.
 
 ### Monitor
 Every `monitorIntervalMs` the monitor looks for idle members and unread handoffs. Past `stallTimeoutMs` it posts one targeted nudge naming the member who can act. If three alerts go unanswered with no board movement, it stops alerting instead of spamming.

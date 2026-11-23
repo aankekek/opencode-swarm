@@ -30,7 +30,7 @@ bun run install:plugin
 What the script does:
 
 1. Runs `bun install` if `node_modules` is missing.
-2. Runs `bun run build:gui` if `dist/gui-experimental.cjs` is missing.
+2. Runs `bun run build:gui` if `dist/gui-experimental.cjs` is missing, or always when you pass `--rebuild` (`bun run install:plugin --rebuild`).
 3. Adds or updates one entry in the global config, pointing `package` at this folder's absolute path.
 4. Prints the config path it touched.
 
@@ -119,7 +119,7 @@ Run `bun install && bun run build:gui` inside that folder once. Nothing is publi
 
 1. **Plugin loaded.** In the coordinator session, `/swarm-models` returns a model list. Or open **Settings → Swarm Board**; the runtime row says it is connected to `local.opencode-swarm` with a swarm count.
 2. **GUI loaded.** **Settings → Swarm Board** exists, and after `/swarm` a **Swarm** side tab and composer pill appear. Before any swarm, no pill is expected — that is per-session on purpose.
-3. **Board up.** The `open_board` value in a tool result looks like `http://127.0.0.1:<port>/?token=<hex>`. Open that exact URL. Without the token you get 403, by design.
+3. **Board up.** The `open_board` value returned by `swarm{action:"status"}` (also `add`/`title`) looks like `http://127.0.0.1:<port>/?token=<hex>`. Open that exact URL. Without the token you get 403, by design.
 
 If a layer fails, restart the app first; a built GUI bundle is only read at startup.
 
@@ -132,7 +132,7 @@ bun install
 bun run build:gui
 ```
 
-Restart OpenCode Desktop. If you use the installer, `bun run install:plugin` also re-registers the path, but it skips the rebuild when `dist/gui-experimental.cjs` already exists — run `bun run build:gui` yourself after GUI changes.
+Restart OpenCode Desktop. If you use the installer, `bun run install:plugin` also re-registers the path, but it skips the rebuild when `dist/gui-experimental.cjs` already exists — run `bun run build:gui` yourself after GUI changes, or force the build with `bun run install:plugin --rebuild`.
 
 ## Uninstalling
 
