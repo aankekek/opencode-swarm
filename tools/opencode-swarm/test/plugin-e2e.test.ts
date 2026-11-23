@@ -858,4 +858,96 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       } catch {}
     }
   });
+
+  test("plugin dispose runs deferred kill cleanup instead of dropping it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-dispose-kill-cleanup-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const stream = createEventStream();
+    const { ctx, tools, hooks, commands } = createMockContext(repoDir, dbPath, {}, () => stream);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as (() => Promise<void>) & {
+      pendingKillCleanup: Map<string, () => void>;
+    };
+    let reader: SwarmBoardDB | undefined;
+
+    try {
+      // The deferred-cleanup map is exposed on the returned cleanup so the test
+      // can seed a spy and assert dispose drains it.
+      const deferredKills = cleanup.pendingKillCleanup;
+      expect(deferredKills).toBeInstanceOf(Map);
+
+      const swarmTool = tools.get("swarm");
+      await commands.get("swarm").execute({
+        sessionID: "sess_coord",
+        prompt: "Dispose kill cleanup test",
+        delivery: "queue",
+      });
+
+      const addRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "w1", brief: "work", workspace: "inherit" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(addRes.ok).toBe(true);
+      const workerSession = addRes.spawned[0].session_id;
+
+      const claimRes = JSON.parse(
+        (await swarmTool.execute({ action: "claim", globs: ["src/**/*.ts"] }, { sessionID: workerSession })).content,
+      );
+      expect(claimRes.ok).toBe(true);
+
+      // An in-flight tool makes the kill's waitForQuiesce time out, deferring
+      // the lock release + workspace cleanup into pendingKillCleanup.
+      await hooks["tool.execute.before"]({
+        id: "call_dispose_1",
+        tool: "write",
+        input: { filePath: join(repoDir, "src", "a.ts") },
+        sessionID: workerSession,
+      });
+      const killRes = JSON.parse(
+        (await swarmTool.execute({ action: "kill", name: "w1" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(killRes.ok).toBe(true);
+
+      const originalCleanup = deferredKills.get(workerSession);
+      expect(typeof originalCleanup).toBe("function");
+      let ran = 0;
+      deferredKills.set(workerSession, () => {
+        ran += 1;
+        originalCleanup!();
+      });
+      expect(deferredKills.size).toBe(1);
+
+      // Before dispose the deferred cleanup has NOT run: the lock is still held.
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      const swarmId = reader.getActiveSwarms()[0].id;
+      expect(reader.listLocks(swarmId)).toHaveLength(1);
+      reader.close();
+      reader = undefined;
+
+      // Dispose invokes the deferred cleanup while the DB is still open.
+      await cleanup();
+      expect(ran).toBe(1);
+      expect(deferredKills.size).toBe(0);
+
+      // A second dispose is a no-op and must not run the entry again.
+      await cleanup();
+      expect(ran).toBe(1);
+      expect(deferredKills.size).toBe(0);
+
+      // The lock release really reached the DB before it closed.
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      expect(reader.listLocks(swarmId)).toHaveLength(0);
+      stream.end();
+    } finally {
+      reader?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

@@ -1299,6 +1299,20 @@ export const swarmRuntimePlugin = Plugin.define({
       spawningMembers.clear();
       activeToolCounts.clear();
       quiesceResolvers.clear();
+      // Deferred kill cleanups release locks and remove worktrees for sessions
+      // that never quiesced before shutdown. They must run while the DB is
+      // still open: dropping them would orphan locks and workspaces forever,
+      // because a same-PID reload makes startup reconciliation skip the swarm.
+      for (const [sessionId, finishKillCleanup] of Array.from(pendingKillCleanup)) {
+        // Another path (quiesce notification) may have already taken it.
+        if (pendingKillCleanup.get(sessionId) !== finishKillCleanup) continue;
+        pendingKillCleanup.delete(sessionId);
+        try {
+          finishKillCleanup();
+        } catch (err) {
+          console.warn("[opencode-swarm] deferred kill cleanup error during shutdown:", err);
+        }
+      }
       pendingKillCleanup.clear();
       if (rpcCleanup) {
         try {
@@ -1324,6 +1338,13 @@ export const swarmRuntimePlugin = Plugin.define({
         }
       }
     };
+    // Test observability: lets regression tests seed a spy and assert the
+    // deferred-cleanup map is drained during dispose. Non-enumerable so it
+    // never leaks into host serialization of the returned function.
+    Object.defineProperty(cleanup, "pendingKillCleanup", {
+      value: pendingKillCleanup,
+      enumerable: false,
+    });
     activePluginInstances.set(instanceKey, cleanup);
     return cleanup;
   },
