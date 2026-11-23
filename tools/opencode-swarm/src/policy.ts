@@ -16,6 +16,45 @@ export const WRITE_TOOLS = new Set([
 
 export const SHELL_TOOLS = new Set(["shell", "bash", "cmd", "powershell", "exec", "run_command"]);
 
+// Names that are clearly read-only even when they contain a write-like word
+// (e.g. "get", "status"). Kept deliberately small and exact-match.
+const READ_ONLY_TOOL_NAMES = new Set([
+  "read",
+  "read_file",
+  "list",
+  "list_files",
+  "glob",
+  "grep",
+  "search",
+  "find",
+  "view",
+  "get",
+  "show",
+  "webfetch",
+  "fetch",
+  "status",
+]);
+
+// Broad write-capable hint. This is intentionally conservative: unknown tools
+// that match are treated as write-capable (fail closed) rather than passed through.
+const WRITE_TOOL_HINT =
+  /(write|edit|patch|apply|replace|create_file|delete|remove|rename|move|mkdir|touch|upload|save)/;
+
+/**
+ * Heuristically detect write-capable tools that are not listed in WRITE_TOOLS
+ * (e.g. MCP/custom tools such as `mcp__fs__write_file` or `str_replace`).
+ *
+ * Used to fail closed: callers must not evaluate path/lock containment for these
+ * names, they should deny unless the caller is explicitly permitted to edit.
+ * Read-only names win over the hint so `grep`/`get`/`status` are never flagged.
+ */
+export function looksLikeWriteTool(toolName: string): boolean {
+  const name = toolName.trim().toLowerCase();
+  if (name.length === 0) return false;
+  if (READ_ONLY_TOOL_NAMES.has(name)) return false;
+  return WRITE_TOOL_HINT.test(name);
+}
+
 export function resolveCoordinatorShellPolicy(options: PluginOptions): ShellPolicy {
   if (options.coordinatorShellPolicy) return options.coordinatorShellPolicy;
   const override = options.overrideShellAllow ?? true;

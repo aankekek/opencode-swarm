@@ -989,4 +989,127 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       } catch {}
     }
   });
+
+  test("unrecognized write-capable tools fail closed for swarm members", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-unknown-write-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, hooks, commands } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      await commands.get("swarm").execute({
+        sessionID: "sess_coord",
+        prompt: "Unknown write tool test",
+        delivery: "queue",
+      });
+
+      const addWorker = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "w1", brief: "work", workspace: "inherit" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(addWorker.ok).toBe(true);
+      const workerSession = addWorker.spawned[0].session_id;
+
+      const addVerifier = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "v1", role: "verifier", brief: "verify" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(addVerifier.ok).toBe(true);
+      const verifierSession = addVerifier.spawned[0].session_id;
+
+      // Worker + MCP write tool outside WRITE_TOOLS -> throws, no lock/path eval.
+      await expect(
+        hooks["tool.execute.before"]({
+          id: "call_unknown_write_1",
+          tool: "mcp__fs__write_file",
+          sessionID: workerSession,
+          input: { path: "../x" },
+        }),
+      ).rejects.toThrow(/not listed in WRITE_TOOLS/);
+
+      // Read-only role + custom write-like tool -> throws.
+      await expect(
+        hooks["tool.execute.before"]({
+          id: "call_unknown_write_2",
+          tool: "str_replace",
+          sessionID: verifierSession,
+          input: { path: "src/a.ts" },
+        }),
+      ).rejects.toThrow(/not listed in WRITE_TOOLS/);
+
+      // Clearly read-only name is not flagged.
+      await hooks["tool.execute.before"]({
+        id: "call_unknown_write_3",
+        tool: "grep",
+        sessionID: workerSession,
+        input: {},
+      });
+
+      // Coordinator without allowCoordinatorEdits -> denied.
+      await expect(
+        hooks["tool.execute.before"]({
+          id: "call_unknown_write_4",
+          tool: "mcp__fs__write_file",
+          sessionID: "sess_coord",
+          input: { path: "src/a.ts" },
+        }),
+      ).rejects.toThrow(/not listed in WRITE_TOOLS/);
+
+      // Known write tool still follows the existing lock/path path (unchanged):
+      // worker has no claimed locks, so the edit is denied by the lock check.
+      await expect(
+        hooks["tool.execute.before"]({
+          id: "call_known_write_1",
+          tool: "edit",
+          sessionID: workerSession,
+          input: { path: join(repoDir, "README.md") },
+        }),
+      ).rejects.toThrow(/no claimed locks/);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("coordinator with allowCoordinatorEdits may run unrecognized write-capable tools", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-unknown-write-coord-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, hooks, commands } = createMockContext(repoDir, dbPath, {
+      allowCoordinatorEdits: true,
+    });
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      await commands.get("swarm").execute({
+        sessionID: "sess_coord",
+        prompt: "Coordinator unknown write test",
+        delivery: "queue",
+      });
+
+      await hooks["tool.execute.before"]({
+        id: "call_coord_unknown_write_1",
+        tool: "mcp__fs__write_file",
+        sessionID: "sess_coord",
+        input: { path: "src/a.ts" },
+      });
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

@@ -10,7 +10,7 @@ import { SWARM_RPC_DEF, type SwarmChangedEvent, type UninstallSelection } from "
 import { openSqliteDatabase, SwarmBoardDB } from "./db.js";
 import { formatModelSpec, listAvailableModels, parseModelSpec, resolveAndValidateModel } from "./models.js";
 import { startStallMonitor } from "./monitor.js";
-import { buildRolePermissions, evaluateActionForMember, SHELL_TOOLS, WRITE_TOOLS } from "./policy.js";
+import { buildRolePermissions, evaluateActionForMember, looksLikeWriteTool, SHELL_TOOLS, WRITE_TOOLS } from "./policy.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "./prompts.js";
 import { createRpcHandlers } from "./rpc-handlers.js";
 import { extractTargetPaths, normalizeHandle, tightenEffect, validateMemberName } from "./security.js";
@@ -1016,9 +1016,29 @@ export const swarmRuntimePlugin = Plugin.define({
       const isReadOnlyRole = member.role === "verifier" || member.role === "monitor" || member.role === "narrator";
       const isKnownWrite = WRITE_TOOLS.has(toolName);
       const isKnownShell = SHELL_TOOLS.has(toolName);
+      const looksWrite = looksLikeWriteTool(toolName);
+
+      // SEC: unrecognized write-capable tools (e.g. MCP/custom write tools) are
+      // not in WRITE_TOOLS, so path/lock evaluation cannot reason about them.
+      // Fail closed for every role except a coordinator explicitly allowed to edit.
+      if (looksWrite && !isKnownWrite) {
+        if (member.role === "coordinator" && options.allowCoordinatorEdits === true) {
+          return;
+        }
+        throw new Error(
+          `[SWARM] Blocked '${toolName}': write-capable tool is not listed in WRITE_TOOLS and @${member.name} (${member.role}) may not run it.`,
+        );
+      }
 
       if (isReadOnlyRole) {
-        if (isKnownWrite || isKnownShell || toolName.includes("write") || toolName.includes("edit") || toolName.includes("exec")) {
+        if (
+          isKnownWrite ||
+          isKnownShell ||
+          looksWrite ||
+          toolName.includes("write") ||
+          toolName.includes("edit") ||
+          toolName.includes("exec")
+        ) {
           const swarm = db.getSwarm(member.swarm_id);
           if (swarm) {
             const targets = extractTargetPaths(toolName, event.input);
@@ -1031,7 +1051,7 @@ export const swarmRuntimePlugin = Plugin.define({
         return;
       }
 
-      if (!isKnownWrite && !isKnownShell) return;
+      if (!isKnownWrite && !isKnownShell && !looksWrite) return;
 
       const swarm = db.getSwarm(member.swarm_id);
       if (!swarm) return;
