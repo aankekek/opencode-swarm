@@ -41,7 +41,48 @@ async function seedOrphanSwarm(
   return { seeded, swarmId: created.swarm.id };
 }
 
-function createMockContext(repoDir: string, dbPath: string, extraOptions: Record<string, unknown> = {}) {
+function createEventStream() {
+  const queue: any[] = [];
+  let notify: (() => void) | undefined;
+  let ended = false;
+  const wake = () => {
+    const fn = notify;
+    notify = undefined;
+    fn?.();
+  };
+  return {
+    push(event: any) {
+      queue.push(event);
+      wake();
+    },
+    end() {
+      ended = true;
+      wake();
+    },
+    async *[Symbol.asyncIterator]() {
+      while (true) {
+        const next = queue.shift();
+        if (next !== undefined) {
+          yield next;
+          continue;
+        }
+        if (ended) return;
+        await new Promise<void>((resolveWait) => {
+          notify = resolveWait;
+        });
+      }
+    },
+  };
+}
+
+type EventStreamFactory = (callIndex: number) => AsyncIterable<any>;
+
+function createMockContext(
+  repoDir: string,
+  dbPath: string,
+  extraOptions: Record<string, unknown> = {},
+  eventStreamFactory?: EventStreamFactory,
+) {
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const hooks: Record<string, Function> = {};
@@ -50,6 +91,7 @@ function createMockContext(repoDir: string, dbPath: string, extraOptions: Record
   const promptCalls: any[] = [];
   const syntheticCalls: any[] = [];
   const interruptCalls: any[] = [];
+  const subscribeCalls: any[] = [];
   let seqCounter = 1;
 
   sessions.set("sess_coord", {
@@ -143,7 +185,10 @@ function createMockContext(repoDir: string, dbPath: string, extraOptions: Record
       },
     },
     event: {
-      subscribe() {
+      subscribe(input: any) {
+        const callIndex = subscribeCalls.length;
+        subscribeCalls.push(input);
+        if (eventStreamFactory) return eventStreamFactory(callIndex);
         return {
           async *[Symbol.asyncIterator]() {},
         };
@@ -151,7 +196,18 @@ function createMockContext(repoDir: string, dbPath: string, extraOptions: Record
     },
   };
 
-  return { ctx, tools, commands, hooks, sessions, switchModelCalls, promptCalls, syntheticCalls, interruptCalls };
+  return {
+    ctx,
+    tools,
+    commands,
+    hooks,
+    sessions,
+    switchModelCalls,
+    promptCalls,
+    syntheticCalls,
+    interruptCalls,
+    subscribeCalls,
+  };
 }
 
 describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
@@ -638,6 +694,91 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       expect(promptCalls[0].text).toContain("Fresh swarm");
     } finally {
       reader?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("event stream consumer resubscribes after a clean stream end", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-eof-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    // First subscription delivers one event and then completes normally (done:true).
+    const firstStream = createEventStream();
+    firstStream.push({
+      type: "session.status",
+      data: { sessionID: "sess_ignored", status: { type: "idle" } },
+    });
+    firstStream.end();
+    // Second subscription stays open so the test can push a later event into it.
+    const secondStream = createEventStream();
+
+    const { ctx, commands, subscribeCalls } = createMockContext(
+      repoDir,
+      dbPath,
+      {},
+      (callIndex) => (callIndex === 0 ? firstStream : secondStream),
+    );
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let reader: SwarmBoardDB | undefined;
+
+    try {
+      // Create a swarm so sess_coord is an active member the event handler can update.
+      await commands.get("swarm").execute({
+        sessionID: "sess_coord",
+        prompt: "Clean EOF test",
+        delivery: "queue",
+      });
+
+      // Clean EOF after one event: the consumer must sleep the backoff and resubscribe.
+      await new Promise((resolveWait) => setTimeout(resolveWait, 350));
+      expect(subscribeCalls.length).toBeGreaterThanOrEqual(2);
+
+      // The resubscribed stream is live and still processes events.
+      secondStream.push({
+        type: "session.status",
+        data: { sessionID: "sess_coord", status: { type: "idle" } },
+      });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      const active = reader.getActiveSwarms();
+      expect(active).toHaveLength(1);
+      const coordinator = reader
+        .listMembers(active[0].id, false)
+        .find((member) => member.role === "coordinator");
+      expect(coordinator?.state).toBe("waiting");
+      secondStream.end();
+    } finally {
+      reader?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("empty event streams grow the backoff instead of hot-looping", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-eof-backoff-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, subscribeCalls } = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      // Zero-event clean EOFs double the backoff (250 -> 500 -> 1000), so over
+      // ~1.1s only three subscribe attempts should have happened. A hot loop that
+      // reset to 250ms every time would already be at five or more.
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1100));
+      expect(subscribeCalls.length).toBeGreaterThanOrEqual(2);
+      expect(subscribeCalls.length).toBeLessThanOrEqual(3);
+    } finally {
       await cleanup();
       try {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });

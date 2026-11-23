@@ -1145,12 +1145,35 @@ export const swarmRuntimePlugin = Plugin.define({
     const abortController = new AbortController();
     void (async () => {
       let backoffMs = 250;
+      const sleepAbortable = (ms: number) =>
+        new Promise<void>((resolveDelay) => {
+          if (abortController.signal.aborted) {
+            resolveDelay();
+            return;
+          }
+          let timer: ReturnType<typeof setTimeout>;
+          const onAbort = () => {
+            clearTimeout(timer);
+            resolveDelay();
+          };
+          timer = setTimeout(() => {
+            abortController.signal.removeEventListener("abort", onAbort);
+            resolveDelay();
+          }, ms);
+          abortController.signal.addEventListener("abort", onAbort, { once: true });
+        });
       while (!abortController.signal.aborted) {
+        let receivedEvent = false;
         try {
           const stream = ctx.event.subscribe({ signal: abortController.signal });
-          backoffMs = 250;
           for await (const rawEvent of stream) {
             if (abortController.signal.aborted) break;
+            if (!receivedEvent) {
+              receivedEvent = true;
+              // Reset only once the subscription proves healthy; a host that
+              // returns an empty iterator must still grow the backoff.
+              backoffMs = 250;
+            }
             try {
               if (debugEvents) logDebug(eventDebugLogPath, { event: rawEvent });
 
@@ -1228,22 +1251,16 @@ export const swarmRuntimePlugin = Plugin.define({
               console.warn("[opencode-swarm] Event handler error:", evErr);
             }
           }
-          // Stream ended cleanly (e.g. test mock or graceful shutdown)
-          break;
+          if (abortController.signal.aborted) break;
+          // The host ends the iterator cleanly when the transport closes and does
+          // not reconnect on its own, so a clean EOF must resubscribe just like a
+          // thrown stream error instead of stopping the consumer permanently.
+          await sleepAbortable(backoffMs);
+          if (!receivedEvent) backoffMs = Math.min(backoffMs * 2, 5000);
         } catch (err) {
           if (abortController.signal.aborted) break;
           console.warn("[opencode-swarm] Event stream error, resubscribing:", err);
-          await new Promise<void>((resolveDelay) => {
-            const t = setTimeout(resolveDelay, backoffMs);
-            abortController.signal.addEventListener(
-              "abort",
-              () => {
-                clearTimeout(t);
-                resolveDelay();
-              },
-              { once: true },
-            );
-          });
+          await sleepAbortable(backoffMs);
           backoffMs = Math.min(backoffMs * 2, 5000);
         }
       }
