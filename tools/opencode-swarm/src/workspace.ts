@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import type { SwarmBoardDB, PendingProvisionRow } from "./db.js";
 import type { WorkspaceMode } from "./types.js";
 
 function runGit(args: string[], cwd: string): string {
@@ -26,6 +27,21 @@ export interface ProvisionedWorkspace {
   branch: string | null;
 }
 
+export function provisionedWorkspacePaths(args: {
+  mode: WorkspaceMode;
+  repoRoot: string;
+  dataDir: string;
+  swarmId: string;
+  memberName: string;
+}): { dir: string; branch: string | null } {
+  if (args.mode === "inherit") return { dir: args.repoRoot, branch: null };
+  const branch = `swarm/${args.swarmId}/${args.memberName}`;
+  if (args.mode === "share") {
+    return { dir: join(args.dataDir, "worktrees", args.swarmId, args.memberName), branch };
+  }
+  return { dir: join(args.dataDir, "clones", args.swarmId, args.memberName), branch };
+}
+
 export function provisionMemberWorkspace(args: {
   mode: WorkspaceMode;
   repoRoot: string;
@@ -43,29 +59,27 @@ export function provisionMemberWorkspace(args: {
     );
   }
 
-  const branch = `swarm/${args.swarmId}/${args.memberName}`;
+  const { dir, branch } = provisionedWorkspacePaths(args);
 
   if (args.mode === "share") {
     const baseDir = join(args.dataDir, "worktrees", args.swarmId);
     mkdirSync(baseDir, { recursive: true });
-    const wtDir = join(baseDir, args.memberName);
-    if (existsSync(wtDir)) {
-      throw new Error(`Worktree directory "${wtDir}" already exists for @${args.memberName}.`);
+    if (existsSync(dir)) {
+      throw new Error(`Worktree directory "${dir}" already exists for @${args.memberName}.`);
     }
-    runGit(["worktree", "add", "-b", branch, wtDir, "HEAD"], args.repoRoot);
-    return { mode: "share", dir: wtDir, branch };
+    runGit(["worktree", "add", "-b", branch!, dir, "HEAD"], args.repoRoot);
+    return { mode: "share", dir, branch };
   }
 
   // branch: isolated clone
   const cloneBase = join(args.dataDir, "clones", args.swarmId);
   mkdirSync(cloneBase, { recursive: true });
-  const cloneDir = join(cloneBase, args.memberName);
-  if (existsSync(cloneDir)) {
-    throw new Error(`Clone directory "${cloneDir}" already exists for @${args.memberName}.`);
+  if (existsSync(dir)) {
+    throw new Error(`Clone directory "${dir}" already exists for @${args.memberName}.`);
   }
-  runGit(["clone", "--dissociate", "--no-checkout", args.repoRoot, cloneDir], args.repoRoot);
-  runGit(["checkout", "-b", branch], cloneDir);
-  return { mode: "branch", dir: cloneDir, branch };
+  runGit(["clone", "--dissociate", "--no-checkout", args.repoRoot, dir], args.repoRoot);
+  runGit(["checkout", "-b", branch!], dir);
+  return { mode: "branch", dir, branch };
 }
 
 export function cleanupMemberWorkspace(args: {
@@ -124,4 +138,95 @@ export function cleanupMemberWorkspace(args: {
     return { ok: false, error: errors.join("; ") };
   }
   return { ok: true };
+}
+
+/** True when `child` resolves to a path strictly inside `parent`. */
+function isStrictlyInside(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  if (rel === "") return false;
+  if (isAbsolute(rel)) return false;
+  return !rel.startsWith("..");
+}
+
+/**
+ * Recover workspaces that were provisioned but never recorded as members
+ * (crash between provisioning and `insertMember`). Each pending row is an
+ * intent record written before provisioning; the row is deleted once the
+ * member exists, so a surviving row means the workspace may be orphaned.
+ *
+ * Safety policy:
+ * - Only remove directories strictly inside `dataDir`. A row pointing
+ *   elsewhere is logged and dropped without touching the filesystem.
+ * - For `share` mode with a `swarm/` branch, best-effort delete the branch
+ *   and prune stale worktree metadata.
+ * - Never throws; per-row failures are logged. Rows whose directory could
+ *   not be removed are kept for a later retry.
+ *
+ * Child sessions are intentionally not deleted here (we cannot map a pending
+ * row to a session reliably).
+ */
+export function recoverPendingProvisions(
+  db: SwarmBoardDB,
+  dataDir: string,
+  repoRoot: string,
+): number {
+  let pending: PendingProvisionRow[];
+  try {
+    pending = db.listPendingProvisions();
+  } catch (err) {
+    console.warn("[opencode-swarm] Failed to read pending workspace provisions:", err);
+    return 0;
+  }
+
+  let recovered = 0;
+  for (const row of pending) {
+    try {
+      if (!isStrictlyInside(dataDir, row.workspace_dir)) {
+        // Outside our data dir: never touch it. Drop the row so we do not
+        // retry forever; the directory is not ours to manage.
+        console.warn(
+          `[opencode-swarm] Pending provisioning for @${row.member_name} (${row.swarm_id}) points outside the data dir (${row.workspace_dir}); skipping removal and dropping journal row.`,
+        );
+        db.deletePendingProvision(row.id);
+        continue;
+      }
+
+      if (existsSync(row.workspace_dir)) {
+        rmSync(row.workspace_dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        if (existsSync(row.workspace_dir)) {
+          console.warn(
+            `[opencode-swarm] Pending workspace still exists after removal attempt: ${row.workspace_dir}; keeping journal row for retry.`,
+          );
+          continue;
+        }
+      }
+
+      if (
+        row.workspace_mode === "share" &&
+        row.workspace_branch &&
+        /^swarm\//.test(row.workspace_branch) &&
+        isGitRepo(repoRoot)
+      ) {
+        try {
+          runGit(["worktree", "prune", "--expire", "now"], repoRoot);
+        } catch {
+          // Best effort only.
+        }
+        try {
+          runGit(["branch", "-D", row.workspace_branch], repoRoot);
+        } catch {
+          // Branch may never have been created, or is already gone.
+        }
+      }
+
+      db.deletePendingProvision(row.id);
+      recovered++;
+    } catch (err) {
+      console.warn(
+        `[opencode-swarm] Failed to recover pending provision ${row.id} for @${row.member_name} (${row.workspace_dir}):`,
+        err,
+      );
+    }
+  }
+  return recovered;
 }

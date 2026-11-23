@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqliteDatabase, SwarmBoardDB } from "../src/db.js";
+import { recoverPendingProvisions } from "../src/workspace.js";
 
 describe("SwarmBoardDB & Crash Recovery", () => {
   test("same-session re-init after completion & startup crash recovery (Review 3 Tests 3 & 4)", async () => {
@@ -391,6 +392,118 @@ describe("SwarmBoardDB & Crash Recovery", () => {
         ...db.getPostsPage(secondSwarm.id, 0, 100).posts,
       ].filter((p) => p.body.includes("Recovered on plugin startup"));
       expect(recoveryPosts).toHaveLength(1);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("recoverPendingProvisions removes an orphaned workspace inside dataDir and deletes the journal row", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-recover-"));
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(join(dir, "board.db")), dir);
+      const ws = join(dir, "worktrees", "sw_x", "w1");
+      mkdirSync(ws, { recursive: true });
+      writeFileSync(join(ws, "marker.txt"), "orphan");
+
+      const rowId = db.insertPendingProvision({
+        swarmId: "sw_x",
+        memberName: "w1",
+        workspaceMode: "share",
+        workspaceDir: ws,
+        workspaceBranch: "swarm/sw_x/w1",
+      });
+      expect(existsSync(ws)).toBe(true);
+      expect(db.listPendingProvisions().map((r) => r.id)).toEqual([rowId]);
+
+      // repoRoot is not a git repo here, so branch cleanup is skipped safely.
+      const recovered = recoverPendingProvisions(db, dir, dir);
+      expect(recovered).toBe(1);
+      expect(existsSync(ws)).toBe(false);
+      expect(db.listPendingProvisions()).toEqual([]);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("recoverPendingProvisions never deletes a workspace outside dataDir and drops the journal row", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-recover-outside-"));
+    const outside = mkdtempSync(join(tmpdir(), "swarm-recover-sentinel-"));
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(join(dir, "board.db")), dir);
+      const sentinel = join(outside, "sentinel.txt");
+      writeFileSync(sentinel, "do not delete");
+
+      const rowId = db.insertPendingProvision({
+        swarmId: "sw_x",
+        memberName: "w_out",
+        workspaceMode: "branch",
+        workspaceDir: outside,
+        workspaceBranch: "swarm/sw_x/w_out",
+      });
+      expect(rowId).toBeGreaterThan(0);
+
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...parts: any[]) => {
+        warnings.push(parts.map(String).join(" "));
+      };
+      let recovered: number;
+      try {
+        recovered = recoverPendingProvisions(db, dir, dir);
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      // Policy: skip removal and drop the row (we do not retry foreign paths).
+      expect(recovered).toBe(0);
+      expect(existsSync(outside)).toBe(true);
+      expect(existsSync(sentinel)).toBe(true);
+      expect(readFileSync(sentinel, "utf8")).toBe("do not delete");
+      expect(db.listPendingProvisions()).toEqual([]);
+      expect(warnings.some((w) => w.includes("outside the data dir"))).toBe(true);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+      try {
+        rmSync(outside, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("recoverPendingProvisions is a no-op for an empty journal and tolerates a missing directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-recover-missing-"));
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(join(dir, "board.db")), dir);
+
+      // Empty journal: no-op, returns 0, never throws.
+      expect(() => recoverPendingProvisions(db, dir, dir)).not.toThrow();
+      expect(recoverPendingProvisions(db, dir, dir)).toBe(0);
+
+      // Row whose directory never materialized: row is cleaned up, no throw.
+      db.insertPendingProvision({
+        swarmId: "sw_x",
+        memberName: "w_missing",
+        workspaceMode: "branch",
+        workspaceDir: join(dir, "clones", "sw_x", "w_missing"),
+        workspaceBranch: "swarm/sw_x/w_missing",
+      });
+      let recovered = 0;
+      expect(() => {
+        recovered = recoverPendingProvisions(db, dir, dir);
+      }).not.toThrow();
+      expect(recovered).toBe(1);
+      expect(db.listPendingProvisions()).toEqual([]);
 
       db.close();
     } finally {

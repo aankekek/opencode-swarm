@@ -27,6 +27,16 @@ import { globsPotentiallyOverlap, normalizeHandle, validateAndNormalizeGlob } fr
  */
 const KILL_LOCK_GRACE_MS = 60_000;
 
+export interface PendingProvisionRow {
+  id: number;
+  swarm_id: string;
+  member_name: string;
+  workspace_mode: WorkspaceMode;
+  workspace_dir: string;
+  workspace_branch: string | null;
+  created_at: number;
+}
+
 export interface SqliteStmt {
   run(...params: unknown[]): { lastInsertRowid: number | bigint; changes: number };
   get(...params: unknown[]): unknown;
@@ -142,6 +152,16 @@ export class SwarmBoardDB {
         owner_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
         claimed_at INTEGER NOT NULL,
         UNIQUE(swarm_id, glob_pattern)
+      );
+
+      CREATE TABLE IF NOT EXISTS pending_provisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        swarm_id TEXT NOT NULL,
+        member_name TEXT NOT NULL,
+        workspace_mode TEXT NOT NULL,
+        workspace_dir TEXT NOT NULL,
+        workspace_branch TEXT,
+        created_at INTEGER NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_posts_swarm ON board_posts(swarm_id, swarm_seq);
@@ -876,6 +896,45 @@ export class SwarmBoardDB {
     } catch (err) {
       console.warn("[opencode-swarm] Failed to sync members.json:", err);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Pending workspace provisions (crash journal)
+  // -------------------------------------------------------------------------
+
+  insertPendingProvision(args: {
+    swarmId: string;
+    memberName: string;
+    workspaceMode: WorkspaceMode;
+    workspaceDir: string;
+    workspaceBranch?: string | null;
+  }): number {
+    const now = Date.now();
+    const res = this.db
+      .prepare(
+        `INSERT INTO pending_provisions (
+           swarm_id, member_name, workspace_mode, workspace_dir, workspace_branch, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        args.swarmId,
+        args.memberName,
+        args.workspaceMode,
+        args.workspaceDir,
+        args.workspaceBranch ?? null,
+        now,
+      );
+    return Number(res.lastInsertRowid);
+  }
+
+  deletePendingProvision(id: number): void {
+    this.db.prepare(`DELETE FROM pending_provisions WHERE id = ?`).run(id);
+  }
+
+  listPendingProvisions(): PendingProvisionRow[] {
+    return this.db
+      .prepare(`SELECT * FROM pending_provisions ORDER BY id ASC`)
+      .all() as unknown as PendingProvisionRow[];
   }
 
   private appendBoardJsonl(post: BoardPostRow) {

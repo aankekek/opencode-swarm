@@ -25,7 +25,7 @@ import type {
   WorkspaceMode,
 } from "./types.js";
 import { createWakeController, type WaiterEntry } from "./wake.js";
-import { cleanupMemberWorkspace, provisionMemberWorkspace } from "./workspace.js";
+import { cleanupMemberWorkspace, provisionedWorkspacePaths, provisionMemberWorkspace, recoverPendingProvisions } from "./workspace.js";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -183,6 +183,18 @@ export const swarmRuntimePlugin = Plugin.define({
       } catch {
         // Ignore if unsupported or sessionID not present
       }
+    }
+
+    // Recover workspaces that were provisioned but never recorded as members
+    // (crash between provisioning and insertMember). Runs after stale-swarm
+    // reconciliation so killed members are already marked. Never fatal.
+    try {
+      const recovered = recoverPendingProvisions(db, dataDir, canonicalWorkspaceRoot);
+      if (recovered > 0) {
+        console.warn(`[opencode-swarm] Recovered ${recovered} orphaned pending workspace provision(s) on startup.`);
+      }
+    } catch (err) {
+      console.warn("[opencode-swarm] Pending workspace recovery failed; continuing:", err);
     }
 
     // Bounded call-ID cache bridging tool.execute.before -> permission.evaluate
@@ -512,6 +524,7 @@ export const swarmRuntimePlugin = Plugin.define({
       let provisioned: { mode: WorkspaceMode; dir: string; branch: string | null } | undefined;
       let insertedMember: MemberRow | undefined;
       let childSessionId: string | undefined;
+      let pendingProvisionId: number | undefined;
 
       try {
         const existing = db.getMemberByName(args.swarmId, cleanName);
@@ -566,6 +579,22 @@ export const swarmRuntimePlugin = Plugin.define({
           if (typeof forkFn !== "function") {
             throw new Error(`ctx.session.fork is not available in this OpenCode runtime.`);
           }
+          if (wsMode !== "inherit") {
+            const paths = provisionedWorkspacePaths({
+              mode: wsMode,
+              repoRoot: canonicalWorkspaceRoot,
+              dataDir,
+              swarmId: args.swarmId,
+              memberName: cleanName,
+            });
+            pendingProvisionId = db.insertPendingProvision({
+              swarmId: args.swarmId,
+              memberName: cleanName,
+              workspaceMode: wsMode,
+              workspaceDir: paths.dir,
+              workspaceBranch: paths.branch,
+            });
+          }
           provisioned = provisionMemberWorkspace({
             mode: wsMode,
             repoRoot: canonicalWorkspaceRoot,
@@ -576,6 +605,22 @@ export const swarmRuntimePlugin = Plugin.define({
           const forked = await forkFn({ sessionID: forkTarget.session_id });
           childSessionId = forked.id;
         } else {
+          if (wsMode !== "inherit") {
+            const paths = provisionedWorkspacePaths({
+              mode: wsMode,
+              repoRoot: canonicalWorkspaceRoot,
+              dataDir,
+              swarmId: args.swarmId,
+              memberName: cleanName,
+            });
+            pendingProvisionId = db.insertPendingProvision({
+              swarmId: args.swarmId,
+              memberName: cleanName,
+              workspaceMode: wsMode,
+              workspaceDir: paths.dir,
+              workspaceBranch: paths.branch,
+            });
+          }
           provisioned = provisionMemberWorkspace({
             mode: wsMode,
             repoRoot: canonicalWorkspaceRoot,
@@ -618,6 +663,13 @@ export const swarmRuntimePlugin = Plugin.define({
           lastReadSeq: latestPost?.swarm_seq ?? 0,
           channels,
         });
+
+        // Member row now exists: the workspace is owned and must not be
+        // treated as an orphan by startup recovery.
+        if (pendingProvisionId !== undefined) {
+          db.deletePendingProvision(pendingProvisionId);
+          pendingProvisionId = undefined;
+        }
 
         if (ownedGlobs.length > 0) {
           const lockRes = db.claimLocksAtomic(args.swarmId, insertedMember.id, cleanName, ownedGlobs);
@@ -681,6 +733,15 @@ export const swarmRuntimePlugin = Plugin.define({
             repoRoot: canonicalWorkspaceRoot,
             deleteBranch: true,
           });
+        }
+        if (pendingProvisionId !== undefined) {
+          try {
+            db.deletePendingProvision(pendingProvisionId);
+          } catch {
+            // Journal row cleanup is best effort here; startup recovery is
+            // the backstop if this fails.
+          }
+          pendingProvisionId = undefined;
         }
         throw err;
       } finally {
