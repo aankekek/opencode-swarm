@@ -512,4 +512,159 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       } catch {}
     }
   });
+
+  test("reconcile reclaims a same-pid swarm owned by a previous instance (plugin reload)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-instance-reload-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm, coordinator } = db.createSwarmWithCoordinator({
+        title: "Reloaded Swarm",
+        objective: "Same-pid reload",
+        coordinatorSessionId: "coord_reload",
+        workspaceDir: dir,
+        ownerInstance: "A",
+      });
+      const claimed = db.claimLocksAtomic(swarm.id, coordinator.id, "coordinator", ["src/**"]);
+      expect(claimed.claimed).toEqual(["src/**"]);
+      expect(db.listLocks(swarm.id).length).toBe(1);
+
+      // A new plugin instance in the same process: same pid, new instance id.
+      const reconciled = db.reconcileStaleSwarmsOnStartup("B");
+
+      expect(reconciled.map((s) => s.id)).toEqual([swarm.id]);
+      expect(db.getSwarm(swarm.id)?.status).toBe("interrupted");
+      expect(db.listLocks(swarm.id)).toEqual([]);
+      expect(db.listMembers(swarm.id, false)).toEqual([]);
+      expect(db.getMemberById(coordinator.id)?.state).toBe("killed");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("reconcile leaves a swarm owned by the current instance untouched", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-instance-live-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(dbPath), dir);
+      const { swarm, coordinator } = db.createSwarmWithCoordinator({
+        title: "Live Swarm",
+        objective: "Same instance",
+        coordinatorSessionId: "coord_live",
+        workspaceDir: dir,
+        ownerInstance: "A",
+      });
+
+      const reconciled = db.reconcileStaleSwarmsOnStartup("A");
+
+      expect(reconciled).toEqual([]);
+      expect(db.getSwarm(swarm.id)?.status).toBe("running");
+      expect(db.getMemberById(coordinator.id)?.state).toBe("working");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("reconcile treats a legacy NULL-instance row owned by this pid as stale", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-instance-legacy-pid-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      // No ownerInstance -> legacy NULL row written with process.pid.
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Legacy Swarm",
+        objective: "Legacy row",
+        coordinatorSessionId: "coord_legacy",
+        workspaceDir: dir,
+      });
+      const legacy = db.getSwarm(swarm.id) as { owner_instance?: string | null } | undefined;
+      expect(legacy?.owner_instance ?? null).toBeNull();
+
+      const reconciled = db.reconcileStaleSwarmsOnStartup("B");
+
+      expect(reconciled.map((s) => s.id)).toEqual([swarm.id]);
+      expect(db.getSwarm(swarm.id)?.status).toBe("interrupted");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("reconcile without an instance id keeps the legacy pid-only behavior", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-instance-bwc-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const db = new SwarmBoardDB(await openSqliteDatabase(dbPath), dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Backwards Compat Swarm",
+        objective: "No instance arg",
+        coordinatorSessionId: "coord_bwc",
+        workspaceDir: dir,
+      });
+
+      // No currentInstance supplied: same-pid ownership is still considered live.
+      expect(db.reconcileStaleSwarmsOnStartup()).toEqual([]);
+      expect(db.getSwarm(swarm.id)?.status).toBe("running");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("schema migration adds owner_instance to a pre-existing swarms table", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-instance-migrate-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      // Simulate a database created before owner_instance existed.
+      sqlite.exec(`
+        CREATE TABLE swarms (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          objective TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'running',
+          owner_pid INTEGER,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          last_monitor_nudge_seq INTEGER NOT NULL DEFAULT 0,
+          monitor_nudge_count INTEGER NOT NULL DEFAULT 0
+        );
+      `);
+      expect(() => new SwarmBoardDB(sqlite, dir)).not.toThrow();
+
+      const columns = (sqlite.prepare(`PRAGMA table_info(swarms)`).all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      );
+      expect(columns).toContain("owner_instance");
+
+      // Legacy rows read as NULL and remain reconcilable by pid.
+      sqlite
+        .prepare(
+          `INSERT INTO swarms (id, title, objective, status, owner_pid, created_at, updated_at)
+           VALUES ('sw_legacy', 'Legacy', 'Legacy', 'running', 999999, 1, 1)`,
+        )
+        .run();
+      sqlite.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

@@ -71,6 +71,7 @@ export class SwarmBoardDB {
         objective TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'running',
         owner_pid INTEGER,
+        owner_instance TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         last_monitor_nudge_seq INTEGER NOT NULL DEFAULT 0,
@@ -176,6 +177,14 @@ export class SwarmBoardDB {
     } catch {
       // Column already exists
     }
+
+    // Safe migration for existing databases missing owner_instance. Legacy rows keep
+    // NULL; reconciliation falls back to pid liveness for those.
+    try {
+      this.db.exec("ALTER TABLE swarms ADD COLUMN owner_instance TEXT;");
+    } catch {
+      // Column already exists
+    }
   }
 
   close() {
@@ -210,7 +219,11 @@ export class SwarmBoardDB {
     coordinatorSessionId: string;
     workspaceDir: string;
     model?: ModelSelection;
+    /** Per-plugin-setup identity. Enables detecting same-process reloads. */
+    ownerInstance?: string;
   }): { swarm: SwarmRow; coordinator: MemberRow } {
+    // Keep the pid-only pass here: orphaned swarms in this process are handled by
+    // the caller's reclaim path, which knows about live coordinator/worker rows.
     this.reconcileStaleSwarmsOnStartup();
     const result = this.withImmediateTransaction(() => {
       const existingActive = this.getActiveMemberBySession(args.coordinatorSessionId);
@@ -231,10 +244,10 @@ export class SwarmBoardDB {
       const pid = process.pid;
       this.db
         .prepare(
-          `INSERT INTO swarms (id, title, objective, status, owner_pid, created_at, updated_at, last_monitor_nudge_seq, monitor_nudge_count)
-           VALUES (?, ?, ?, 'running', ?, ?, ?, 0, 0)`,
+          `INSERT INTO swarms (id, title, objective, status, owner_pid, owner_instance, created_at, updated_at, last_monitor_nudge_seq, monitor_nudge_count)
+           VALUES (?, ?, ?, 'running', ?, ?, ?, ?, 0, 0)`,
         )
-        .run(swarmId, args.title, args.objective, pid, now, now);
+        .run(swarmId, args.title, args.objective, pid, args.ownerInstance ?? null, now, now);
 
       this.db
         .prepare(
@@ -285,14 +298,42 @@ export class SwarmBoardDB {
     }
   }
 
-  reconcileStaleSwarmsOnStartup(): SwarmRow[] {
-    const active = this.getActiveSwarms();
+  /**
+   * Mark swarms abandoned by a previous plugin instance as interrupted.
+   *
+   * Ownership is identified by `owner_instance` when available. A bare pid is not
+   * enough: the same process can reload the plugin (same pid, new instance) and two
+   * different processes can share a pid over time (pid reuse). For legacy rows that
+   * predate `owner_instance` (NULL) we fall back to pid liveness, and additionally
+   * treat `owner_pid === process.pid` as stale because the previous plugin instance
+   * in this process is necessarily gone. Residual limitation for legacy NULL rows:
+   * another *live* process that reused a dead owner's pid is indistinguishable.
+   */
+  reconcileStaleSwarmsOnStartup(currentInstance?: string): SwarmRow[] {
+    type OwnedSwarmRow = SwarmRow & { owner_instance?: string | null };
+    const active = this.getActiveSwarms() as OwnedSwarmRow[];
     const stale: SwarmRow[] = [];
     const currentPid = process.pid;
 
     for (const swarm of active) {
-      // S2: If swarm is owned by this process or another live process, do not clobber it
-      if (swarm.owner_pid && (swarm.owner_pid === currentPid || this.isPidAlive(swarm.owner_pid))) {
+      if (currentInstance !== undefined) {
+        if (swarm.owner_instance) {
+          // Live swarm owned by this exact plugin instance; a different instance id
+          // (including a same-process reload) is always stale.
+          if (swarm.owner_instance === currentInstance) continue;
+        } else {
+          // Legacy row without an instance id. A matching pid means the old plugin
+          // instance in this process is gone (reload/duplicate load) -> stale.
+          // Otherwise keep the historical pid-liveness heuristic.
+          const ownedByThisProcess = swarm.owner_pid === currentPid;
+          const aliveForeignPid = !!swarm.owner_pid && this.isPidAlive(swarm.owner_pid);
+          if (!ownedByThisProcess && aliveForeignPid) continue;
+        }
+      } else if (
+        // S2: backwards-compatible pid-only behavior when no instance id is supplied.
+        swarm.owner_pid &&
+        (swarm.owner_pid === currentPid || this.isPidAlive(swarm.owner_pid))
+      ) {
         continue;
       }
 

@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin";
 
 type Context = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0];
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -155,6 +155,10 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     }
 
+    // One identity per plugin setup. A reload/duplicate load in the same process keeps
+    // the pid but gets a new instance id, letting startup reconciliation reclaim the
+    // previous instance's swarms instead of mistaking them for live.
+    const instanceId = randomUUID();
     const sqlite = await openSqliteDatabase(dbPath);
     const db = new SwarmBoardDB(sqlite, dataDir);
     let dbClosed = false;
@@ -162,7 +166,7 @@ export const swarmRuntimePlugin = Plugin.define({
 
     let reconciled: ReturnType<typeof db.reconcileStaleSwarmsOnStartup> = [];
     try {
-      reconciled = db.reconcileStaleSwarmsOnStartup();
+      reconciled = db.reconcileStaleSwarmsOnStartup(instanceId);
     } catch (err) {
       // Degrade gracefully: a failed reconcile must not prevent the plugin from loading.
       console.warn("[opencode-swarm] Startup stale-swarm reconciliation failed; continuing with degraded state:", err);
@@ -346,6 +350,7 @@ export const swarmRuntimePlugin = Plugin.define({
         coordinatorSessionId: sessionId,
         workspaceDir: canonicalWorkspaceRoot,
         model,
+        ownerInstance: instanceId,
       });
       emitSwarmChanged({ swarmId: created.swarm.id, reason: "swarm_created", summary: title });
       const changedModel =
@@ -977,6 +982,8 @@ export const swarmRuntimePlugin = Plugin.define({
           const cleanTitle = text.trim().split(/\r?\n/)[0]?.slice(0, 64) || "Swarm";
 
           // Clear stale rows owned by dead processes before touching coordinator state.
+          // Startup already reclaimed rows from a previous plugin instance; rows left
+          // here are handled by the orphan-reclaim path below, which checks liveness.
           db.reconcileStaleSwarmsOnStartup();
 
           try {
