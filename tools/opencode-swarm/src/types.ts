@@ -7,6 +7,7 @@ export type SwarmStatus = "running" | "completing" | "completed" | "interrupted"
 export type WorkspaceMode = "inherit" | "share" | "branch";
 export type WakeMode = "mentions" | "any";
 export type TrackStatus = "open" | "done";
+export type SwarmTaskStatus = "open" | "assigned" | "done";
 export type ShellPolicy = "deny" | "ask" | "allow";
 export type PermissionEffect = "allow" | "ask" | "deny";
 
@@ -111,6 +112,18 @@ export interface BoardPostRow {
   is_all: number;
   body: string;
   created_at: number;
+}
+
+export interface SwarmTaskRow {
+  id: number;
+  swarm_id: string;
+  seq: number;
+  label: string;
+  status: SwarmTaskStatus;
+  assignee_member_id: string | null;
+  assignee_name: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface FileLockRow {

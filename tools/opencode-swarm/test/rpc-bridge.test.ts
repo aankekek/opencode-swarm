@@ -330,6 +330,9 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
     expect(COORDINATOR_PROTOCOL).toMatch(/maxShardsPerAdd/);
     expect(COORDINATOR_PROTOCOL).toMatch(/do not retry blindly/i);
     expect(COORDINATOR_PROTOCOL).toMatch(/one worker per unit|one unit means one worker/i);
+    expect(COORDINATOR_PROTOCOL).toContain('swarm{action:"plan"');
+    expect(COORDINATOR_PROTOCOL).toMatch(/unassigned_units/);
+    expect(COORDINATOR_PROTOCOL).toMatch(/more than 2 units/i);
     expect(COORDINATOR_PROTOCOL.toLowerCase()).not.toContain("do not spawn a swarm");
     expect(COORDINATOR_PROTOCOL.match(/## Finish/g)).toHaveLength(1);
   });
@@ -346,6 +349,61 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
 
       const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
       expect(status.members.filter((m: { role: string }) => m.role === "worker")).toHaveLength(0);
+    });
+  });
+
+  test("plan records units, posts one board message, and rejects empty tasks", async () => {
+    await withBridgeHarness(async ({ registeredTools, registeredHandlers }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Planned Swarm" }, toolCtx);
+
+      const empty = parseToolResult(await swarmTool.execute({ action: "plan", tasks: [] }, toolCtx));
+      expect(empty.ok).toBe(false);
+      expect(String(empty.error)).toContain("non-empty");
+
+      const res = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["write parser", "add tests", "update docs"] }, toolCtx),
+      );
+      expect(res.ok).toBe(true);
+      expect(res.units).toBe(3);
+      expect(res.task_ids).toHaveLength(3);
+      expect(res.open_board).toBeDefined();
+
+      const snap = (await registeredHandlers.getSwarmSnapshot({ sessionId: "coord-sess-1" })) as {
+        swarm: { id: string };
+        board_posts: Array<{ seq: number; body: string; author_name: string }>;
+      };
+      const planPosts = snap.board_posts.filter((p) => p.body.includes("#plan "));
+      expect(planPosts).toHaveLength(1);
+      expect(planPosts[0].body).toContain("#plan Planned Swarm");
+      expect(planPosts[0].body).toContain("1. write parser");
+      expect(planPosts[0].body).toContain("2. add tests");
+      expect(planPosts[0].body).toContain("3. update docs");
+
+      // A second plan while units are still open replaces the open list.
+      const again = parseToolResult(await swarmTool.execute({ action: "plan", tasks: ["only"] }, toolCtx));
+      expect(again.ok).toBe(true);
+      expect(again.units).toBe(1);
+    });
+  });
+
+  test("plan is denied for non-coordinators", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const coordCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Plan Guard" }, coordCtx);
+      const add = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "worker-a", brief: "work" }, coordCtx),
+      );
+      expect(add.ok).toBe(true);
+      const workerCtx = { sessionID: add.spawned[0].session_id };
+
+      const res = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["a", "b"] }, workerCtx),
+      );
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toContain("Only @coordinator");
     });
   });
 

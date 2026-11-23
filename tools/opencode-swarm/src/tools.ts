@@ -76,14 +76,14 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
     tools.add({
       name: "swarm",
       description:
-        "Manage the swarm: status, models (list models + variants), add (spawn worker/group), model (live in-place model/variant switch), kill, title, channel, claim, complete.",
+        "Manage the swarm: status, models (list models + variants), plan (record the unit list), add (spawn worker/group), model (live in-place model/variant switch), kill, title, channel, claim, complete.",
       input: {
         type: "object",
         required: ["action"],
         properties: {
           action: {
             type: "string",
-            enum: ["status", "models", "add", "model", "kill", "title", "channel", "claim", "complete"],
+            enum: ["status", "models", "plan", "add", "model", "kill", "title", "channel", "claim", "complete"],
           },
           all: { type: "boolean", description: "For models: include disabled/deprecated models." },
           name: { type: "string", description: "Worker name for add, model, or kill." },
@@ -94,7 +94,16 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           workspace: { type: "string", enum: ["inherit", "share", "branch"] },
           fork: { type: "string", description: "Fork conversation history from member name or 'coordinator'." },
           n: { type: "number", description: "Spawn N homogeneous copies (<name>-1..<name>-N)." },
-          tasks: { type: "array", items: { type: "string" }, description: "Per-worker slice targets." },
+          tasks: {
+            type: "array",
+            items: { type: "string" },
+            description: "Per-worker slice targets, or the unit labels for action:'plan'.",
+          },
+          task_ids: {
+            type: "array",
+            items: { type: "number" },
+            description: "Unit ids from swarm{action:\"plan\"} to assign to this add.",
+          },
           channels: { type: "array", items: { type: "string" } },
           owned_globs: { type: "array", items: { type: "string" } },
           title: { type: "string", description: "Swarm title for action:'title'." },
@@ -131,6 +140,51 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           db.setSwarmTitle(swarmId, title);
           emitSwarmChanged({ swarmId, reason: "swarm_updated", summary: title });
           return toolJson({ ok: true, swarm_id: swarmId, title, open_board: deps.getBoardUrl() });
+        }
+
+        if (action === "plan") {
+          const rawTasks = Array.isArray(input.tasks) ? input.tasks : [];
+          const units = (rawTasks as unknown[])
+            .map((t) => String(t).trim())
+            .filter((t) => t.length > 0);
+          if (units.length === 0) {
+            return toolJson({ ok: false, error: "tasks must be a non-empty array of unit labels for action:'plan'." });
+          }
+          const { swarmId, coordinator } = await deps.ensureCoordinator(toolCtx.sessionID);
+          const caller = db.getActiveMemberBySession(toolCtx.sessionID) ?? coordinator;
+          if (caller.role !== "coordinator") {
+            return toolJson({ ok: false, error: "Only @coordinator may record the swarm plan." });
+          }
+          try {
+            const tasks = db.createPlan(swarmId, units);
+            const title = db.getSwarm(swarmId)?.title || swarmId;
+            const header = `#plan ${title}`;
+            let body = header;
+            for (const task of tasks) {
+              const label = task.label.length > 200 ? `${task.label.slice(0, 197)}...` : task.label;
+              const line = `\n${task.seq}. ${label}`;
+              if (body.length + line.length > 4000) break;
+              body += line;
+            }
+            db.addPost({
+              swarmId,
+              authorName: caller.name,
+              channel: "main",
+              mentions: [],
+              channelMentions: [],
+              isAll: false,
+              body,
+            });
+            emitSwarmChanged({ swarmId, reason: "board_post", summary: body });
+            return toolJson({
+              ok: true,
+              units: tasks.length,
+              task_ids: tasks.map((t) => t.id),
+              open_board: deps.getBoardUrl(),
+            });
+          } catch (err) {
+            return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
+          }
         }
 
         if (action === "status") {

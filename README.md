@@ -140,6 +140,7 @@ Do not call `complete` yourself from the coordinator unless the verifier has pos
 | `status` | Current swarm, members, models, workspaces, locks. |
 | `models` | Lists available `provider/model` entries and their `variants`. `all:true` includes disabled models. |
 | `add` | Spawns a worker/verifier/monitor/narrator. Needs `name` + `brief`. |
+| `plan` | Records the unit list; `add` assigns units and reports unassigned counts. |
 | `model` | Switches a member's model/variant in place, keeping history. |
 | `kill` | Stops a member you added. |
 | `title` | Renames the swarm (coordinator only). |

@@ -909,3 +909,93 @@ describe("SwarmBoardDB & Crash Recovery", () => {
     }
   });
 });
+
+describe("Swarm unit plan", () => {
+  test("createPlan inserts ordered rows, replaces open plans, and rejects invalid lists", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-plan-"));
+    try {
+      const sqlite = await openSqliteDatabase(join(dir, "board.db"));
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm, coordinator } = db.createSwarmWithCoordinator({
+        title: "Plan Swarm",
+        objective: "Record a plan",
+        coordinatorSessionId: "sess_plan_db",
+        workspaceDir: dir,
+      });
+
+      const tasks = db.createPlan(swarm.id, ["  alpha  ", "", "beta", "beta"]);
+      expect(tasks.map((t) => t.seq)).toEqual([1, 2, 3]);
+      expect(tasks.map((t) => t.label)).toEqual(["alpha", "beta", "beta"]);
+      expect(tasks.every((t) => t.status === "open")).toBe(true);
+
+      const replaced = db.createPlan(swarm.id, ["one", "two"]);
+      expect(replaced.map((t) => t.seq)).toEqual([1, 2]);
+      expect(db.listTasks(swarm.id).map((t) => t.label)).toEqual(["one", "two"]);
+
+      expect(() => db.createPlan(swarm.id, ["   "])).toThrow("At least one unit is required.");
+      expect(() =>
+        db.createPlan(
+          swarm.id,
+          Array.from({ length: 51 }, (_, i) => `unit-${i}`),
+        ),
+      ).toThrow("at most 50");
+
+      const assigned = db.assignTasks(swarm.id, coordinator.id, coordinator.name, [replaced[0].id]);
+      expect(assigned).toHaveLength(1);
+      expect(assigned[0].status).toBe("assigned");
+      expect(assigned[0].assignee_name).toBe(coordinator.name);
+
+      expect(() => db.createPlan(swarm.id, ["again"])).toThrow("already in progress");
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("assignTasks validates ids, getTaskCounts reports, and completeTasksForMember marks only its rows", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-plan-"));
+    try {
+      const sqlite = await openSqliteDatabase(join(dir, "board.db"));
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm, coordinator } = db.createSwarmWithCoordinator({
+        title: "Plan Counts",
+        objective: "Count plan units",
+        coordinatorSessionId: "sess_plan_counts",
+        workspaceDir: dir,
+      });
+      const worker = db.insertMember({
+        swarmId: swarm.id,
+        name: "worker-a",
+        sessionId: "sess_plan_worker",
+        role: "worker",
+        addedBy: coordinator.name,
+        workspaceMode: "inherit",
+        workspaceDir: dir,
+        brief: "work",
+      });
+
+      const [t1, t2, t3] = db.createPlan(swarm.id, ["a", "b", "c"]);
+      expect(db.getTaskCounts(swarm.id)).toEqual({ total: 3, open: 3, assigned: 0, done: 0 });
+
+      expect(() => db.assignTasks(swarm.id, worker.id, worker.name, [9999])).toThrow("does not exist");
+      expect(() => db.assignTasks(swarm.id, worker.id, worker.name, [t1.id, 999999])).toThrow("does not exist");
+
+      db.assignTasks(swarm.id, worker.id, worker.name, [t1.id, t2.id]);
+      expect(db.getTaskCounts(swarm.id)).toEqual({ total: 3, open: 1, assigned: 2, done: 0 });
+      expect(() => db.assignTasks(swarm.id, worker.id, worker.name, [t1.id])).toThrow("already assigned");
+
+      expect(db.completeTasksForMember(worker.id)).toBe(2);
+      expect(db.getTaskCounts(swarm.id)).toEqual({ total: 3, open: 1, assigned: 0, done: 2 });
+      expect(db.listTasks(swarm.id).find((t) => t.id === t3.id)?.status).toBe("open");
+      expect(db.completeTasksForMember(worker.id)).toBe(0);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+});

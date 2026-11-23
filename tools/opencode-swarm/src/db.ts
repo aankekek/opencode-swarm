@@ -11,6 +11,7 @@ import type {
   ModelSelection,
   SwarmRow,
   SwarmStatus,
+  SwarmTaskRow,
   TrackStatus,
   WakeMode,
   WorkspaceMode,
@@ -199,10 +200,24 @@ export class SwarmBoardDB {
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS swarm_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        swarm_id TEXT NOT NULL REFERENCES swarms(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        assignee_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        assignee_name TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(swarm_id, seq)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_posts_swarm ON board_posts(swarm_id, swarm_seq);
       CREATE INDEX IF NOT EXISTS idx_members_swarm ON members(swarm_id, state);
       CREATE INDEX IF NOT EXISTS idx_members_session ON members(session_id);
       CREATE INDEX IF NOT EXISTS idx_locks_swarm ON file_locks(swarm_id, owner_member_id);
+      CREATE INDEX IF NOT EXISTS idx_swarm_tasks_swarm ON swarm_tasks(swarm_id, status);
     `);
 
     // Safe migration for existing databases missing owner_pid
@@ -1067,6 +1082,100 @@ export class SwarmBoardDB {
     return this.db
       .prepare(`SELECT * FROM pending_provisions ORDER BY id ASC`)
       .all() as unknown as PendingProvisionRow[];
+  }
+
+  // -------------------------------------------------------------------------
+  // Swarm unit plan
+  // -------------------------------------------------------------------------
+
+  createPlan(swarmId: string, labels: string[]): SwarmTaskRow[] {
+    const cleaned = labels.map((label) => String(label).trim()).filter((label) => label.length > 0);
+    if (cleaned.length === 0) throw new Error("At least one unit is required.");
+    if (cleaned.length > 50) throw new Error("A plan may contain at most 50 units.");
+
+    return this.withImmediateTransaction(() => {
+      const progress = this.db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM swarm_tasks WHERE swarm_id = ? AND status != 'open'`,
+        )
+        .get(swarmId) as { c: number };
+      if (Number(progress.c) > 0) {
+        throw new Error("A plan is already in progress for this swarm.");
+      }
+      this.db.prepare(`DELETE FROM swarm_tasks WHERE swarm_id = ? AND status = 'open'`).run(swarmId);
+
+      const now = Date.now();
+      const insert = this.db.prepare(
+        `INSERT INTO swarm_tasks (swarm_id, seq, label, status, created_at, updated_at)
+         VALUES (?, ?, ?, 'open', ?, ?)`,
+      );
+      for (let i = 0; i < cleaned.length; i++) {
+        insert.run(swarmId, i + 1, cleaned[i], now, now);
+      }
+      return this.listTasks(swarmId);
+    });
+  }
+
+  listTasks(swarmId: string): SwarmTaskRow[] {
+    return this.db
+      .prepare(`SELECT * FROM swarm_tasks WHERE swarm_id = ? ORDER BY seq ASC`)
+      .all(swarmId) as unknown as SwarmTaskRow[];
+  }
+
+  getTaskCounts(swarmId: string): { total: number; open: number; assigned: number; done: number } {
+    const rows = this.db
+      .prepare(`SELECT status, COUNT(*) AS c FROM swarm_tasks WHERE swarm_id = ? GROUP BY status`)
+      .all(swarmId) as unknown as Array<{ status: string; c: number }>;
+    const counts = { total: 0, open: 0, assigned: 0, done: 0 };
+    for (const row of rows) {
+      const n = Number(row.c);
+      counts.total += n;
+      if (row.status === "open" || row.status === "assigned" || row.status === "done") {
+        counts[row.status] += n;
+      }
+    }
+    return counts;
+  }
+
+  assignTasks(
+    swarmId: string,
+    memberId: string,
+    memberName: string,
+    taskIds: number[],
+  ): SwarmTaskRow[] {
+    const ids = Array.from(new Set(taskIds.map((id) => Number(id))));
+    if (ids.length === 0) throw new Error("At least one task id is required.");
+
+    return this.withImmediateTransaction(() => {
+      const now = Date.now();
+      const update = this.db.prepare(
+        `UPDATE swarm_tasks
+           SET status = 'assigned', assignee_member_id = ?, assignee_name = ?, updated_at = ?
+         WHERE swarm_id = ? AND id = ? AND status = 'open'`,
+      );
+      for (const id of ids) {
+        const row = this.db
+          .prepare(`SELECT * FROM swarm_tasks WHERE id = ?`)
+          .get(id) as SwarmTaskRow | undefined;
+        if (!row) throw new Error(`Task ${id} does not exist.`);
+        if (row.swarm_id !== swarmId) throw new Error(`Task ${id} does not belong to this swarm.`);
+        if (row.status !== "open") throw new Error(`Task ${id} is already ${row.status}.`);
+        update.run(memberId, memberName, now, swarmId, id);
+      }
+      return ids
+        .map((id) => this.db.prepare(`SELECT * FROM swarm_tasks WHERE id = ?`).get(id) as SwarmTaskRow)
+        .sort((a, b) => a.seq - b.seq);
+    });
+  }
+
+  completeTasksForMember(memberId: string): number {
+    const res = this.db
+      .prepare(
+        `UPDATE swarm_tasks SET status = 'done', updated_at = ?
+         WHERE assignee_member_id = ? AND status != 'done'`,
+      )
+      .run(Date.now(), memberId);
+    return Number(res.changes);
   }
 
   private appendBoardJsonl(post: BoardPostRow) {
