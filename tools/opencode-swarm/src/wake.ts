@@ -82,15 +82,26 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     if (waiter) {
       const matched = checkPendingWakePosts(db, member, waiter.sinceSeq, waiter.mentionsOnly);
       if (matched.length > 0) {
-        waiters.delete(member.id);
-        db.setMemberState(member.id, "working");
         const maxMatchedSeq = matched[matched.length - 1].swarm_seq;
-        recordWakeSeq(member.id, maxMatchedSeq);
-        if (!waiter.mentionsOnly) {
-          db.advanceReadCursor(member.id, maxMatchedSeq);
+        // Resolving must be unconditional: a fallible DB/emit call below must never
+        // leave the promise parked after the entry is removed from the map.
+        try {
+          db.setMemberState(member.id, "working");
+          recordWakeSeq(member.id, maxMatchedSeq);
+          if (!waiter.mentionsOnly) {
+            db.advanceReadCursor(member.id, maxMatchedSeq);
+          }
+          emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+        } catch (err) {
+          // Best-effort bookkeeping: the wake still delivers the matched posts.
+          console.warn(
+            `[opencode-swarm] wake bookkeeping failed for @${member.name}:`,
+            err instanceof Error ? err.message : String(err),
+          );
+        } finally {
+          waiters.delete(member.id);
+          waiter.resolve({ posts: matched });
         }
-        emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-        waiter.resolve({ posts: matched });
         return;
       }
       // If the waiter did not match the trigger post (e.g. unsubscribed channel or not mentioned),
@@ -295,14 +306,26 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
         : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
 
     if (coordWaiter) {
-      waiters.delete(coord.id);
-      const unread = db
-        .getPostsPage(swarmId, coordWaiter.sinceSeq, 50, "*")
-        .posts.filter((p) => p.author_name !== coord.name);
-      const posts = unread.length > 0 ? unread : [latestPost];
-      recordWakeSeq(coord.id, latestPost.swarm_seq);
-      db.advanceReadCursor(coord.id, latestPost.swarm_seq);
-      coordWaiter.resolve({ posts, handoff: handoffText });
+      let posts: BoardPostRow[] = [latestPost];
+      // Resolving must be unconditional: if the read cursor or posts query throws,
+      // still hand off with the best payload available instead of orphaning the wait.
+      try {
+        const unread = db
+          .getPostsPage(swarmId, coordWaiter.sinceSeq, 50, "*")
+          .posts.filter((p) => p.author_name !== coord.name);
+        if (unread.length > 0) posts = unread;
+        recordWakeSeq(coord.id, latestPost.swarm_seq);
+        db.advanceReadCursor(coord.id, latestPost.swarm_seq);
+      } catch (err) {
+        // Best-effort bookkeeping: the handoff still reaches the coordinator.
+        console.warn(
+          `[opencode-swarm] coordinator wake bookkeeping failed for @${coord.name}:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      } finally {
+        waiters.delete(coord.id);
+        coordWaiter.resolve({ posts, handoff: handoffText });
+      }
       return;
     }
 

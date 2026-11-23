@@ -933,4 +933,60 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       } catch {}
     }
   });
+
+  test("session.deleted settles a member parked in swarm_wait instead of hanging forever", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-deleted-waiter-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const stream = createEventStream();
+    const { ctx, tools, commands } = createMockContext(repoDir, dbPath, {}, () => stream);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      await commands.get("swarm").execute({
+        sessionID: "sess_coord",
+        prompt: "Deleted waiter test",
+        delivery: "queue",
+      });
+
+      const addRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "w1", brief: "work", workspace: "inherit" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(addRes.ok).toBe(true);
+      const workerSession = addRes.spawned[0].session_id;
+
+      // Park the worker in swarm_wait on a sequence that never arrives, so the
+      // tool only settles if the session.deleted handler aborts the waiter.
+      const waitTool = tools.get("swarm_wait");
+      const waitPromise = waitTool.execute({ since: 9999 }, { sessionID: workerSession });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+
+      stream.push({ type: "session.deleted", data: { sessionID: workerSession } });
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        waitPromise,
+        new Promise<never>((_, rejectWait) => {
+          timer = setTimeout(() => rejectWait(new Error("swarm_wait did not settle after session.deleted")), 2000);
+        }),
+      ]);
+      clearTimeout(timer);
+
+      const result = JSON.parse(settled.content);
+      expect(result.aborted).toBe(true);
+      expect(result.woken).toBe(false);
+      stream.end();
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

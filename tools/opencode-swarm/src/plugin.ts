@@ -1253,6 +1253,7 @@ export const swarmRuntimePlugin = Plugin.define({
                 db.incrementMemberSteps(member.id, `Running ${toolLabel}`, "tool");
               } else if (eventType === "session.deleted") {
                 db.setMemberState(member.id, "killed");
+                resolveWaiterAborted(member.id);
                 db.releaseLocksForMember(member.id);
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
               }
