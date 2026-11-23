@@ -330,6 +330,11 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
     expect(COORDINATOR_PROTOCOL).toMatch(/maxShardsPerAdd/);
     expect(COORDINATOR_PROTOCOL).toMatch(/do not retry blindly/i);
     expect(COORDINATOR_PROTOCOL).toMatch(/one worker per unit|one unit means one worker/i);
+    const perUnitRule = COORDINATOR_PROTOCOL.split("\n").find((line) => line.startsWith("3. 2-8 units"));
+    expect(perUnitRule).toBeDefined();
+    expect(perUnitRule).toContain("one worker per unit");
+    expect(perUnitRule).toMatch(/maxWorkers/);
+    expect(COORDINATOR_PROTOCOL).not.toMatch(/\uFFFD/);
     expect(COORDINATOR_PROTOCOL).toContain('swarm{action:"plan"');
     expect(COORDINATOR_PROTOCOL).toMatch(/unassigned_units/);
     expect(COORDINATOR_PROTOCOL).toMatch(/more than 2 units/i);
