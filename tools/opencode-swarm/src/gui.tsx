@@ -30,6 +30,7 @@ import {
   DEFAULT_SWARM_SETTINGS,
   normalizeSwarmList,
   normalizeSwarmSnapshot,
+  snapshotSignature,
   SWARM_SETTINGS_PAGE_ID,
   SwarmSettingsSchema,
   type SwarmSettings,
@@ -163,10 +164,12 @@ export default Plugin.define({
     let refreshSeq = 0;
     let lastDir: string | undefined;
     let lastSessionId: string | null = null;
+    let lastSnapshotSignature = snapshotSignature(null);
 
     const currentSessionId = () => ctx.sessions.current()?.id ?? null;
-    const activeForThisSession = () =>
-      rpcStatus().state === "connected" && sessionSwarmId() !== null;
+    // Tab existence depends only on the session's summon evidence. RPC transport
+    // failures must surface inside the panel (rpcError), never by unmounting the tab.
+    const activeForThisSession = () => sessionSwarmId() !== null;
     const currentDirectory = () => ctx.sessions.current()?.location?.directory ?? mountedDirectory();
     const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
     const getCallOptions = (timeoutMs = 8000) => {
@@ -258,20 +261,28 @@ export default Plugin.define({
           typeof (rawSnap as { boardUrl?: unknown }).boardUrl === "string" &&
           (rawSnap as { boardUrl: string }).boardUrl
         ) {
+          // Sticky within a session: never clear to "" from a poll, otherwise the
+          // empty `iframeSrc` unmounts the board iframe and the next tick reloads it.
           setBoardUrl((rawSnap as { boardUrl: string }).boardUrl);
-        } else {
-          setBoardUrl("");
         }
         const snap = normalizeSwarmSnapshot(rawSnap);
-        setSnapshot(snap);
+        const sig = snapshotSignature(snap);
+        if (sig !== lastSnapshotSignature) {
+          lastSnapshotSignature = sig;
+          setSnapshot(snap);
+        }
         // Sticky summon evidence for the session: any non-null session-resolved
         // snapshot means this session is a member of a swarm, whatever its status
         // (running, completing, completed, interrupted). A pinned (history) fetch
-        // must not clear or overwrite it.
-        if (viaSession) {
-          setSessionSwarmId(snap ? snap.swarmId : null);
+        // must not clear or overwrite it, and a poll never writes null here — only
+        // the session-change effect clears it.
+        if (viaSession && snap) {
+          setSessionSwarmId(snap.swarmId);
         }
-        setRpcStatus({ state: "connected" });
+        const currentRpc = rpcStatus();
+        if (currentRpc.state !== "connected") {
+          setRpcStatus({ state: "connected" });
+        }
         void rpc
           .getRoleConfig(pinnedId ? { swarmId: pinnedId } : sid ? { sessionId: sid } : {}, opts)
           .then((rawCfg) => {
@@ -290,11 +301,17 @@ export default Plugin.define({
         if (mySeq !== refreshSeq) return;
         const isUnavailable =
           typeof err === "object" && err !== null && "type" in err && (err as { type?: string }).type === "rpc.unavailable";
-        setRpcStatus(
-          isUnavailable
-            ? { state: "unavailable" }
-            : { state: "error", message: err instanceof Error ? err.message : String(err) }
-        );
+        const nextStatus: SwarmRpcStatus = isUnavailable
+          ? { state: "unavailable" }
+          : { state: "error", message: err instanceof Error ? err.message : String(err) };
+        const currentRpc = rpcStatus();
+        const sameStatus =
+          currentRpc.state === nextStatus.state &&
+          (nextStatus.state !== "error" ||
+            currentRpc.message === (nextStatus as { message?: string }).message);
+        if (!sameStatus) {
+          setRpcStatus(nextStatus);
+        }
       }
     };
 
@@ -303,12 +320,13 @@ export default Plugin.define({
       const sessionId = currentSessionId();
       void ctx.sessions.current()?.pending;
       selectedSwarmId();
-      if (dir !== lastDir || sessionId !== lastSessionId) {
-        lastDir = dir;
+      if (dir !== lastDir) lastDir = dir;
+      if (sessionId !== lastSessionId) {
         lastSessionId = sessionId;
         setUserPinnedSwarmId(null);
         setSelectedSwarmId(null);
         setSnapshot(null);
+        lastSnapshotSignature = snapshotSignature(null);
         setSessionSwarmId(null);
         setBoardUrl("");
         setSwarms([]);

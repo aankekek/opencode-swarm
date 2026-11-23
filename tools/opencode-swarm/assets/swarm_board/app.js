@@ -46,8 +46,8 @@
   if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 
   const params = new URLSearchParams(location.search);
-  const initialTab = params.get('tab');
-  const urlTabChosen = !!(initialTab && document.querySelector(`.tab[data-tab="${CSS.escape(initialTab)}"]`));
+  let initialTab = params.get('tab');
+  let urlTabChosen = !!(initialTab && document.querySelector(`.tab[data-tab="${CSS.escape(initialTab)}"]`));
   const currentConv = () => window.sidecar?.conversationId || params.get('conversationId') || '';
 
   // GET routes bypass token auth, so plain fetch works both in the iframe and standalone.

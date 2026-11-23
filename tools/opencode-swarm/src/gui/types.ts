@@ -93,6 +93,29 @@ export interface SwarmSnapshot {
   handoffs?: SwarmHandoff[];
 }
 
+/**
+ * Stable, cheap signature of everything the GUI derives from a snapshot.
+ * Used to skip redundant `setSnapshot` writes on each poll so the snapshot
+ * object identity stays put and `iframeSrc` never recomputes spuriously.
+ */
+export function snapshotSignature(snap: SwarmSnapshot | null): string {
+  if (!snap) return "";
+  const lastPostId = snap.posts.length > 0 ? String(snap.posts[snap.posts.length - 1]?.id ?? "") : "";
+  const members = snap.members
+    .map((m) => `${m.handle}:${m.state}:${m.trackStatus ?? ""}`)
+    .join("|");
+  return [
+    snap.swarmId,
+    snap.status,
+    snap.boardUrl ?? "",
+    snap.stalled ? "1" : "0",
+    snap.verifierStatus ?? "",
+    String(snap.posts.length),
+    lastPostId,
+    members,
+  ].join("\u0000");
+}
+
 export function unwrapRpcOutput<T>(res: unknown): T | null {
   if (!res || typeof res !== "object") return null;
   if ("output" in res) {
