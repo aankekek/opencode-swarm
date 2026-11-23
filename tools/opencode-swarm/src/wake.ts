@@ -49,6 +49,9 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
   const lastWakeSeq = new Map<string, number>();
   const autoVerifierSpawnAttempts = new Map<string, number>();
   const lastVerificationRequestSeq = new Map<string, number>();
+  // Per-swarm in-flight marker so overlapping callers cannot both post [verify]
+  // for the same latest post while the first request is still being delivered.
+  const verificationRequestsInFlight = new Set<string>();
 
   function getLastWakeSeq(memberId: string): number {
     return lastWakeSeq.get(memberId) ?? 0;
@@ -71,6 +74,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     lastWakeSeq.clear();
     autoVerifierSpawnAttempts.clear();
     lastVerificationRequestSeq.clear();
+    verificationRequestsInFlight.clear();
   }
 
   async function wakeMember(member: MemberRow, triggerPost: BoardPostRow): Promise<void> {
@@ -212,6 +216,8 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     if (fresh.paused_quota === 1 || fresh.state === "stopped" || fresh.state === "killed") return "unavailable";
     if (waiters.has(fresh.id)) return "in_progress";
     if (lastVerificationRequestSeq.get(swarmId) === latestPost.swarm_seq) return "in_progress";
+    if (verificationRequestsInFlight.has(swarmId)) return "in_progress";
+    verificationRequestsInFlight.add(swarmId);
     try {
       await postToBoard(
         swarmId,
@@ -225,6 +231,8 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     } catch (err) {
       console.warn("[opencode-swarm] verification request failed:", err instanceof Error ? err.message : String(err));
       return "unavailable";
+    } finally {
+      verificationRequestsInFlight.delete(swarmId);
     }
   }
 

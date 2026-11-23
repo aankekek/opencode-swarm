@@ -177,3 +177,77 @@ describe("wake controller settles parked waiters even when DB work throws", () =
     expect(resolved[0].handoff).toBeDefined();
   });
 });
+
+describe("verification requests are serialized per swarm", () => {
+  test("concurrent ensureVerifierForCompletedWork posts [verify] exactly once", async () => {
+    const coord = makeMember({
+      id: "m_coord",
+      name: "coordinator",
+      role: "coordinator",
+      session_id: "sess_coord",
+    });
+    // Stub deliberately keeps the verifier in "waiting": member-state writes are
+    // not persisted, so both overlapping calls reach the dedupe guards instead of
+    // short-circuiting on the transient "working" state.
+    const verifier = makeMember({
+      id: "m_ver",
+      name: "verifier",
+      role: "verifier",
+      session_id: "sess_ver",
+      wake_mode: "any",
+      state: "waiting",
+    });
+    const latestPost = makePost({ author_name: "worker1", swarm_seq: 5 });
+    const addedPosts: Array<{ body: string; swarm_seq: number }> = [];
+
+    const dbStub = {
+      getSwarm: () => ({ id: "sw1", status: "running" }),
+      getMemberById: (id: string) => (id === coord.id ? coord : verifier),
+      getMemberByName: (_swarmId: string, name: string) =>
+        name === coord.name ? coord : name === verifier.name ? verifier : undefined,
+      getMemberChannels: () => ["main"],
+      getChannel: () => ({ id: "ch_main", swarm_id: "sw1", name: "main", archived: 0 }),
+      listMembers: () => [coord, verifier],
+      getLatestPost: () => latestPost,
+      getPostsPage: () => ({
+        posts: [makePost({ author_name: "coordinator", swarm_seq: 6, body: "@verifier [verify]" })],
+        hasMore: false,
+      }),
+      setMemberState: () => {},
+      advanceReadCursor: () => {},
+      addPost: (args: { body: string }) => {
+        const post = makePost({ author_name: "coordinator", swarm_seq: 6, body: args.body });
+        addedPosts.push({ body: post.body, swarm_seq: post.swarm_seq });
+        return post;
+      },
+    };
+
+    const controller = createWakeController({
+      db: dbStub as unknown as SwarmBoardDB,
+      getAutoSpawnVerifier: () => true,
+      waiters: new Map<string, WaiterEntry>(),
+      // Delay inside postToBoard's wake delivery keeps the request in flight.
+      promptSession: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      },
+      emitSwarmChanged: () => {},
+      spawnVerifier: async () => undefined,
+    });
+
+    const outcomes = await Promise.all([
+      controller.ensureVerifierForCompletedWork("sw1", coord, latestPost),
+      controller.ensureVerifierForCompletedWork("sw1", coord, latestPost),
+    ]);
+
+    expect(addedPosts.filter((p) => p.body.includes("[verify]"))).toHaveLength(1);
+    expect(outcomes.filter((o) => o === "requested")).toHaveLength(1);
+    expect(outcomes.filter((o) => o === "in_progress")).toHaveLength(1);
+    expect(outcomes.sort()).toEqual(["in_progress", "requested"]);
+
+    // The seq guard still suppresses a later request for the same post.
+    await expect(controller.ensureVerifierForCompletedWork("sw1", coord, latestPost)).resolves.toBe(
+      "in_progress",
+    );
+    expect(addedPosts.filter((p) => p.body.includes("[verify]"))).toHaveLength(1);
+  });
+});
