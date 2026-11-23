@@ -30,6 +30,23 @@ export const DEFAULT_SWARM_SETTINGS: SwarmSettings = {
   onboardingComplete: false,
 };
 
+/**
+ * Run `fn` only when an async response still belongs to the latest request.
+ *
+ * Returns `false` (and never calls `fn`) when `requestSeq` is stale, otherwise
+ * calls `fn` and returns `true`. Exceptions from `fn` propagate unchanged: this
+ * is a guard, not an error boundary, so the caller's `catch` still sees them.
+ */
+export function applyIfCurrent(
+  requestSeq: number,
+  currentSeq: number,
+  fn: () => void
+): boolean {
+  if (requestSeq !== currentSeq) return false;
+  fn();
+  return true;
+}
+
 export interface SwarmSummary {
   id: string;
   title: string;

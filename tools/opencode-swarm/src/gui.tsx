@@ -27,6 +27,7 @@ import { SwarmOnboardingModal } from "./gui/SwarmOnboardingModal.js";
 import { SwarmSettingsView, type SwarmRpcStatus } from "./gui/SwarmSettingsView.js";
 import { SwarmUninstallModal } from "./gui/SwarmUninstallModal.js";
 import {
+  applyIfCurrent,
   DEFAULT_SWARM_SETTINGS,
   normalizeSwarmList,
   normalizeSwarmSnapshot,
@@ -286,12 +287,14 @@ export default Plugin.define({
         void rpc
           .getRoleConfig(pinnedId ? { swarmId: pinnedId } : sid ? { sessionId: sid } : {}, opts)
           .then((rawCfg) => {
-            const cfg = (rawCfg && typeof rawCfg === "object" && "output" in rawCfg
-              ? (rawCfg as { output?: SwarmRoleConfig }).output
-              : rawCfg) as SwarmRoleConfig | undefined;
-            if (typeof cfg?.autoSpawnVerifier === "boolean") {
-              setAutoSpawnVerifier(cfg.autoSpawnVerifier);
-            }
+            applyIfCurrent(mySeq, refreshSeq, () => {
+              const cfg = (rawCfg && typeof rawCfg === "object" && "output" in rawCfg
+                ? (rawCfg as { output?: SwarmRoleConfig }).output
+                : rawCfg) as SwarmRoleConfig | undefined;
+              if (typeof cfg?.autoSpawnVerifier === "boolean") {
+                setAutoSpawnVerifier(cfg.autoSpawnVerifier);
+              }
+            });
           })
           .catch(() => {});
         if (snap) {
