@@ -1,7 +1,51 @@
 # opencode-swarm
 
-Swarm runtime plugin (see root README for full docs).
+The runtime package behind this repo's swarm mode: four tools (`swarm`, `post_message`, `read_board`, `swarm_wait`), a SQLite board, Git worktree/clone isolation, a stall monitor, slash commands, and the OpenCode Desktop GUI bundle.
 
-## Config
+Start at the [root README](../../README.md) for what a swarm is and how to use one. For install options and per-OS paths, see [docs/INSTALL.md](../../docs/INSTALL.md).
 
-- `autoSpawnVerifier` (default `true`): when all worker tracks are done and no verification ran, auto-spawn a `verifier` (or send one `[verify]` request to the idle verifier) before any coordinator `complete` handoff. Set `options.autoSpawnVerifier = false` to disable.
+## What's here
+
+| Path | Purpose |
+| --- | --- |
+| `index.ts` | Plugin entry point. |
+| `src/tools.ts` | The four tools and their actions. |
+| `src/plugin.ts` | Lifecycle, slash commands, startup recovery, data paths. |
+| `src/workspace.ts` | Worktree (`share`) and clone (`branch`) provisioning. |
+| `src/board-server.ts` | Local board HTTP server on `127.0.0.1` with a bearer token. |
+| `src/db.ts` | SQLite schema, locks, mirrors. |
+| `src/gui.tsx`, `src/gui/` | Desktop surfaces; built to `dist/gui-experimental.cjs`. |
+
+## Options
+
+Set these under the plugin entry's `options` in `opencode.json` / `opencode.jsonc`.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `stallTimeoutMs` | `180000` | Idle time before a stall nudge. |
+| `monitorIntervalMs` | `30000` | Monitor check interval. |
+| `allowCoordinatorEdits` | `false` | Allow coordinator file edits. |
+| `overrideShellAllow` | `true` | Coordinator shell resolves to `allow` unless overridden. |
+| `coordinatorShellPolicy` | `"allow"` or `"ask"` | Explicit coordinator shell policy. |
+| `workerShellPolicy` | `"ask"` | Worker shell policy; `"deny"` is safer without isolated workspaces. |
+| `verifierShellPolicy` | `"ask"` | Verifier shell policy; `"deny"` keeps it read-only. |
+| `roleModels` | `{}` | Per-role `provider/model#variant` defaults. |
+| `boardServer` | `true` | Serve the board UI. |
+| `boardPort` | `0` | Board port; `0` = ephemeral. |
+| `dbPath` | unset | Explicit SQLite path. |
+| `autoSpawnVerifier` | `true` | Spawn/wake a verifier when worker tracks finish. |
+| `debugEvents` | `false` | Log events to `events.debug.jsonl`. |
+| `debugHooks` | `false` | Log hooks to `hooks.debug.jsonl`. |
+
+## Scripts
+
+| Script | Does |
+| --- | --- |
+| `bun run typecheck` | `tsc --noEmit`. |
+| `bun test` | Bun test suite. |
+| `bun run build:gui` | Builds `dist/gui-experimental.cjs`. |
+| `bun run install:plugin` | Installs deps, builds if needed, registers the global config. |
+| `bun run uninstall:dry-run` | Lists what uninstall would remove. |
+| `bun run uninstall` | Removes registration, workspaces, runtime data, artifacts. |
+
+The GUI bundle is **committed**. Editing anything under `src/gui.tsx` or `src/gui/` changes nothing in the running app until you run `bun run build:gui` and restart OpenCode Desktop.
