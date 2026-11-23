@@ -296,7 +296,88 @@ describe("board-server", () => {
         expect(res.status).toBe(200);
         expect(res.headers.get("content-type")).toContain(expectedType);
         expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+        expect(res.headers.get("referrer-policy")).toBe("no-referrer");
       }
+    } finally {
+      await handle.close();
+      sqlite.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("sets Referrer-Policy: no-referrer on JSON and auth failures, and validates role-model writes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-board-refpol-"));
+    const { sqlite, deps } = await createTestDeps(dir);
+    const roleModels: Record<string, string> = {};
+    const written: Array<{ role: string; spec: string }> = [];
+    deps.setRoleModelDefault = (role, spec) => {
+      written.push({ role, spec });
+      roleModels[role] = spec;
+    };
+    deps.getRoleModelDefaults = () => roleModels;
+    const handle = await startBoardServer(deps, 0);
+    const base = `http://127.0.0.1:${handle.port}`;
+    const auth = { "Authorization": `Bearer ${handle.token}`, "Content-Type": "application/json" };
+    try {
+      // Authorized JSON response
+      const json = await fetch(`${base}/api/swarm`, { headers: { Authorization: `Bearer ${handle.token}` } });
+      expect(json.status).toBe(200);
+      expect(json.headers.get("referrer-policy")).toBe("no-referrer");
+
+      // Unauthorized 401
+      const denied = await fetch(`${base}/api/swarm`);
+      expect(denied.status).toBe(401);
+      expect(denied.headers.get("referrer-policy")).toBe("no-referrer");
+
+      // Unknown / prototype-polluting role keys are rejected and not persisted
+      for (const role of ["__proto__", "constructor", "typo", "Coordinator "]) {
+        const bad = await fetch(`${base}/api/role-models`, {
+          method: "POST",
+          headers: auth,
+          body: JSON.stringify({ role, model: "openai/gpt-5" }),
+        });
+        expect(bad.status).toBe(400);
+        expect(await bad.json()).toEqual({ ok: false, error: "Unknown role" });
+      }
+      expect(written.length).toBe(0);
+      expect(Object.prototype.hasOwnProperty.call(roleModels, "__proto__")).toBe(false);
+      expect(roleModels).toEqual({});
+
+      // Empty / malformed model specs are rejected
+      for (const body of [
+        { role: "worker", model: "" },
+        { role: "worker", model: "   " },
+        { role: "worker", model: "not-a-spec" },
+        {},
+      ]) {
+        const bad = await fetch(`${base}/api/role-models`, {
+          method: "POST",
+          headers: auth,
+          body: JSON.stringify(body),
+        });
+        expect(bad.status).toBe(400);
+        expect((await bad.json()).ok).toBe(false);
+      }
+      expect(written.length).toBe(0);
+
+      // Positive control: a real role with a valid spec still persists
+      const good = await fetch(`${base}/api/role-models`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({ role: "worker", model: "openai/gpt-5#high" }),
+      });
+      expect(good.status).toBe(200);
+      expect(await good.json()).toEqual({ ok: true, roleModels: { worker: "openai/gpt-5#high" } });
+      expect(written).toEqual([{ role: "worker", spec: "openai/gpt-5#high" }]);
+
+      // Legacy `spec` field keeps working
+      const legacy = await fetch(`${base}/api/role-models`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({ role: "verifier", spec: "openai/gpt-5" }),
+      });
+      expect(legacy.status).toBe(200);
+      expect(roleModels).toEqual({ worker: "openai/gpt-5#high", verifier: "openai/gpt-5" });
     } finally {
       await handle.close();
       sqlite.close();

@@ -5,7 +5,7 @@ import type { Socket } from "node:net";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { SwarmBoardDB } from "./db.js";
-import type { AvailableModelEntry } from "./models.js";
+import { formatModelSpec, parseModelSpec, type AvailableModelEntry } from "./models.js";
 import type { MemberRole } from "./types.js";
 
 export interface BoardServerDeps {
@@ -48,6 +48,15 @@ const CSP_HEADER = [
   "connect-src 'self'",
   "frame-src 'self' blob: data:",
 ].join("; ");
+
+// Applied to every response (JSON, preload.js, static assets, 404s, auth failures).
+// The board URL carries `?token=`, so never leak it via Referer to external hosts.
+const BASE_RESPONSE_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": CSP_HEADER,
+  "Referrer-Policy": "no-referrer",
+};
+
+const VALID_ROLE_KEYS = new Set<MemberRole>(["coordinator", "worker", "verifier", "monitor", "narrator"]);
 
 class HttpError extends Error {
   constructor(public readonly status: number, message: string) {
@@ -107,7 +116,7 @@ function sendJson(res: ServerResponse, status: number, data: unknown) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Content-Security-Policy": CSP_HEADER,
+    ...BASE_RESPONSE_HEADERS,
   });
   res.end(body);
 }
@@ -393,8 +402,30 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
           return sendJson(res, 200, { ok: true, result });
         }
 
-        const role = String(body.role ?? "") as MemberRole;
-        const spec = String(body.spec ?? "");
+        const roleInput = typeof body.role === "string" ? body.role.trim() : "";
+        if (!VALID_ROLE_KEYS.has(roleInput as MemberRole)) {
+          return sendJson(res, 400, { ok: false, error: "Unknown role" });
+        }
+        const role = roleInput as MemberRole;
+
+        // The board UI historically sent `spec`; the RPC/tool path uses `model`.
+        const rawSpec = typeof body.spec === "string" ? body.spec : typeof body.model === "string" ? body.model : "";
+        if (!rawSpec.trim()) {
+          return sendJson(res, 400, { ok: false, error: "Model must be specified" });
+        }
+        let spec: string;
+        try {
+          const parsed = parseModelSpec(rawSpec);
+          if (!parsed?.providerID || !parsed.id) {
+            return sendJson(res, 400, {
+              ok: false,
+              error: `Model must use "providerID/modelID" or "providerID/modelID#variant" format (got "${rawSpec.trim()}").`,
+            });
+          }
+          spec = formatModelSpec(parsed);
+        } catch (err) {
+          return sendJson(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
         deps.setRoleModelDefault(role, spec);
         return sendJson(res, 200, { ok: true, roleModels: deps.getRoleModelDefaults() });
       }
@@ -403,7 +434,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
         res.writeHead(200, {
           "Content-Type": "application/javascript; charset=utf-8",
           "Cache-Control": "no-store",
-          "Content-Security-Policy": CSP_HEADER,
+          ...BASE_RESPONSE_HEADERS,
         });
         res.end(PRELOAD_JS);
         return;
@@ -419,14 +450,14 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
           res.writeHead(200, {
             "Content-Type": mime,
             "Cache-Control": "no-store",
-            "Content-Security-Policy": CSP_HEADER,
+            ...BASE_RESPONSE_HEADERS,
           });
           res.end(readFileSync(filePath));
           return;
         }
       }
 
-      res.writeHead(404, { "Content-Security-Policy": CSP_HEADER });
+      res.writeHead(404, BASE_RESPONSE_HEADERS);
       res.end("Not found");
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 400;
