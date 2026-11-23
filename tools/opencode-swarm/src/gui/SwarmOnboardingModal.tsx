@@ -8,6 +8,7 @@ import {
 } from "./recommendedModels.js";
 import { SearchableModelSelect } from "./SearchableModelSelect.js";
 import type { SwarmGuiContext } from "./types.js";
+import { createDismissedFlag } from "./useDismissed.js";
 
 const ROLE_ORDER: SwarmControlRole[] = ["coordinator", "worker", "verifier", "monitor"];
 
@@ -34,20 +35,23 @@ export function SwarmOnboardingModal(props: SwarmOnboardingModalProps) {
   });
 
   const recommended = createMemo(() => resolveRecommendedRoleModels(catalog()));
+  const isDismissed = createDismissedFlag();
 
   onMount(async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const cfg = await props.loadRoleConfig();
+      if (isDismissed()) return;
       const models = cfg?.models ?? [];
       setCatalog(models);
       const rec = resolveRecommendedRoleModels(models, cfg?.roleModels);
       setSelections(rec);
     } catch (err) {
+      if (isDismissed()) return;
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (!isDismissed()) setLoading(false);
     }
   });
 
@@ -56,6 +60,7 @@ export function SwarmOnboardingModal(props: SwarmOnboardingModalProps) {
     setErrorMsg(null);
     try {
       const res = await props.onApplyModels(chosen);
+      if (isDismissed()) return;
       if (!res.ok) {
         const msg = res.errors.join("; ") || "Failed to apply one or more role models.";
         setErrorMsg(msg);
@@ -73,10 +78,11 @@ export function SwarmOnboardingModal(props: SwarmOnboardingModalProps) {
       });
       props.onComplete();
     } catch (err) {
+      if (isDismissed()) return;
       const msg = err instanceof Error ? err.message : String(err);
       setErrorMsg(msg);
     } finally {
-      setSaving(false);
+      if (!isDismissed()) setSaving(false);
     }
   };
 

@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import type { UninstallCategoryId, UninstallPlan, UninstallResult, UninstallSelection } from "../../src/rpc.js";
 import type { SwarmGuiContext } from "./types.js";
+import { createDismissedFlag } from "./useDismissed.js";
 
 export interface SwarmUninstallModalProps {
   ctx: SwarmGuiContext;
@@ -33,11 +34,14 @@ export function SwarmUninstallModal(props: SwarmUninstallModalProps) {
     tempFiles: true,
   });
 
+  const isDismissed = createDismissedFlag();
+
   onMount(async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const p = await props.loadPlan();
+      if (isDismissed()) return;
       setPlan(p);
       if (p) {
         const init = { ...selected() };
@@ -47,9 +51,10 @@ export function SwarmUninstallModal(props: SwarmUninstallModalProps) {
         setSelected(init);
       }
     } catch (err) {
+      if (isDismissed()) return;
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (!isDismissed()) setLoading(false);
     }
   });
 
@@ -67,6 +72,7 @@ export function SwarmUninstallModal(props: SwarmUninstallModalProps) {
     setErrorMsg(null);
     try {
       const res = await props.onExecute(selected());
+      if (isDismissed()) return;
       if (resetGuiStore()) {
         props.onResetGuiStore();
       }
@@ -85,9 +91,10 @@ export function SwarmUninstallModal(props: SwarmUninstallModalProps) {
         });
       }
     } catch (err) {
+      if (isDismissed()) return;
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
-      setRunning(false);
+      if (!isDismissed()) setRunning(false);
     }
   };
 

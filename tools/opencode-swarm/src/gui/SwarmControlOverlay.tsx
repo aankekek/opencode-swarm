@@ -3,6 +3,7 @@ import type { SetRoleModelResult, SwarmRoleConfig } from "../../src/rpc.js";
 import { buildSortedModelOptions, type SwarmControlRole } from "./recommendedModels.js";
 import { SearchableModelSelect } from "./SearchableModelSelect.js";
 import type { SwarmGuiContext, SwarmSnapshot } from "./types.js";
+import { createDismissedFlag } from "./useDismissed.js";
 
 export type { SwarmControlRole };
 
@@ -47,17 +48,20 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
   const [loading, setLoading] = createSignal(true);
   const [savingRole, setSavingRole] = createSignal<SwarmControlRole | null>(null);
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
+  const isDismissed = createDismissedFlag();
 
   const fetchConfig = async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const res = await props.loadRoleConfig();
+      if (isDismissed()) return;
       setConfig(res);
     } catch (err) {
+      if (isDismissed()) return;
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (!isDismissed()) setLoading(false);
     }
   };
 
@@ -90,6 +94,7 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
     setErrorMsg(null);
     try {
       const res = await props.onSetRoleModel(role, nextSpec);
+      if (isDismissed()) return;
       if (!res || !res.ok) {
         const err = res?.error ?? `Failed to switch ${role} model`;
         setErrorMsg(err);
@@ -119,11 +124,12 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
         variant: "success",
       });
     } catch (err) {
+      if (isDismissed()) return;
       const msg = err instanceof Error ? err.message : String(err);
       setErrorMsg(msg);
       props.ctx.toast.show({ title: `Failed to switch ${role}`, description: msg, variant: "error" });
     } finally {
-      setSavingRole(null);
+      if (!isDismissed()) setSavingRole(null);
     }
   };
 
