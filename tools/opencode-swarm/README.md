@@ -2,6 +2,8 @@
 
 The runtime package behind this repo's swarm mode: four tools (`swarm`, `post_message`, `read_board`, `swarm_wait`), a SQLite board, Git worktree/clone isolation, a stall monitor, slash commands, and the OpenCode Desktop GUI bundle.
 
+Plans are stored as unit rows in `swarm_tasks`: `add` assigns units to workers and reports coverage counts, and the monitor emits `@coordinator [coverage]` nudges when units are left unassigned.
+
 Start at the [root README](../../README.md) for what a swarm is and how to use one. For install options and per-OS paths, see [docs/INSTALL.md](../../docs/INSTALL.md).
 
 ## What's here

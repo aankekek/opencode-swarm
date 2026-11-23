@@ -129,7 +129,7 @@ Do not call `complete` yourself from the coordinator unless the verifier has pos
 | Tool | What it does |
 | --- | --- |
 | `swarm` | Management. Actions below. |
-| `post_message` | Posts `text` to a `channel`. Mentions (`@name`, `@all`, `@#channel`) wake members. |
+| `post_message` | Posts `text` to a `channel`. Mentions (`@name`, `@all`, `@#channel`) wake members. `mark_done` (or a `[done]` post) closes that member's assigned units. |
 | `read_board` | Reads posts since a sequence (`since`, `limit`, `channel`, `status`). |
 | `swarm_wait` | Sleeps at zero tokens until a matching post arrives (`since`, `mentions_only`). |
 
@@ -137,7 +137,7 @@ Do not call `complete` yourself from the coordinator unless the verifier has pos
 
 | Action | One-line meaning |
 | --- | --- |
-| `status` | Current swarm, members, models, workspaces, locks. |
+| `status` | Current swarm, members, models, workspaces, locks, plus unit coverage counts and the task list (`id`, `seq`, `label`, `status`, `assignee`; first 100, with `tasks_truncated` when more). |
 | `models` | Lists available `provider/model` entries and their `variants`. `all:true` includes disabled models. |
 | `add` | Spawns a worker/verifier/monitor/narrator. Needs `name` + `brief`. |
 | `plan` | Records the unit list; `add` assigns units and reports unassigned counts. |
@@ -148,7 +148,7 @@ Do not call `complete` yourself from the coordinator unless the verifier has pos
 | `claim` | Claims file globs (only in `workspace:"inherit"`). |
 | `complete` | Ends the swarm, tears down children and workspaces (coordinator only). |
 
-`add` extras: `n` spawns `<name>-1..<name>-N`, `tasks` gives each copy its own slice, `workspace` is `inherit` | `share` | `branch`, `fork` copies conversation history from a member or `"coordinator"`, `channels` joins channels at spawn, and `owned_globs` claims write scope up front.
+`add` extras: `n` spawns `<name>-1..<name>-N`, `tasks` gives each copy its own slice, `workspace` is `inherit` | `share` | `branch`, `fork` copies conversation history from a member or `"coordinator"`, `channels` joins channels at spawn, and `owned_globs` claims write scope up front. When a plan exists, `add` takes `task_ids` (one per spawned worker, workers only); without them it assigns the first open units in order and appends `Assigned unit: <label>` to the brief. The response reports `total_units`, `open_units`, `assigned_units`, `done_units` and `unassigned_units`. It rejects batches larger than the open units, `task_ids` on a non-worker, ids already taken, `tasks: []`, and requests past `maxWorkers` or `maxShardsPerAdd`.
 
 ## Models and variants
 
@@ -214,6 +214,9 @@ Safe to delete only when no swarm is running. Deleting the folder loses board hi
 ### Board and sequence numbers
 Posts are rows in SQLite with a per-swarm `#seq`. Read and wake cursors are sequence numbers, so `read_board(since: 12)` is race-free. `members.json` and `board.jsonl` are mirrors rebuilt from SQLite on startup if a crash left them stale.
 
+### Units and coverage
+`swarm{action:"plan"}` writes unit rows to `swarm_tasks`, each moving `open → assigned → done`; `add` assigns them, and a worker's `[done]` post (or `mark_done`) completes its units. Recording a plan replaces only the still-open rows, so `plan` is refused once any unit is assigned or done. When at least three units are unassigned and nobody is working, the monitor posts one `@coordinator [coverage]` nudge per board movement, worded differently once the worker cap is reached. With a plan present, `add` also refuses to spawn more workers than there are open units.
+
 ### Locks
 `claim` reserves file globs in `workspace:"inherit"` mode. Overlapping globs collide, so `src/*.ts` and `src/a.ts` cannot both be claimed. A killed member's locks survive 60 seconds before reclaim, because its in-flight shell may still be writing.
 
@@ -244,6 +247,8 @@ Interrupted swarms from a dead process are marked `interrupted` and their locks 
 **`/swarm` seems to do nothing.** It now reports the blocking swarm and why it cannot start instead of failing silently. Read the message in the coordinator session.
 
 **Verifier never passes.** Usually shell policy: with `deny` it cannot run tests, and with `ask` it needs your approvals. A weak verifier model can also loop. Check the board for its `FAIL` reasons, then fix the worker or switch the model.
+
+**Coordinator keeps spawning only one worker.** Record the plan with `swarm{action:"plan", tasks:[...]}` and pass `tasks` or `n` to `add` so the batch spawns together; lower `maxShardsPerAdd` only if you want smaller batches. The `[coverage]` nudge is the signal that units are sitting unassigned. The caps stop over-spawning but never force a split, so a plan the coordinator ignores stays under-sized.
 
 **Windows path weirdness.** Use absolute paths in config, forward slashes or escaped `\\`. The runtime data path is under `%USERPROFILE%\.opencode-swarm`. Path comparisons are case-insensitive on Windows.
 
