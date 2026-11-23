@@ -160,7 +160,13 @@ export const swarmRuntimePlugin = Plugin.define({
     let dbClosed = false;
     let boardServerClosed = false;
 
-    const reconciled = db.reconcileStaleSwarmsOnStartup();
+    let reconciled: ReturnType<typeof db.reconcileStaleSwarmsOnStartup> = [];
+    try {
+      reconciled = db.reconcileStaleSwarmsOnStartup();
+    } catch (err) {
+      // Degrade gracefully: a failed reconcile must not prevent the plugin from loading.
+      console.warn("[opencode-swarm] Startup stale-swarm reconciliation failed; continuing with degraded state:", err);
+    }
     if (reconciled.length > 0) {
       console.warn(
         `[opencode-swarm] Reconciled ${reconciled.length} stale swarm(s) on startup (${reconciled.map((s) => s.id).join(", ")}); all locks released.`,

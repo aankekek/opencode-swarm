@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
@@ -1107,6 +1107,41 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       });
     } finally {
       await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("setup survives a startup reconciliation failure and still registers tools and commands", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-plugin-reconcile-fail-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    mkdirSync(repoDir, { recursive: true });
+
+    const originalReconcile = SwarmBoardDB.prototype.reconcileStaleSwarmsOnStartup;
+    SwarmBoardDB.prototype.reconcileStaleSwarmsOnStartup = function () {
+      throw new Error("simulated reconcile failure");
+    };
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...parts: any[]) => {
+      warnings.push(parts.map(String).join(" "));
+    };
+
+    let cleanup: (() => Promise<void>) | undefined;
+    try {
+      const { ctx, tools, commands } = createMockContext(repoDir, dbPath);
+      cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+
+      expect(tools.has("swarm")).toBe(true);
+      expect(commands.has("swarm")).toBe(true);
+      expect(warnings.some((w) => w.includes("reconciliation failed"))).toBe(true);
+    } finally {
+      console.warn = originalWarn;
+      SwarmBoardDB.prototype.reconcileStaleSwarmsOnStartup = originalReconcile;
+      if (cleanup) await cleanup();
       try {
         rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
       } catch {}

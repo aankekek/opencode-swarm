@@ -276,7 +276,13 @@ export class SwarmBoardDB {
         continue;
       }
 
-      this.withImmediateTransaction(() => {
+      // Decide and perform the transition atomically so two processes starting together
+      // cannot both claim the same stale swarm.
+      const transitioned = this.withImmediateTransaction(() => {
+        const current = this.getSwarm(swarm.id);
+        if (!current || (current.status !== "running" && current.status !== "completing")) {
+          return false;
+        }
         const now = Date.now();
         // RT-H1: Mark members 'killed' so partial index idx_active_member_session no longer blocks reuse
         this.db
@@ -287,17 +293,30 @@ export class SwarmBoardDB {
           .run(now, swarm.id);
         this.db.prepare(`DELETE FROM file_locks WHERE swarm_id = ?`).run(swarm.id);
         this.db.prepare(`UPDATE swarms SET status = 'interrupted', updated_at = ? WHERE id = ?`).run(now, swarm.id);
+        return true;
       });
-      this.addPost({
-        swarmId: swarm.id,
-        authorName: "monitor",
-        channel: "main",
-        mentions: [],
-        channelMentions: [],
-        isAll: false,
-        body: `Recovered on plugin startup after restart/crash: marked swarm '${swarm.id}' interrupted and released all locks.`,
-      });
-      this.syncMembersJson(swarm.id);
+      if (!transitioned) continue;
+
+      // addPost opens its own transaction; keep it outside the one above and tolerate
+      // failures so one swarm cannot abort reconciliation of the rest.
+      try {
+        this.addPost({
+          swarmId: swarm.id,
+          authorName: "monitor",
+          channel: "main",
+          mentions: [],
+          channelMentions: [],
+          isAll: false,
+          body: `Recovered on plugin startup after restart/crash: marked swarm '${swarm.id}' interrupted and released all locks.`,
+        });
+      } catch (err) {
+        console.warn(`[opencode-swarm] Failed to post recovery notice for stale swarm '${swarm.id}':`, err);
+      }
+      try {
+        this.syncMembersJson(swarm.id);
+      } catch (err) {
+        console.warn(`[opencode-swarm] Failed to sync members.json for stale swarm '${swarm.id}':`, err);
+      }
       stale.push(swarm);
     }
     return stale;

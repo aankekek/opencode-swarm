@@ -295,4 +295,108 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       } catch {}
     }
   });
+
+  test("reconcileStaleSwarmsOnStartup transitions a stale swarm exactly once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-reconcile-once-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Stale Once Swarm",
+        objective: "Atomic reconcile",
+        coordinatorSessionId: "coord_once",
+        workspaceDir: dir,
+      });
+      sqlite.prepare(`UPDATE swarms SET owner_pid = 999999 WHERE id = ?`).run(swarm.id);
+
+      const first = db.reconcileStaleSwarmsOnStartup();
+      expect(first.map((s) => s.id)).toEqual([swarm.id]);
+
+      // Second pass must observe the transition and skip the swarm entirely.
+      const second = db.reconcileStaleSwarmsOnStartup();
+      expect(second).toEqual([]);
+
+      const recoveryPosts = db
+        .getPostsPage(swarm.id, 0, 100)
+        .posts.filter((p) => p.body.includes("Recovered on plugin startup"));
+      expect(recoveryPosts).toHaveLength(1);
+      expect(db.getSwarm(swarm.id)?.status).toBe("interrupted");
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("reconcileStaleSwarmsOnStartup tolerates addPost failure and still reconciles every stale swarm", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-reconcile-post-fail-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+
+      const { swarm: firstSwarm } = db.createSwarmWithCoordinator({
+        title: "First Stale Swarm",
+        objective: "First",
+        coordinatorSessionId: "coord_first",
+        workspaceDir: dir,
+      });
+      // Free the workspace so a second active swarm can be created.
+      db.setSwarmStatus(firstSwarm.id, "completed");
+      const { swarm: secondSwarm } = db.createSwarmWithCoordinator({
+        title: "Second Stale Swarm",
+        objective: "Second",
+        coordinatorSessionId: "coord_second",
+        workspaceDir: dir,
+      });
+      sqlite
+        .prepare(`UPDATE swarms SET status = 'running', owner_pid = 999999 WHERE id IN (?, ?)`)
+        .run(firstSwarm.id, secondSwarm.id);
+
+      const originalAddPost = db.addPost.bind(db);
+      let addPostCalls = 0;
+      (db as any).addPost = (args: any) => {
+        addPostCalls += 1;
+        if (addPostCalls === 1) throw new Error("simulated addPost failure");
+        return originalAddPost(args);
+      };
+
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...parts: any[]) => {
+        warnings.push(parts.map(String).join(" "));
+      };
+
+      let reconciled: ReturnType<typeof db.reconcileStaleSwarmsOnStartup>;
+      try {
+        reconciled = db.reconcileStaleSwarmsOnStartup();
+      } finally {
+        console.warn = originalWarn;
+        (db as any).addPost = originalAddPost;
+      }
+
+      // A throwing addPost must not abort the loop: both swarms are reconciled.
+      expect(addPostCalls).toBe(2);
+      expect(reconciled!.map((s) => s.id).sort()).toEqual([firstSwarm.id, secondSwarm.id].sort());
+      expect(db.getSwarm(firstSwarm.id)?.status).toBe("interrupted");
+      expect(db.getSwarm(secondSwarm.id)?.status).toBe("interrupted");
+      expect(warnings.some((w) => w.includes("Failed to post recovery notice"))).toBe(true);
+
+      // Exactly the non-failing post succeeded; the other failure was logged, not silent.
+      const recoveryPosts = [
+        ...db.getPostsPage(firstSwarm.id, 0, 100).posts,
+        ...db.getPostsPage(secondSwarm.id, 0, 100).posts,
+      ].filter((p) => p.body.includes("Recovered on plugin startup"));
+      expect(recoveryPosts).toHaveLength(1);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });
