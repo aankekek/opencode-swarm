@@ -257,6 +257,19 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
         finishKillCleanup();
       } else {
         deps.pendingKillCleanup.set(target.session_id, finishKillCleanup);
+        // Safety net: if the session never quiesces (e.g. the runtime never
+        // emits tool.success/failed) release the locks and the workspace after
+        // 15s instead of leaking them forever.
+        const safety = setTimeout(() => {
+          if (deps.pendingKillCleanup.get(target.session_id) !== finishKillCleanup) return;
+          deps.pendingKillCleanup.delete(target.session_id);
+          try {
+            finishKillCleanup();
+          } catch {
+            // Best-effort deferred cleanup
+          }
+        }, 15_000);
+        safety.unref?.();
       }
       deps.emitSwarmChanged({ swarmId: swarm.id, reason: "member_killed", handle: target.name, summary: reason });
       return { ok: true };

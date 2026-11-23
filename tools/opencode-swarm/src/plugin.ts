@@ -237,7 +237,16 @@ export const swarmRuntimePlugin = Plugin.define({
     }
 
     function clearActiveTools(sessionId: string) {
-      if (activeToolCounts.has(sessionId) || pendingKillCleanup.has(sessionId) || quiesceResolvers.has(sessionId)) {
+      // A kill is waiting for this session's tools to finish. `execution.*`
+      // events can arrive while tool parts are still running, so deleting the
+      // counts here is fine but must NOT fake quiescence: only the real
+      // `session.tool.success|failed` decrement may trigger deferred cleanup,
+      // otherwise we could rmSync a worktree under a still-running tool.
+      if (pendingKillCleanup.has(sessionId)) {
+        activeToolCounts.delete(sessionId);
+        return;
+      }
+      if (activeToolCounts.has(sessionId) || quiesceResolvers.has(sessionId)) {
         activeToolCounts.delete(sessionId);
         notifySessionQuiesced(sessionId);
       }

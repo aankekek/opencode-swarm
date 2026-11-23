@@ -356,6 +356,19 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               finishKillCleanup();
             } else {
               deps.pendingKillCleanup.set(t.session_id, finishKillCleanup);
+              // Safety net: if the session never quiesces (e.g. the runtime
+              // never emits tool.success/failed) release the locks and the
+              // workspace after 15s instead of leaking them forever.
+              const safety = setTimeout(() => {
+                if (deps.pendingKillCleanup.get(t.session_id) !== finishKillCleanup) return;
+                deps.pendingKillCleanup.delete(t.session_id);
+                try {
+                  finishKillCleanup();
+                } catch {
+                  // Best-effort deferred cleanup
+                }
+              }, 15_000);
+              safety.unref?.();
             }
             emitSwarmChanged({
               swarmId: t.swarm_id,

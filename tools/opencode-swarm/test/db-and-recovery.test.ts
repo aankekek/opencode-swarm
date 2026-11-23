@@ -114,7 +114,9 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       expect(res1.claimed).toEqual(["src/**/*.ts"]);
       expect(res1.conflicts.length).toBe(0);
 
-      // Kill w1 without releasing lock
+      // Kill w1 without releasing lock. This mirrors the real kill path:
+      // state flips to 'killed' before the member's in-flight tools finish,
+      // so the lock must stay held until releaseLocksForMember runs.
       db.setMemberState(w1.id, "killed");
 
       const w2 = db.insertMember({
@@ -134,7 +136,14 @@ describe("SwarmBoardDB & Crash Recovery", () => {
         channels: ["main"],
       });
 
-      // w2 claims the same glob; dead owner lock must be reassigned and verified
+      // w2 cannot take the killed owner's glob while its tools may still run.
+      const blocked = db.claimLocksAtomic(swarm.id, w2.id, w2.name, ["src/**/*.ts"]);
+      expect(blocked.claimed).toEqual([]);
+      expect(blocked.conflicts).toHaveLength(1);
+      expect(blocked.conflicts[0].owner).toBe("w1");
+
+      // Only once the deferred kill cleanup releases w1's locks may w2 claim.
+      db.releaseLocksForMember(w1.id);
       const res2 = db.claimLocksAtomic(swarm.id, w2.id, w2.name, ["src/**/*.ts"]);
       expect(res2.claimed).toEqual(["src/**/*.ts"]);
       expect(res2.conflicts.length).toBe(0);

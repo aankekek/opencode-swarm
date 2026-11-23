@@ -785,4 +785,77 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       } catch {}
     }
   });
+
+  test("killed member's deferred cleanup waits for tool.success, not execution.interrupted", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-kill-quiesce-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const stream = createEventStream();
+    const { ctx, tools, hooks, commands } = createMockContext(repoDir, dbPath, {}, () => stream);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let reader: SwarmBoardDB | undefined;
+
+    try {
+      const swarmTool = tools.get("swarm");
+      await commands.get("swarm").execute({
+        sessionID: "sess_coord",
+        prompt: "Kill quiesce test",
+        delivery: "queue",
+      });
+
+      const addRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "w1", brief: "work", workspace: "inherit" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(addRes.ok).toBe(true);
+      const workerSession = addRes.spawned[0].session_id;
+
+      const claimRes = JSON.parse(
+        (await swarmTool.execute({ action: "claim", globs: ["src/**/*.ts"] }, { sessionID: workerSession })).content,
+      );
+      expect(claimRes.ok).toBe(true);
+      expect(claimRes.claimed).toEqual(["src/**/*.ts"]);
+
+      // Simulate a write tool already running for the worker: this bumps the
+      // active-tool counter so kill's waitForQuiesce times out and the cleanup
+      // is deferred into pendingKillCleanup.
+      await hooks["tool.execute.before"]({
+        id: "call_kill_1",
+        tool: "write",
+        input: { filePath: join(repoDir, "src", "a.ts") },
+        sessionID: workerSession,
+      });
+
+      const killRes = JSON.parse(
+        (await swarmTool.execute({ action: "kill", name: "w1" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(killRes.ok).toBe(true);
+
+      // Mechanism B: execution.interrupted must NOT fake quiescence for a
+      // session with deferred kill cleanup; the lock must survive it.
+      stream.push({ type: "session.execution.interrupted", data: { sessionID: workerSession } });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      const activeSwarm = reader.getActiveSwarms()[0];
+      expect(reader.listLocks(activeSwarm.id)).toHaveLength(1);
+
+      // The real tool completion is what triggers the deferred cleanup.
+      stream.push({ type: "session.tool.success", data: { sessionID: workerSession } });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+      expect(reader.listLocks(activeSwarm.id)).toHaveLength(0);
+      stream.end();
+    } finally {
+      reader?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

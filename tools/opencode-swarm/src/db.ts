@@ -17,6 +17,16 @@ import type {
 } from "./types.js";
 import { globsPotentiallyOverlap, normalizeHandle, validateAndNormalizeGlob } from "./security.js";
 
+/**
+ * How long a lock owned by a killed member must survive before a claim may
+ * reclaim it. `kill` flips the member's state to `killed` *before* its in-flight
+ * tool calls finish; releasing the locks that early would let another member
+ * claim the same globs while the killed member's shell/write is still running.
+ * The kill path releases locks itself once the tools quiesce, so this grace
+ * period only matters for the never-quiesces safety net.
+ */
+const KILL_LOCK_GRACE_MS = 60_000;
+
 export interface SqliteStmt {
   run(...params: unknown[]): { lastInsertRowid: number | bigint; changes: number };
   get(...params: unknown[]): unknown;
@@ -755,11 +765,17 @@ export class SwarmBoardDB {
     return this.withImmediateTransaction(() => {
       const conflicts: Array<{ requested: string; existing: string; owner: string }> = [];
       const existing = this.listLocks(swarmId);
-      const liveIds = new Set(this.listMembers(swarmId, false).map((m) => m.id));
-
-      // RT-H4: Clean up dead locks whose owner is no longer live
+      // RT-H4: clean up only truly orphaned locks. Member rows are retained
+      // after a kill, so `state='killed'` is NOT a signal that the owner is
+      // gone: its in-flight tools may still be writing. Reclaim a lock only
+      // when the owner row no longer exists at all, or when the lock has
+      // outlived KILL_LOCK_GRACE_MS (the deferred-cleanup safety net case).
+      const allMemberIds = new Set(this.listMembers(swarmId, true).map((m) => m.id));
+      const now = Date.now();
       for (const lock of existing) {
-        if (!liveIds.has(lock.owner_member_id)) {
+        const orphaned = !allMemberIds.has(lock.owner_member_id);
+        const expired = now - lock.claimed_at >= KILL_LOCK_GRACE_MS;
+        if (orphaned || expired) {
           this.db.prepare(`DELETE FROM file_locks WHERE id = ?`).run(lock.id);
         }
       }
@@ -792,7 +808,6 @@ export class SwarmBoardDB {
            owner_member_id = excluded.owner_member_id,
            claimed_at = excluded.claimed_at`,
       );
-      const now = Date.now();
       const claimed: string[] = [];
       for (const req of normalized) {
         const info = stmt.run(swarmId, req, owner, ownerMemberId, now);
