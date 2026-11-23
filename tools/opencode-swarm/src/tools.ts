@@ -5,7 +5,7 @@ import { formatModelSpec, listAvailableModels } from "./models.js";
 import { hasFreshVerifierPass } from "./monitor.js";
 import type { SwarmChangedEvent } from "./rpc.js";
 import { normalizeHandle, validateMemberName } from "./security.js";
-import type { BoardPostRow, MemberRole, MemberRow, WorkspaceMode } from "./types.js";
+import type { BoardPostRow, MemberRole, MemberRow, PluginOptions, WorkspaceMode } from "./types.js";
 import type { WaiterEntry } from "./wake.js";
 import { cleanupMemberWorkspace } from "./workspace.js";
 
@@ -15,8 +15,13 @@ function toolJson(payload: unknown): { content: string } {
   return { content: JSON.stringify(payload, null, 2) };
 }
 
+function positiveInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
 export interface SwarmToolsDeps {
   db: SwarmBoardDB;
+  options: PluginOptions;
   canonicalWorkspaceRoot: string;
   roleModels: Partial<Record<MemberRole, string>>;
   waiters: Map<string, WaiterEntry>;
@@ -183,6 +188,26 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
           const n = typeof input.n === "number" && input.n > 1 ? Math.floor(input.n) : undefined;
           const count = tasks ? tasks.length : n;
+          const cap = positiveInt(deps.options.maxWorkers) ?? 6;
+          const shardCap = positiveInt(deps.options.maxShardsPerAdd) ?? 8;
+
+          if (count !== undefined && count > shardCap) {
+            return toolJson({
+              ok: false,
+              error: `At most ${shardCap} shards per add. Group the units into batches of <=${shardCap} with tasks, or spawn groups sequentially.`,
+            });
+          }
+
+          const requested = count ?? 1;
+          const liveWorkersBefore = db.listMembers(swarmId, false).filter((m) => m.role === "worker");
+          if (role === "worker" && liveWorkersBefore.length + requested > cap) {
+            return toolJson({
+              ok: false,
+              error: `Worker cap ${cap} reached (${liveWorkersBefore.length} live + ${requested} requested). Group units or finish tracks first.`,
+              workers: liveWorkersBefore.length,
+              cap,
+            });
+          }
 
           const spawned: Array<{ name: string; session_id: string; model: string; workspace: string }> = [];
           const spawnedMembers: MemberRow[] = [];
@@ -262,7 +287,17 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
                 workspace: m.workspace_mode,
               });
             }
-            return toolJson({ ok: true, swarm_id: swarmId, spawned, open_board: deps.getBoardUrl() });
+            const liveWorkersAfter = db.listMembers(swarmId, false).filter((m) => m.role === "worker");
+            return toolJson({
+              ok: true,
+              swarm_id: swarmId,
+              spawned,
+              workers: liveWorkersBefore.length + spawned.length,
+              cap,
+              open_tracks: liveWorkersAfter.filter((m) => m.track_status === "open").length,
+              shard_cap: shardCap,
+              open_board: deps.getBoardUrl(),
+            });
           } catch (err) {
             for (const m of spawnedMembers) {
               await ctx.session.interrupt({ sessionID: m.session_id }).catch(() => {});

@@ -42,6 +42,10 @@ export interface PluginOptions {
   debugHooks?: boolean;
   /** Auto-spawn a verifier when all worker tracks are done and no verification ran (default: true). */
   autoSpawnVerifier?: boolean;
+  /** Maximum live workers per swarm; extra units must be grouped (default: 6). */
+  maxWorkers?: number;
+  /** Maximum members spawned by one `add` call; split into sequential batches (default: 8). */
+  maxShardsPerAdd?: number;
 }
 
 export interface SwarmRow {

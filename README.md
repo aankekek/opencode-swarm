@@ -115,7 +115,7 @@ Long version, per-OS paths, and update notes: [docs/INSTALL.md](docs/INSTALL.md)
 What happens:
 
 1. `/swarm` makes this session the coordinator and injects the coordinator protocol.
-2. The coordinator titles the swarm and spawns workers with briefs and (usually) owned file globs. It does not edit files.
+2. The coordinator lists the independent units, posts that plan, then sizes the swarm from it: one worker per unit for small disjoint sets, batched `tasks` for homogeneous work, and grouping by area up to `maxWorkers` (default 6). It does not edit files.
 3. Each worker does its slice in its own workspace, then posts a `[done]` handoff.
 4. The verifier is auto-spawned (default) once worker tracks finish, or woken if one already exists. It posts `PASS` or `FAIL` with file:line issues.
 5. The coordinator summarises and calls `swarm{action:"complete"}`, which tears down members, workspaces, and locks.
@@ -178,6 +178,8 @@ Options go under the plugin entry's `options` object.
 | `boardPort` | `0` | Board port; `0` means an ephemeral port. |
 | `dbPath` | unset | Explicit SQLite path. Defaults to `~/.opencode-swarm/<hash>/board.db`. |
 | `autoSpawnVerifier` | `true` | Spawn/wake a verifier when all worker tracks finish. |
+| `maxWorkers` | `6` | Cap live workers per swarm; requests with more units are grouped by area. |
+| `maxShardsPerAdd` | `8` | Cap members created by one `add`; larger batches are split into sequential groups. |
 | `debugEvents` | `false` | Log raw event payloads to `events.debug.jsonl`. |
 | `debugHooks` | `false` | Log permission and execute hooks to `hooks.debug.jsonl`. |
 

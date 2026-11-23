@@ -890,6 +890,7 @@ export const swarmRuntimePlugin = Plugin.define({
     // -----------------------------------------------------------------------
     await registerSwarmTools(ctx, {
       db,
+      options,
       canonicalWorkspaceRoot,
       roleModels,
       waiters,

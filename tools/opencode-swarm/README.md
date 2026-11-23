@@ -34,6 +34,8 @@ Set these under the plugin entry's `options` in `opencode.json` / `opencode.json
 | `boardPort` | `0` | Board port; `0` = ephemeral. |
 | `dbPath` | unset | Explicit SQLite path. |
 | `autoSpawnVerifier` | `true` | Spawn/wake a verifier when worker tracks finish. |
+| `maxWorkers` | `6` | Maximum live workers; extra units are grouped by area. |
+| `maxShardsPerAdd` | `8` | Maximum members per `add`; larger batches split into sequential groups. |
 | `debugEvents` | `false` | Log events to `events.debug.jsonl`. |
 | `debugHooks` | `false` | Log hooks to `hooks.debug.jsonl`. |
 

@@ -3,19 +3,26 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SwarmBoardDB } from "../src/db.js";
+import { COORDINATOR_PROTOCOL } from "../src/prompts.js";
 import { SWARM_RPC_DEF } from "../src/rpc.js";
 import { swarmRuntimePlugin } from "../src/plugin.js";
 
 type RpcHandler = (args?: Record<string, unknown>) => Promise<unknown>;
 type RegisteredTool = { name: string; execute: (args: Record<string, unknown>, ctx: unknown) => Promise<string> };
 
-async function createBridgeHarness(tempDir: string) {
+function parseToolResult(value: unknown): Record<string, any> {
+  return JSON.parse((value as { content: string }).content);
+}
+
+async function createBridgeHarness(tempDir: string, pluginOptions: Record<string, unknown> = {}) {
   let registeredHandlers: Record<string, RpcHandler> = {};
   const emittedEvents: Array<{ event: string; payload: unknown }> = [];
   const registeredTools = new Map<string, RegisteredTool>();
   let disposed = false;
 
+  let sessionCounter = 0;
   const mockCtx = {
+    options: pluginOptions,
     location: { directory: tempDir },
     directory: tempDir,
     worktree: tempDir,
@@ -51,7 +58,10 @@ async function createBridgeHarness(tempDir: string) {
       hook: async () => () => {},
     },
     session: {
-      create: async () => ({ data: { id: "worker-sess-1" } }),
+      create: async () => {
+        const id = `worker-sess-${++sessionCounter}`;
+        return { id, data: { id } };
+      },
       prompt: async () => ({}),
       interrupt: async () => ({}),
       update: async () => ({}),
@@ -71,6 +81,7 @@ async function createBridgeHarness(tempDir: string) {
   }).setup(mockCtx, {
     dbPath: join(tempDir, "board.db"),
     boardPort: 0,
+    ...pluginOptions,
   });
 
   return { registeredHandlers, registeredTools, emittedEvents, hooks, isDisposed: () => disposed };
@@ -78,14 +89,17 @@ async function createBridgeHarness(tempDir: string) {
 
 type BridgeHarness = Awaited<ReturnType<typeof createBridgeHarness>>;
 
-async function withBridgeHarness(fn: (harness: BridgeHarness) => Promise<void>) {
+async function withBridgeHarness(
+  fn: (harness: BridgeHarness) => Promise<void>,
+  pluginOptions: Record<string, unknown> = {},
+) {
   const tempDir = mkdtempSync(join(tmpdir(), "swarm-rpc-bridge-"));
   const prevUserProfile = process.env.USERPROFILE;
   const prevHome = process.env.HOME;
   process.env.USERPROFILE = tempDir;
   process.env.HOME = tempDir;
   try {
-    const harness = await createBridgeHarness(tempDir);
+    const harness = await createBridgeHarness(tempDir, pluginOptions);
     await fn(harness);
     await (harness.hooks as { dispose?: () => Promise<void> } | undefined)?.dispose?.();
   } finally {
@@ -306,5 +320,120 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       expect(byId.swarm?.id).toBe(swarmId);
       expect(byId.swarm?.status).toBe("completed");
     });
+  });
+
+  test("coordinator protocol sizes the swarm from an explicit unit list", () => {
+    expect(COORDINATOR_PROTOCOL).toContain("## Sizing the swarm");
+    expect(COORDINATOR_PROTOCOL).toMatch(/N items is N units/i);
+    expect(COORDINATOR_PROTOCOL).toMatch(/group by area/i);
+    expect(COORDINATOR_PROTOCOL).toMatch(/maxWorkers/);
+    expect(COORDINATOR_PROTOCOL).toMatch(/do not retry blindly/i);
+  });
+
+  test("add rejects more shards than the default shard cap", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Shard cap" }, toolCtx);
+
+      const res = parseToolResult(await swarmTool.execute({ action: "add", name: "lint", brief: "fix", n: 9 }, toolCtx));
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toContain("At most 8 shards");
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      expect(status.members.filter((m: { role: string }) => m.role === "worker")).toHaveLength(0);
+    });
+  });
+
+  test("add with tasks spawns one worker per slice and reports budget", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Slices" }, toolCtx);
+
+      const res = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "slice", brief: "work", tasks: ["a", "b", "c"] }, toolCtx),
+      );
+      expect(res.ok).toBe(true);
+      expect(res.spawned).toHaveLength(3);
+      expect(res.workers).toBe(3);
+      expect(res.cap).toBe(6);
+      expect(res.open_tracks).toBe(3);
+      expect(res.shard_cap).toBe(8);
+    });
+  });
+
+  test("add rejects spawns beyond a configured worker cap", async () => {
+    await withBridgeHarness(
+      async ({ registeredTools }) => {
+        const swarmTool = registeredTools.get("swarm")!;
+        const toolCtx = { sessionID: "coord-sess-1" };
+        await swarmTool.execute({ action: "title", title: "Worker cap" }, toolCtx);
+
+        const first = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "pair", brief: "work", tasks: ["a", "b"] }, toolCtx),
+        );
+        expect(first.ok).toBe(true);
+        expect(first.workers).toBe(2);
+
+        const second = parseToolResult(await swarmTool.execute({ action: "add", name: "extra", brief: "work" }, toolCtx));
+        expect(second.ok).toBe(false);
+        expect(String(second.error)).toContain("Worker cap 2 reached");
+        expect(second.workers).toBe(2);
+        expect(second.cap).toBe(2);
+      },
+      { maxWorkers: 2 },
+    );
+  });
+
+  test("verifier spawns are not blocked by the worker cap", async () => {
+    await withBridgeHarness(
+      async ({ registeredTools }) => {
+        const swarmTool = registeredTools.get("swarm")!;
+        const toolCtx = { sessionID: "coord-sess-1" };
+        await swarmTool.execute({ action: "title", title: "Verifier cap" }, toolCtx);
+
+        const worker = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "only", brief: "work" }, toolCtx),
+        );
+        expect(worker.ok).toBe(true);
+
+        const verifier = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "check", role: "verifier", brief: "verify" }, toolCtx),
+        );
+        expect(verifier.ok).toBe(true);
+        expect(verifier.workers).toBe(2);
+      },
+      { maxWorkers: 1 },
+    );
+  });
+
+  test("invalid worker and shard options fall back to defaults", async () => {
+    await withBridgeHarness(
+      async ({ registeredTools }) => {
+        const swarmTool = registeredTools.get("swarm")!;
+        const toolCtx = { sessionID: "coord-sess-1" };
+        await swarmTool.execute({ action: "title", title: "Invalid options" }, toolCtx);
+
+        const tooMany = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "lint", brief: "fix", n: 9 }, toolCtx),
+        );
+        expect(tooMany.ok).toBe(false);
+        expect(String(tooMany.error)).toContain("At most 8 shards");
+
+        const six = parseToolResult(
+          await swarmTool.execute({
+            action: "add",
+            name: "unit",
+            brief: "work",
+            tasks: ["a", "b", "c", "d", "e", "f"],
+          }, toolCtx),
+        );
+        expect(six.ok).toBe(true);
+        expect(six.cap).toBe(6);
+        expect(six.workers).toBe(6);
+      },
+      { maxWorkers: 0, maxShardsPerAdd: -3 },
+    );
   });
 });

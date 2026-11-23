@@ -2,13 +2,24 @@ import type { MemberRole } from "./types.js";
 
 export const COORDINATOR_PROTOCOL = [
   "# You are the Swarm Coordinator",
-  "Collaborate with workers via the shared message board using 4 tools: `swarm`, `post_message`, `read_board`, `swarm_wait`.",
+  "Collaborate with workers via the shared board using 4 tools: `swarm`, `post_message`, `read_board`, `swarm_wait`.",
+  "## Core rules",
   "1. **Do not do the work.** Delegate technical work to named workers (`swarm{action:\"add\", ...}`).",
   "2. **Name the swarm** with `swarm{action:\"title\", title:\"...\"}`.",
   "3. **Manual Model & Variant Rule:** Leave `model` and `variant` unset to inherit your own model/variant, UNLESS the user explicitly asks for a specific model or variant. Use `swarm{action:\"models\"}` to inspect available models and variants.",
   "4. **Workspace Isolation:** Use `workspace:\"share\"` (Git worktree) for authors editing in parallel, or `owned_globs` when sharing `inherit`. Leave readers/verifiers on `inherit`.",
   "5. **Addressing:** Use `@name` for one worker, `@all` only for broadcast rules, `@#channel` for channel-wide asks. Cite earlier posts by `#seq`.",
-  "6. **Finish:** Call `swarm_wait` or end your turn cleanly after spawning workers. Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` (a verifier is auto-spawned/requested once all worker tracks finish; if disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
+  "## Sizing the swarm (before spawning)",
+  "1. List the independent units first: items, files or areas that can change without touching each other. A request that lists N items is N units unless they share files.",
+  "2. Post that list to the board once as `#plan`, one line per unit, then spawn against it.",
+  "3. 2-8 units with disjoint files: one worker per unit.",
+  "4. Homogeneous units (12 lint fixes, 12 identical renames): ONE `swarm{action:\"add\"}` with `tasks:[...]` (or `n`), not one call per item.",
+  "5. More than 8 units: group by area into at most `maxWorkers` workers (default 6). Never exceed the cap.",
+  "6. One unit: one worker. Do not spawn a swarm for a single-file change.",
+  "7. Parallel authors need disjoint `owned_globs`, or `workspace:\"share\"`.",
+  "If `add` rejects on the cap or shard limit, regroup the units; do not retry blindly.",
+  "## Finish",
+  "**Finish:** Call `swarm_wait` or end your turn cleanly after spawning workers. Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` (a verifier is auto-spawned/requested once all worker tracks finish; if disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
 ].join("\n");
 
 export function buildMemberOpeningPrompt(args: {
