@@ -22,7 +22,7 @@ export interface UninstallEnvOptions {
   boardUrl?: string;
 }
 
-const SWARM_MATCH_RE = /(?:^|[\\/])(?:opencode-swarm|swarm-runtime)(?:$|[\\/])|local\.swarm-runtime/i;
+const SWARM_MATCH_RE = /(?:^|[\\/])(?:opencode-swarm|swarm-runtime)(?:$|[\\/])|local\.(?:opencode-swarm|swarm-runtime)/i;
 
 export function stripJsonComments(raw: string): string {
   const input = raw.replace(/^\uFEFF/, "");
@@ -357,7 +357,7 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
         regItems.push({
           path: cfgPath,
           kind: "edit-config",
-          detail: "Remove swarm-runtime entry from global plugins list (keep other plugins intact)",
+          detail: "Remove opencode-swarm entry from global plugins list (keep other plugins intact)",
         });
       }
     } catch (err) {
@@ -379,7 +379,7 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
           kind: res.emptyAfter ? "delete-file" : "edit-config",
           detail: res.emptyAfter
             ? "Delete project swarm config (and remove empty .opencode/ directory)"
-            : "Remove swarm-runtime entry from project config",
+            : "Remove opencode-swarm entry from project config",
         });
       }
     } catch (err) {
@@ -452,7 +452,7 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
     {
       id: "pluginRegistration",
       title: "1. Plugin Registration & Configs",
-      description: "Remove swarm-runtime from global/project OpenCode configs (keeps other plugins intact).",
+      description: "Remove opencode-swarm from global/project OpenCode configs (keeps other plugins intact).",
       defaultChecked: true,
       items: regItems,
     },
@@ -473,7 +473,7 @@ export function buildUninstallPlan(env?: UninstallEnvOptions): UninstallPlan {
     {
       id: "buildArtifacts",
       title: "4. Build Artifacts (node_modules & dist)",
-      description: "Delete installed dependencies and built GUI bundle inside tools/swarm-runtime.",
+      description: "Delete installed dependencies and built GUI bundle inside tools/opencode-swarm.",
       defaultChecked: true,
       items: buildItems,
     },
@@ -549,7 +549,7 @@ export async function verifyUninstall(
     const passed = lingering.length === 0 && unreadable.length === 0;
     checks.push({
       id: "config_clean",
-      label: "No swarm-runtime config references",
+      label: "No opencode-swarm config references",
       passed,
       detail: passed
         ? "All global and project configs clean"

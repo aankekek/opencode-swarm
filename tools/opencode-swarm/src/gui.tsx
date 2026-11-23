@@ -130,7 +130,7 @@ export default Plugin.define({
       try {
         return ctx.add(registry, item as never);
       } catch (err) {
-        console.warn(`[swarm-runtime] OpenCode did not accept a GUI item:`, err);
+        console.warn(`[opencode-swarm] OpenCode did not accept a GUI item:`, err);
         return () => {};
       }
     };
@@ -693,7 +693,7 @@ export default Plugin.define({
               rpcError={() => {
                 const s = rpcStatus();
                 if (s.state === "unavailable") {
-                  return "Server plugin (local.swarm-runtime) is not loaded for this workspace.";
+                  return "Server plugin (local.opencode-swarm) is not loaded for this workspace.";
                 }
                 if (s.state === "error") return s.message;
                 return undefined;

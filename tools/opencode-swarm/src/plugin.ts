@@ -61,7 +61,7 @@ function cloneToolInput(input: unknown): Record<string, unknown> | undefined {
 }
 
 export const swarmRuntimePlugin = Plugin.define({
-  id: "local.swarm-runtime",
+  id: "local.opencode-swarm",
 
   async setup(ctx: Context) {
     const workspaceRoot = resolve(ctx.location.directory);
@@ -118,7 +118,7 @@ export const swarmRuntimePlugin = Plugin.define({
         writeFileSync(tmpPath, JSON.stringify(roleModels, null, 2), "utf8");
         renameSync(tmpPath, roleModelsPath);
       } catch (err) {
-        console.warn("[swarm-runtime] Failed to persist role-models.json:", err);
+        console.warn("[opencode-swarm] Failed to persist role-models.json:", err);
         try {
           writeFileSync(roleModelsPath, JSON.stringify(roleModels, null, 2), "utf8");
         } catch {
@@ -146,7 +146,7 @@ export const swarmRuntimePlugin = Plugin.define({
     const reconciled = db.reconcileStaleSwarmsOnStartup();
     if (reconciled.length > 0) {
       console.warn(
-        `[swarm-runtime] Reconciled ${reconciled.length} stale swarm(s) on startup (${reconciled.map((s) => s.id).join(", ")}); all locks released.`,
+        `[opencode-swarm] Reconciled ${reconciled.length} stale swarm(s) on startup (${reconciled.map((s) => s.id).join(", ")}); all locks released.`,
       );
       // SEC-H7: Clear/restore session permissions for the current session if it was part of reconciled swarms
       try {
@@ -192,6 +192,8 @@ export const swarmRuntimePlugin = Plugin.define({
     const lastCoordinatorWakeSeq = new Map<string, number>();
     const lastWakeSeq = new Map<string, number>();
     const spawningMembers = new Set<string>();
+    const autoVerifierSpawns = new Set<string>();
+    const lastVerificationRequestSeq = new Map<string, number>();
     const memberSwitchLocks = new Map<string, Promise<unknown>>();
     const activeToolCounts = new Map<string, number>();
     const quiesceResolvers = new Map<string, Array<() => void>>();
@@ -294,7 +296,7 @@ export const swarmRuntimePlugin = Plugin.define({
           model = await resolveAndValidateModel(ctx, coordinatorSpec, undefined, sessionModel);
         } catch (err) {
           console.warn(
-            `[swarm-runtime] Ignoring invalid roleModels.coordinator "${coordinatorSpec}": ${err instanceof Error ? err.message : String(err)}`,
+            `[opencode-swarm] Ignoring invalid roleModels.coordinator "${coordinatorSpec}": ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }
@@ -324,7 +326,7 @@ export const swarmRuntimePlugin = Plugin.define({
           });
         } catch (err) {
           console.warn(
-            `[swarm-runtime] Could not switch coordinator model to ${model.providerID}/${model.id}: ${err instanceof Error ? err.message : String(err)}`,
+            `[opencode-swarm] Could not switch coordinator model to ${model.providerID}/${model.id}: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }
@@ -429,23 +431,82 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     }
 
+    async function ensureVerifierForCompletedWork(
+      swarmId: string,
+      coord: MemberRow,
+      latestPost: BoardPostRow,
+    ): Promise<"spawned" | "requested" | "in_progress" | "unavailable"> {
+      const liveVerifiers = db.listMembers(swarmId, false).filter((m) => m.role === "verifier");
+      if (liveVerifiers.length === 0) {
+        if (autoVerifierSpawns.has(swarmId)) return "in_progress";
+        autoVerifierSpawns.add(swarmId);
+        try {
+          let verifierName = "verifier";
+          if (db.getMemberByName(swarmId, verifierName)) {
+            let n = 2;
+            while (db.getMemberByName(swarmId, `verifier-${n}`)) n++;
+            verifierName = `verifier-${n}`;
+          }
+          const brief = [
+            `You are the swarm verifier. All worker tracks are complete (latest #${latestPost.swarm_seq} from ${latestPost.author_name}).`,
+            `Verify completed worker output against the swarm objective: read board with read_board, independently verify each finished track, inspect diffs and run concrete checks (tests/builds/file review).`,
+            `Then post PASS to @${coord.name} if all checks pass, or FAIL with exact file:line issues naming the responsible @worker.`,
+            `Read-only: do not edit workspace files.`,
+          ].join(" ");
+          await spawnSingleMember({
+            swarmId,
+            caller: coord,
+            name: verifierName,
+            role: "verifier",
+            brief,
+            workspace: "inherit",
+            channels: ["main"],
+          });
+          return "spawned";
+        } catch (err) {
+          autoVerifierSpawns.delete(swarmId);
+          console.warn("[opencode-swarm] auto-spawn verifier failed:", err instanceof Error ? err.message : String(err));
+          return "unavailable";
+        }
+      }
+
+      const anyWorkingVerifier = liveVerifiers.some((m) => db.getMemberById(m.id)?.state === "working" || m.state === "working");
+      if (anyWorkingVerifier) return "in_progress";
+      const waitingVerifier = liveVerifiers.find((m) => {
+        const fresh = db.getMemberById(m.id) ?? m;
+        return fresh.state === "waiting";
+      });
+      if (!waitingVerifier) return "unavailable";
+      const fresh = db.getMemberById(waitingVerifier.id) ?? waitingVerifier;
+      if (fresh.paused_quota === 1 || fresh.state === "stopped" || fresh.state === "killed") return "unavailable";
+      if (waiters.has(fresh.id)) return "in_progress";
+      if (lastVerificationRequestSeq.get(swarmId) === latestPost.swarm_seq) return "in_progress";
+      try {
+        await postToBoard(
+          swarmId,
+          coord.name,
+          "main",
+          `@${fresh.name} [verify] All worker tracks are complete (latest #${latestPost.swarm_seq}). Independently verify completed worker output against the swarm objective: read board with read_board, inspect diffs and run concrete checks, then post PASS to @${coord.name} or FAIL with exact file:line issues naming the responsible @worker.`,
+          new Set([coord.id]),
+        );
+        lastVerificationRequestSeq.set(swarmId, latestPost.swarm_seq);
+        return "requested";
+      } catch (err) {
+        console.warn("[opencode-swarm] verification request failed:", err instanceof Error ? err.message : String(err));
+        return "unavailable";
+      }
+    }
+
     async function maybeWakeIdleCoordinator(swarmId: string, triggerPost?: BoardPostRow) {
       const swarm = db.getSwarm(swarmId);
       if (!swarm || swarm.status !== "running") return;
 
       const members = db.listMembers(swarmId, false);
       const coord = members.find((m) => m.role === "coordinator");
-      if (!coord || coord.state !== "waiting" || coord.paused_quota === 1 || waiters.has(coord.id)) {
-        return;
-      }
+      if (!coord) return;
 
       const latestPost = triggerPost ?? db.getLatestPost(swarmId);
       if (!latestPost || latestPost.author_name === coord.name) return;
-
-      const prevCoordinatorWakeSeq = lastCoordinatorWakeSeq.get(swarmId) ?? 0;
-      if (coord.last_read_seq >= latestPost.swarm_seq || prevCoordinatorWakeSeq >= latestPost.swarm_seq) {
-        return;
-      }
 
       const nonCoord = members.filter(
         (m) => m.role !== "coordinator" && m.role !== "monitor" && m.role !== "narrator",
@@ -453,8 +514,27 @@ export const swarmRuntimePlugin = Plugin.define({
       const anyWorking = nonCoord.some((m) => m.state === "working");
       const workers = nonCoord.filter((m) => m.role === "worker");
       const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
-      const isVerifierReport = latestPost.author_name === "verifier" && /\b(PASS|FAIL)\b/i.test(latestPost.body);
+      const latestAuthorMember = db.getMemberByName(swarmId, latestPost.author_name);
+      const isVerifierAuthor =
+        latestAuthorMember?.role === "verifier" ||
+        latestPost.author_name === "verifier" ||
+        /^verifier(-\d+)?$/i.test(latestPost.author_name);
+      const isVerifierReport = isVerifierAuthor && /\b(PASS|FAIL)\b/i.test(latestPost.body);
       const isMonitorStall = latestPost.author_name === "monitor";
+
+      if (options.autoSpawnVerifier !== false && allWorkersDone && !anyWorking && !isVerifierReport) {
+        const outcome = await ensureVerifierForCompletedWork(swarmId, coord, latestPost);
+        if (outcome === "spawned" || outcome === "requested" || outcome === "in_progress") return;
+      }
+
+      if (coord.state !== "waiting" || coord.paused_quota === 1 || waiters.has(coord.id)) {
+        return;
+      }
+
+      const prevCoordinatorWakeSeq = lastCoordinatorWakeSeq.get(swarmId) ?? 0;
+      if (coord.last_read_seq >= latestPost.swarm_seq || prevCoordinatorWakeSeq >= latestPost.swarm_seq) {
+        return;
+      }
       let parsedMentions: string[] = [];
       try {
         parsedMentions = JSON.parse(latestPost.mentions_json || "[]") as string[];
@@ -476,16 +556,14 @@ export const swarmRuntimePlugin = Plugin.define({
       db.setMemberState(coord.id, "working");
       emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
 
-      const allPassOrNoVerifier =
-        allWorkersDone &&
-        !anyWorking &&
-        (isVerifierReport
-          ? /\bPASS\b/i.test(latestPost.body)
-          : !nonCoord.some((m) => m.role === "verifier"));
+      const isVerifierPassReport = isVerifierReport && /\bPASS\b/i.test(latestPost.body);
+      const completeReady = isVerifierPassReport && allWorkersDone && !anyWorking;
 
-      const handoffText = allPassOrNoVerifier
+      const handoffText = completeReady
         ? `All swarm members finished (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Read board updates since #${prevReadSeq} with read_board, present the final summary to the user, and call swarm{action:"complete"}.`
-        : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
+        : allWorkersDone && !anyWorking && !isVerifierReport
+          ? `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Verification is NOT done: no verifier PASS yet. Call read_board(since: ${prevReadSeq}) to review, spawn or repair a verifier (@verifier) to independently verify worker output, and do NOT call swarm{action:"complete"} until a verifier posts PASS.`
+          : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
 
       try {
         await ctx.session.prompt({
@@ -867,7 +945,7 @@ export const swarmRuntimePlugin = Plugin.define({
           options.boardPort ?? 0,
         );
       } catch (err) {
-        console.warn("[swarm-runtime] Failed to start board server:", err);
+        console.warn("[opencode-swarm] Failed to start board server:", err);
       }
     }
 
@@ -1314,7 +1392,7 @@ export const swarmRuntimePlugin = Plugin.define({
         rpcCleanup = () => rpcReg!.dispose!();
       }
     } catch (err) {
-      console.warn("[swarm-runtime] Failed to register RPC domain:", err);
+      console.warn("[opencode-swarm] Failed to register RPC domain:", err);
     }
 
     // -----------------------------------------------------------------------
@@ -1913,7 +1991,7 @@ export const swarmRuntimePlugin = Plugin.define({
           emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
           if (caller.role !== "coordinator") {
             void maybeWakeIdleCoordinator(caller.swarm_id).catch((err) => {
-              console.warn("[swarm-runtime] coordinator wake error:", err);
+              console.warn("[opencode-swarm] coordinator wake error:", err);
             });
           }
 
@@ -2272,14 +2350,14 @@ export const swarmRuntimePlugin = Plugin.define({
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
               }
             } catch (evErr) {
-              console.warn("[swarm-runtime] Event handler error:", evErr);
+              console.warn("[opencode-swarm] Event handler error:", evErr);
             }
           }
           // Stream ended cleanly (e.g. test mock or graceful shutdown)
           break;
         } catch (err) {
           if (abortController.signal.aborted) break;
-          console.warn("[swarm-runtime] Event stream error, resubscribing:", err);
+          console.warn("[opencode-swarm] Event stream error, resubscribing:", err);
           await new Promise<void>((resolveDelay) => {
             const t = setTimeout(resolveDelay, backoffMs);
             abortController.signal.addEventListener(
@@ -2313,6 +2391,8 @@ export const swarmRuntimePlugin = Plugin.define({
       lastCoordinatorWakeSeq.clear();
       lastWakeSeq.clear();
       spawningMembers.clear();
+      autoVerifierSpawns.clear();
+      lastVerificationRequestSeq.clear();
       activeToolCounts.clear();
       quiesceResolvers.clear();
       pendingKillCleanup.clear();
@@ -2320,7 +2400,7 @@ export const swarmRuntimePlugin = Plugin.define({
         try {
           await rpcCleanup();
         } catch (err) {
-          console.warn("[swarm-runtime] rpcCleanup error during shutdown:", err);
+          console.warn("[opencode-swarm] rpcCleanup error during shutdown:", err);
         }
       }
       if (boardServer && !boardServerClosed) {
@@ -2328,7 +2408,7 @@ export const swarmRuntimePlugin = Plugin.define({
         try {
           await boardServer.close();
         } catch (err) {
-          console.warn("[swarm-runtime] boardServer.close error during shutdown:", err);
+          console.warn("[opencode-swarm] boardServer.close error during shutdown:", err);
         }
       }
       if (!dbClosed) {
@@ -2336,7 +2416,7 @@ export const swarmRuntimePlugin = Plugin.define({
         try {
           db.close();
         } catch (err) {
-          console.warn("[swarm-runtime] db.close error during shutdown:", err);
+          console.warn("[opencode-swarm] db.close error during shutdown:", err);
         }
       }
     };

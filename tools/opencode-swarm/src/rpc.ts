@@ -168,7 +168,7 @@ function standardSchema<T>(validate: (value: unknown) => string | null) {
   return {
     "~standard": {
       version: 1 as const,
-      vendor: "swarm-runtime",
+      vendor: "opencode-swarm",
       validate(value: unknown): { value: T } | { issues: readonly { message: string }[] } {
         const issue = validate(value);
         return issue ? { issues: [{ message: issue }] } : { value: value as T };
@@ -181,7 +181,7 @@ function optionalObjectSchema<T>(validate: (value: Record<string, unknown>) => s
   return {
     "~standard": {
       version: 1 as const,
-      vendor: "swarm-runtime",
+      vendor: "opencode-swarm",
       validate(value: unknown): { value: T } | { issues: readonly { message: string }[] } {
         const normalized = value === undefined ? {} : value;
         if (!isObject(normalized)) {
@@ -195,7 +195,7 @@ function optionalObjectSchema<T>(validate: (value: Record<string, unknown>) => s
 }
 
 export const SWARM_RPC_DEF = {
-  id: "local.swarm-runtime",
+  id: "local.opencode-swarm",
   methods: {
     getBoardInfo: {
       input: optionalObjectSchema<Record<string, never>>(() => null),

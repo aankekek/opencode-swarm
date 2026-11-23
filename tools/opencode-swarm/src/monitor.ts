@@ -79,13 +79,13 @@ export function startStallMonitor(
           });
           db.updateMonitorNudge(swarm.id, post.swarm_seq, nextCount);
         } catch (err) {
-          console.error(`[swarm-runtime] monitor error for swarm ${swarm.id}:`, err);
+          console.error(`[opencode-swarm] monitor error for swarm ${swarm.id}:`, err);
         } finally {
           inFlightSwarms.delete(swarm.id);
         }
       }
     } catch (err) {
-      console.error("[swarm-runtime] monitor error:", err);
+      console.error("[opencode-swarm] monitor error:", err);
     }
   }, config.monitorIntervalMs);
 

@@ -196,14 +196,78 @@ describe("Swarm Uninstall Checklist & Complete Removal", () => {
       mkdirSync(dirname(cfgPath), { recursive: true });
       writeFileSync(cfgPath, JSON.stringify({ plugins: ["@slkiser/opencode-quota"] }, null, 2), "utf8");
 
-      const first = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\swarm-runtime");
+      const first = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
       expect(first.changed).toBe(true);
-      const second = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\swarm-runtime");
+      const second = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
       expect(second.changed).toBe(false);
 
       const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
       expect(parsed.plugins.length).toBe(2);
       expect(parsed.plugins[0]).toBe("@slkiser/opencode-quota");
+    } finally {
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test("removeSwarmFromConfigContent removes opencode-swarm paths and local.opencode-swarm entries", () => {
+    const raw = JSON.stringify(
+      {
+        plugins: [
+          "@slkiser/opencode-quota",
+          { package: "../tools/opencode-swarm", options: { boardServer: true } },
+          "local.opencode-swarm",
+        ],
+      },
+      null,
+      2,
+    );
+    const res = removeSwarmFromConfigContent(raw);
+    expect(res.changed).toBe(true);
+    expect(res.emptyAfter).toBe(false);
+    const after = JSON.parse(res.nextContent);
+    expect(after.plugins).toEqual(["@slkiser/opencode-quota"]);
+  });
+
+  test("registerSwarmInGlobalConfig migrates stale swarm-runtime path, preserves options, deduplicates, and is idempotent", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-install-migrate-"));
+    try {
+      const cfgPath = join(root, ".config", "opencode", "opencode.json");
+      mkdirSync(dirname(cfgPath), { recursive: true });
+      writeFileSync(
+        cfgPath,
+        JSON.stringify(
+          {
+            plugins: [
+              "@slkiser/opencode-quota",
+              {
+                package: "C:\\fake\\tools\\swarm-runtime",
+                options: { stallTimeoutMs: 42000, boardServer: false },
+              },
+              "../tools/swarm-runtime",
+            ],
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+
+      const migrated = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
+      expect(migrated.changed).toBe(true);
+
+      const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
+      expect(parsed.plugins).toEqual([
+        "@slkiser/opencode-quota",
+        {
+          package: "C:\\fake\\tools\\opencode-swarm",
+          options: { stallTimeoutMs: 42000, boardServer: false },
+        },
+      ]);
+
+      const again = registerSwarmInGlobalConfig(cfgPath, "C:\\fake\\tools\\opencode-swarm");
+      expect(again.changed).toBe(false);
     } finally {
       try {
         rmSync(root, { recursive: true, force: true });

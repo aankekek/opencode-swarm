@@ -1,6 +1,6 @@
-# OpenCode Desktop GUI Integration (`swarm-runtime`)
+# OpenCode Desktop GUI Integration (`opencode-swarm`)
 
-The `swarm-runtime` plugin provides a native SolidJS OpenCode Desktop GUI (`dist/gui-experimental.cjs`) built with `@opencode/plugin/gui`, `ctx.ui.*`, `solid-js`, and `effect` (`Schema` for `ctx.storage.store`).
+The `opencode-swarm` plugin provides a native SolidJS OpenCode Desktop GUI (`dist/gui-experimental.cjs`) built with `@opencode/plugin/gui`, `ctx.ui.*`, `solid-js`, and `effect` (`Schema` for `ctx.storage.store`).
 
 ## Surfaces
 

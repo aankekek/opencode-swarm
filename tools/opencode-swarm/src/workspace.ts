@@ -104,7 +104,7 @@ export function cleanupMemberWorkspace(args: {
       errors.push(`Workspace directory still exists: ${args.dir}`);
     }
     if (errors.length > 0) {
-      console.warn(`[swarm-runtime] Workspace cleanup warning for ${args.dir}: ${errors.join("; ")}`);
+      console.warn(`[opencode-swarm] Workspace cleanup warning for ${args.dir}: ${errors.join("; ")}`);
       return { ok: false, error: errors.join("; ") };
     }
     return { ok: true };
@@ -120,7 +120,7 @@ export function cleanupMemberWorkspace(args: {
     errors.push(`Workspace directory still exists: ${args.dir}`);
   }
   if (errors.length > 0) {
-    console.warn(`[swarm-runtime] Workspace cleanup warning for ${args.dir}: ${errors.join("; ")}`);
+    console.warn(`[opencode-swarm] Workspace cleanup warning for ${args.dir}: ${errors.join("; ")}`);
     return { ok: false, error: errors.join("; ") };
   }
   return { ok: true };

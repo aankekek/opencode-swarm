@@ -168,7 +168,7 @@ export class SwarmBoardDB {
       try {
         this.db.exec("ROLLBACK");
       } catch (rbErr) {
-        console.warn("[swarm-runtime] SQLite ROLLBACK failed:", rbErr);
+        console.warn("[opencode-swarm] SQLite ROLLBACK failed:", rbErr);
       }
       throw err;
     }
@@ -834,7 +834,7 @@ export class SwarmBoardDB {
         "utf8",
       );
     } catch (err) {
-      console.warn("[swarm-runtime] Failed to sync members.json:", err);
+      console.warn("[opencode-swarm] Failed to sync members.json:", err);
     }
   }
 
@@ -849,7 +849,7 @@ export class SwarmBoardDB {
       });
       appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), line + "\n", "utf8");
     } catch (err) {
-      console.warn("[swarm-runtime] Failed to append board.jsonl:", err);
+      console.warn("[opencode-swarm] Failed to append board.jsonl:", err);
     }
   }
 }

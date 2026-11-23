@@ -449,7 +449,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
       server.removeListener("error", onStartupError);
       server.on("error", (err) => {
         dead = true;
-        console.error("[swarm-runtime] board-server error:", err);
+        console.error("[opencode-swarm] board-server error:", err);
       });
       server.on("close", () => {
         dead = true;

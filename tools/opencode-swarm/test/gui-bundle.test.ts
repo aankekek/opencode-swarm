@@ -6,7 +6,7 @@ import { SWARM_RPC_DEF } from "../src/rpc.js";
 
 describe("OpenCode v2 GUI experimental bundle", () => {
   test("SWARM_RPC_DEF exposes Standard Schema v1 validators for all methods and events", () => {
-    expect(SWARM_RPC_DEF.id).toBe("local.swarm-runtime");
+    expect(SWARM_RPC_DEF.id).toBe("local.opencode-swarm");
 
     for (const [name, method] of Object.entries(SWARM_RPC_DEF.methods)) {
       expect(method.input["~standard"].version).toBe(1);
@@ -29,7 +29,7 @@ describe("OpenCode v2 GUI experimental bundle", () => {
     const code = readFileSync(bundlePath, "utf8");
 
     expect(code).toContain("use strict");
-    expect(code).toContain("local.swarm-runtime");
+    expect(code).toContain("local.opencode-swarm");
     expect(code).toContain("getSwarmSnapshot");
     expect(code).toContain("listSwarms");
     expect(code).toContain("~standard");

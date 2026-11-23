@@ -40,6 +40,8 @@ export interface PluginOptions {
   debugEvents?: boolean;
   /** Logs permission.evaluate and execute.before payloads to hooks.debug.jsonl. */
   debugHooks?: boolean;
+  /** Auto-spawn a verifier when all worker tracks are done and no verification ran (default: true). */
+  autoSpawnVerifier?: boolean;
 }
 
 export interface SwarmRow {

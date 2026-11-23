@@ -35,12 +35,12 @@ export function SwarmSettingsView(props: SwarmSettingsViewProps) {
     const s = props.rpcStatus();
     if (s.state === "connected") {
       const count = props.activeSwarmCount();
-      return `Connected to local.swarm-runtime (${count} swarm${count === 1 ? "" : "s"} recorded).`;
+      return `Connected to local.opencode-swarm (${count} swarm${count === 1 ? "" : "s"} recorded).`;
     }
     if (s.state === "unavailable") {
-      return "Server plugin (local.swarm-runtime) is not loaded for this workspace.";
+      return "Server plugin (local.opencode-swarm) is not loaded for this workspace.";
     }
-    return s.message ? `RPC error: ${s.message}` : "Unable to reach local.swarm-runtime.";
+    return s.message ? `RPC error: ${s.message}` : "Unable to reach local.opencode-swarm.";
   };
 
   return (
