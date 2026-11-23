@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startBoardServer, type BoardServerDeps } from "../src/board-server.js";
@@ -302,5 +302,17 @@ describe("board-server", () => {
       sqlite.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("board polling cannot hang: requests are abortable and always reschedule", () => {
+    const src = readFileSync(new URL("../assets/swarm_board/app.js", import.meta.url), "utf8");
+    // (a) the GET passes an abort signal to fetch
+    expect(src).toMatch(/method:\s*['"]GET['"][\s\S]{0,200}?signal/);
+    // (b) a timeout controller drives that signal
+    expect(/AbortController|AbortSignal\.timeout/.test(src)).toBe(true);
+    // (c) the next poll stays scheduled from finally, so an error cannot stall it
+    expect(src).toMatch(/finally\s*\{[^}]*setTimeout\(\s*poll\s*,/);
+    // and overlapping invocations are guarded
+    expect(src).toMatch(/pollInFlight/);
   });
 });

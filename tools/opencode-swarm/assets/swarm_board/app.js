@@ -14,6 +14,9 @@
 (() => {
   const POLL_MS = 1500;       // live refresh while a swarm is shown
   const IDLE_POLL_MS = 3000;  // re-resolve cadence while there is no swarm
+  const REQUEST_TIMEOUT_MS = 5000;  // a hung request must not freeze polling
+  // True while a poll is in progress, so a manual/second call cannot overlap.
+  let pollInFlight = false;
   const $ = (id) => document.getElementById(id);
   const state = {
     conv: null,       // conversation the shown data was resolved for
@@ -51,11 +54,20 @@
   const currentConv = () => window.sidecar?.conversationId || params.get('conversationId') || '';
 
   // GET routes bypass token auth, so plain fetch works both in the iframe and standalone.
-  async function getJson(path) {
+  async function getJson(path, timeoutMs = REQUEST_TIMEOUT_MS) {
     const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
-    const res = await f(path, { method: 'GET' });
-    if (!res.ok) throw new Error(`${path}: ${res.status}`);
-    return res.json();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await f(path, { method: 'GET', signal: ctrl.signal });
+      if (!res.ok) throw new Error(`${path}: ${res.status}`);
+      return res.json();
+    } catch (e) {
+      if (ctrl.signal.aborted) throw new Error(`${path}: timed out after ${timeoutMs}ms`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ---------- theme ----------
@@ -362,6 +374,8 @@
   }
 
   async function poll() {
+    if (pollInFlight) return;
+    pollInFlight = true;
     let delay = POLL_MS;
     try {
       const conv = currentConv();
@@ -392,6 +406,7 @@
     } catch (e) {
       console.warn(e);
     } finally {
+      pollInFlight = false;
       setLive(Date.now() - state.lastOk <= POLL_MS * 4);
       setTimeout(poll, delay);
     }
