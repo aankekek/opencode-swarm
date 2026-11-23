@@ -45,8 +45,14 @@ export function normalizeHandle(raw: string): string {
 
 export function isProtectedRepoPath(repoRelPath: string): boolean {
   const norm = repoRelPath.replace(/\\/g, "/").replace(/^\.\//, "");
-  const firstSegment = (norm.split("/")[0] ?? "").toLowerCase();
-  return PROTECTED_TOP_DIRS.has(firstSegment);
+  // Any segment may be a protected directory: a worker owning `packages/**` must
+  // not reach `packages/app/.git/config` or `packages/app/node_modules/...`.
+  // Compare whole segments only, so near-misses such as `.gitignore`,
+  // `.gitmodules`, `.opencode.json` or `node_modules-cache` stay allowed.
+  return norm
+    .split("/")
+    .filter(Boolean)
+    .some((segment) => PROTECTED_TOP_DIRS.has(segment.toLowerCase()));
 }
 
 const MAX_SYMLINK_HOPS = 40;

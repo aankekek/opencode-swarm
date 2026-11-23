@@ -65,6 +65,38 @@ describe("security & path/glob validation", () => {
     }
   });
 
+  test("resolveSafeWorkspacePath blocks nested protected dirs in any segment", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-nested-protected-"));
+    try {
+      // A worker owning `packages/**` must not reach nested repo-control dirs.
+      expect(() => resolveSafeWorkspacePath(root, "packages/a/.git/config")).toThrow(/Protected repository path/);
+      expect(() => resolveSafeWorkspacePath(root, "packages/a/node_modules/x/index.js")).toThrow(/Protected repository path/);
+      expect(() => resolveSafeWorkspacePath(root, "a/b/.opencode/state.json")).toThrow(/Protected repository path/);
+      // Case-insensitive exact segment matches.
+      expect(() => resolveSafeWorkspacePath(root, "packages/A/.GIT/config")).toThrow(/Protected repository path/);
+
+      // Near-misses must stay allowed (exact segment comparison only).
+      expect(resolveSafeWorkspacePath(root, "src/.gitignore")).toBe("src/.gitignore");
+      expect(resolveSafeWorkspacePath(root, "src/.gitmodules")).toBe("src/.gitmodules");
+      expect(resolveSafeWorkspacePath(root, ".opencode.json")).toBe(".opencode.json");
+      expect(resolveSafeWorkspacePath(root, "src/node_modules.ts")).toBe("src/node_modules.ts");
+      expect(resolveSafeWorkspacePath(root, "lib/my.git/file.ts")).toBe("lib/my.git/file.ts");
+      expect(resolveSafeWorkspacePath(root, "node_modules-cache/x")).toBe("node_modules-cache/x");
+      expect(resolveSafeWorkspacePath(root, "sub/node_modules.ts")).toBe("sub/node_modules.ts");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ownership globs reject nested protected dirs but allow near-misses", () => {
+    expect(() => validateAndNormalizeGlob("packages/a/node_modules/**")).toThrow(/Protected path/);
+    expect(() => validateAndNormalizeGlob("packages/a/.git/**")).toThrow(/Protected path/);
+    expect(() => validateAndNormalizeGlob("packages/.opencode/*")).toThrow(/Protected path/);
+    expect(validateAndNormalizeGlob("packages/a/.gitignore")).toBe("packages/a/.gitignore");
+    expect(validateAndNormalizeGlob("src/node_modules.ts")).toBe("src/node_modules.ts");
+    expect(validateAndNormalizeGlob("node_modules-cache/**")).toBe("node_modules-cache/**");
+  });
+
   test("resolveSafeWorkspacePath blocks dangling symlink escapes (SEC-H4)", () => {
     const root = mkdtempSync(join(tmpdir(), "swarm-symlink-root-"));
     const outside = mkdtempSync(join(tmpdir(), "swarm-symlink-outside-"));
