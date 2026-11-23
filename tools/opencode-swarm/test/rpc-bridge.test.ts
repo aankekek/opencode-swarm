@@ -327,7 +327,11 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
     expect(COORDINATOR_PROTOCOL).toMatch(/N items is N units/i);
     expect(COORDINATOR_PROTOCOL).toMatch(/group by area/i);
     expect(COORDINATOR_PROTOCOL).toMatch(/maxWorkers/);
+    expect(COORDINATOR_PROTOCOL).toMatch(/maxShardsPerAdd/);
     expect(COORDINATOR_PROTOCOL).toMatch(/do not retry blindly/i);
+    expect(COORDINATOR_PROTOCOL).toMatch(/one worker per unit|one unit means one worker/i);
+    expect(COORDINATOR_PROTOCOL.toLowerCase()).not.toContain("do not spawn a swarm");
+    expect(COORDINATOR_PROTOCOL.match(/## Finish/g)).toHaveLength(1);
   });
 
   test("add rejects more shards than the default shard cap", async () => {

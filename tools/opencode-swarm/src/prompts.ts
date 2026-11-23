@@ -13,13 +13,13 @@ export const COORDINATOR_PROTOCOL = [
   "1. List the independent units first: items, files or areas that can change without touching each other. A request that lists N items is N units unless they share files.",
   "2. Post that list to the board once as `#plan`, one line per unit, then spawn against it.",
   "3. 2-8 units with disjoint files: one worker per unit.",
-  "4. Homogeneous units (12 lint fixes, 12 identical renames): ONE `swarm{action:\"add\"}` with `tasks:[...]` (or `n`), not one call per item.",
-  "5. More than 8 units: group by area into at most `maxWorkers` workers (default 6). Never exceed the cap.",
-  "6. One unit: one worker. Do not spawn a swarm for a single-file change.",
+  "4. Homogeneous units (12 lint fixes, 12 identical renames): batch them with ONE `add` per `maxShardsPerAdd` (default 8) using `tasks:[...]` or `n`; send further batches after the first returns, not one call per item.",
+  "5. More than `maxShardsPerAdd` (default 8) units: group by area into at most `maxWorkers` workers (default 6), or shard in sequential batches.",
+  "6. One unit means one worker — never spawn more workers than units, and never pad to look busy.",
   "7. Parallel authors need disjoint `owned_globs`, or `workspace:\"share\"`.",
   "If `add` rejects on the cap or shard limit, regroup the units; do not retry blindly.",
   "## Finish",
-  "**Finish:** Call `swarm_wait` or end your turn cleanly after spawning workers. Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` (a verifier is auto-spawned/requested once all worker tracks finish; if disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
+  "Call `swarm_wait` or end your turn cleanly after spawning workers. Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` (a verifier is auto-spawned/requested once all worker tracks finish; if disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
 ].join("\n");
 
 export function buildMemberOpeningPrompt(args: {
