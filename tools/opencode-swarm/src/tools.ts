@@ -931,7 +931,7 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           since: {
             type: "number",
             description:
-              "Board post sequence number (seq, e.g. 12) to wait after — NOT seconds or milliseconds. Omit to use your current read/wake cursor.",
+              "Board post sequence number (seq, e.g. 12) you have actually read — NOT seconds/ms and NOT the unread board head. Omit to use your current read/wake cursor.",
           },
           mentions_only: {
             type: "boolean",
@@ -949,10 +949,11 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
         const input = (rawInput ?? {}) as { since?: number; mentions_only?: boolean };
         const mentionsOnly = input.mentions_only ?? true;
         const latestSeq = db.getLatestPost(caller.swarm_id)?.swarm_seq ?? 0;
+        const readFloor = Math.max(caller.last_read_seq, mentionsOnly ? deps.getLastWakeSeq(caller.id) : 0);
         const rawSince =
           typeof input.since === "number" && Number.isFinite(input.since)
             ? Math.max(0, Math.floor(input.since))
-            : Math.max(caller.last_read_seq, mentionsOnly ? deps.getLastWakeSeq(caller.id) : 0);
+            : readFloor;
         const sinceSeq = Math.min(rawSince, latestSeq);
 
         // Race-free check: if matching posts already exist after sinceSeq, return immediately
@@ -972,6 +973,29 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               text: p.body,
             })),
           });
+        }
+
+        // Park guard: prevent an agent from passing an unread board head as `since`
+        // and sleeping right past unread matching posts between readFloor and sinceSeq.
+        if (sinceSeq > readFloor) {
+          const missed = checkPendingWakePosts(db, caller, readFloor, mentionsOnly);
+          if (missed.length > 0) {
+            const maxSeq = missed[missed.length - 1].swarm_seq;
+            deps.recordWakeSeq(caller.id, maxSeq);
+            if (!mentionsOnly) {
+              db.advanceReadCursor(caller.id, maxSeq);
+            }
+            return toolJson({
+              woken: true,
+              guard: "[board] new messages arrived before your requested `since`; read_board before waiting again.",
+              posts: missed.map((p) => ({
+                seq: p.swarm_seq,
+                channel: p.channel,
+                author: p.author_name,
+                text: p.body,
+              })),
+            });
+          }
         }
 
         if (caller.role === "coordinator") {

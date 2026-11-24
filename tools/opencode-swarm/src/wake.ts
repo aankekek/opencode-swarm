@@ -118,6 +118,9 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
       }
       // If the waiter did not match the trigger post (e.g. unsubscribed channel or not mentioned),
       // do not fall through to session.prompt to avoid double-waking a parked member.
+      console.warn(
+        `[opencode-swarm] swarm ${member.swarm_id}: #${triggerPost.swarm_seq} by @${triggerPost.author_name} targeted parked member @${member.name} (wake=${waiter.mentionsOnly ? "mentions" : "any"}, wait_since=${waiter.sinceSeq}, last_read=${member.last_read_seq}) but matched 0 posts`,
+      );
       return;
     }
 

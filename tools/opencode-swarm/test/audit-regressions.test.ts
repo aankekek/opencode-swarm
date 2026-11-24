@@ -1652,4 +1652,84 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       } catch {}
     }
   });
+
+  test("U1: swarm_park_guard blocks sleeping past unread @mention when caller passes board head as since", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-u1-park-guard-mentions-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const waitTool = tools.get("swarm_wait");
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+
+      // Coordinator posts @w1 mention at seq 2 and another post at seq 3 while w1 is working
+      await postTool.execute({ text: "@w1 fix edge case" }, { sessionID: "sess_coord" });
+      await postTool.execute({ text: "general status update" }, { sessionID: "sess_coord" });
+
+      // w1 mistakenly passes board head (since: 3) without reading seq 2 -> park guard must wake immediately with seq 2
+      const waitRes = JSON.parse((await waitTool.execute({ since: 3 }, { sessionID: w1Sess })).content);
+      expect(waitRes.woken).toBe(true);
+      expect(String(waitRes.guard)).toContain("read_board before waiting again");
+      expect(waitRes.posts.some((p: any) => p.seq === 2 && p.text.includes("@w1 fix edge case"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("U2: swarm_park_guard with mentions_only:false blocks sleeping past unread posts, then parks once caught up", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-u2-park-guard-any-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const waitTool = tools.get("swarm_wait");
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+
+      // Coordinator posts a general message without mentioning w1 (seq 2)
+      await postTool.execute({ text: "unmentioned board post" }, { sessionID: "sess_coord" });
+
+      // w1 calls swarm_wait({ since: 2, mentions_only: false }) -> park guard returns seq 2 immediately and advances cursor
+      const guardedRes = JSON.parse(
+        (await waitTool.execute({ since: 2, mentions_only: false }, { sessionID: w1Sess })).content,
+      );
+      expect(guardedRes.woken).toBe(true);
+      expect(String(guardedRes.guard)).toContain("read_board before waiting again");
+      expect(guardedRes.posts.some((p: any) => p.seq === 2 && p.text === "unmentioned board post")).toBe(true);
+
+      // Now w1 is caught up to seq 2 -> calling swarm_wait({ since: 2, mentions_only: false }) parks and wakes on seq 3
+      const waitPromise = waitTool.execute({ since: 2, mentions_only: false }, { sessionID: w1Sess });
+      await new Promise((r) => setTimeout(r, 20));
+      await postTool.execute({ text: "next board update" }, { sessionID: "sess_coord" });
+      const wokenRes = JSON.parse((await waitPromise).content);
+      expect(wokenRes.woken).toBe(true);
+      expect(wokenRes.guard).toBeUndefined();
+      expect(wokenRes.posts.some((p: any) => p.seq === 3 && p.text === "next board update")).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });
