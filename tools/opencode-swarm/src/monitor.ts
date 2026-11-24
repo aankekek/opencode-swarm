@@ -52,6 +52,59 @@ export function buildVerificationIncompleteNudge(swarmId: string, verifier?: Mem
   return `@coordinator [stall] Swarm '${swarmId}' is idle with all tracks done, but verification is incomplete: no live verifier exists. Spawn a verifier to independently verify the finished work, and do not mark the swarm complete until it posts PASS.`;
 }
 
+function safeParseMentions(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Board-truth check for an unanswered @mention: returns the newest waiting/stopped
+ * non-coordinator member whose latest @mention post has seq > its last_post_seq.
+ * Judges from board posts rather than wait_since (which moves past failed turns).
+ */
+export function findUnansweredMentionTarget(
+  members: MemberRow[],
+  posts: BoardPostRow[],
+): { member: MemberRow; mentionPost: BoardPostRow } | undefined {
+  const latestPostSeqByAuthor = new Map<string, number>();
+  for (const p of posts) {
+    if (p.author_name === "monitor" || p.author_name === "narrator") continue;
+    latestPostSeqByAuthor.set(p.author_name, Math.max(latestPostSeqByAuthor.get(p.author_name) ?? 0, p.swarm_seq));
+  }
+
+  const candidates = members.filter(
+    (m) =>
+      m.role !== "coordinator" &&
+      m.role !== "monitor" &&
+      m.role !== "narrator" &&
+      (m.state === "waiting" || m.state === "stopped"),
+  );
+  if (candidates.length === 0) return undefined;
+
+  for (let i = posts.length - 1; i >= 0; i--) {
+    const p = posts[i];
+    if (p.author_name === "monitor" || p.author_name === "narrator") continue;
+    const mentions = safeParseMentions(p.mentions_json);
+    if (mentions.length === 0) continue;
+
+    for (const m of candidates) {
+      if (p.author_name === m.name) continue;
+      const isMentioned = mentions.includes(m.name) || (m.group_prefix !== null && mentions.includes(m.group_prefix));
+      if (!isMentioned) continue;
+      const memberLastPostSeq = Math.max(m.last_post_seq ?? 0, latestPostSeqByAuthor.get(m.name) ?? 0);
+      if (p.swarm_seq > memberLastPostSeq) {
+        return { member: m, mentionPost: p };
+      }
+    }
+  }
+  return undefined;
+}
+
 export function startStallMonitor(
   db: SwarmBoardDB,
   config: MonitorConfig,
@@ -65,6 +118,9 @@ export function startStallMonitor(
   // Last coverage nudge per swarm: the board seq it was based on and how many
   // plan units were still unassigned then. Bounded by the active swarms.
   const lastCoverage = new Map<string, { seq: number; open: number }>();
+  // Tracks the last unanswered @mention we directly re-pinged per swarm so the
+  // next stalled tick escalates to @coordinator instead of re-pinging forever.
+  const pingedUnanswered = new Map<string, { memberName: string; mentionSeq: number }>();
   const postTimeoutMs = Math.max(100, Math.min(config.monitorIntervalMs, 15_000));
   const maxWorkers = config.maxWorkers ?? 6;
 
@@ -76,6 +132,7 @@ export function startStallMonitor(
         activeSwarmIds.add(swarm.id);
         if (swarm.status !== "running") {
           lastCoverage.delete(swarm.id);
+          pingedUnanswered.delete(swarm.id);
           continue;
         }
         if (swarm.owner_pid && swarm.owner_pid !== process.pid) continue;
@@ -133,6 +190,11 @@ export function startStallMonitor(
           const openWorkers = members.filter((m) => m.role === "worker" && m.track_status === "open");
           const verifier = members.find((m) => m.role === "verifier");
           const hasPass = hasFreshVerifierPass(db, swarm.id, members);
+          const unanswered = !coverageDue ? findUnansweredMentionTarget(members, windowPosts) : undefined;
+          const actionableUnanswered =
+            unanswered && (unanswered.member.track_status === "open" || (unanswered.member.role === "verifier" && !hasPass))
+              ? unanswered
+              : undefined;
 
           let nudgeMessage: string;
           if (coverageDue) {
@@ -144,8 +206,22 @@ export function startStallMonitor(
             } else {
               nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned, ${activeWorkers} worker(s) live (cap ${maxWorkers}). Spawn one worker per unit, group by area, or shard with add{tasks}. Use swarm{action:"plan"} to adjust the plan.`;
             }
-          } else if (coordinator && latestPost && latestPost.swarm_seq > coordinator.last_read_seq) {
+          } else if (coordinator && latestPost && latestPost.author_name !== "monitor" && latestPost.swarm_seq > coordinator.last_read_seq) {
             nudgeMessage = `@coordinator [stall] #${latestPost.swarm_seq} (from @${latestPost.author_name}) is unread; all members are waiting.`;
+          } else if (actionableUnanswered) {
+            const prevPing = pingedUnanswered.get(swarm.id);
+            const alreadyPinged =
+              prevPing?.memberName === actionableUnanswered.member.name &&
+              prevPing?.mentionSeq === actionableUnanswered.mentionPost.swarm_seq;
+            if (actionableUnanswered.member.paused_quota === 1 || alreadyPinged) {
+              nudgeMessage = `@coordinator [stall] @${actionableUnanswered.member.name} has not answered #${actionableUnanswered.mentionPost.swarm_seq}${alreadyPinged ? " even after a direct re-ping" : ""}${actionableUnanswered.member.paused_quota ? " (paused_quota)" : ""}. It may be stuck or out of quota — switch its model or reassign the work.`;
+            } else {
+              pingedUnanswered.set(swarm.id, {
+                memberName: actionableUnanswered.member.name,
+                mentionSeq: actionableUnanswered.mentionPost.swarm_seq,
+              });
+              nudgeMessage = `@${actionableUnanswered.member.name} [stall] #${actionableUnanswered.mentionPost.swarm_seq} is waiting on your reply (last_post_seq=${actionableUnanswered.member.last_post_seq}). Please respond or post [blocked] to @coordinator.`;
+            }
           } else if (openWorkers.length > 0) {
             const summary = openWorkers
               .map((w: MemberRow) => `@${w.name} (${w.paused_quota ? "paused_quota" : w.state})`)
@@ -191,9 +267,12 @@ export function startStallMonitor(
           inFlightSwarms.delete(swarm.id);
         }
       }
-      // Drop coverage state for swarms that are no longer active.
+      // Drop coverage and ping state for swarms that are no longer active.
       for (const id of lastCoverage.keys()) {
         if (!activeSwarmIds.has(id)) lastCoverage.delete(id);
+      }
+      for (const id of pingedUnanswered.keys()) {
+        if (!activeSwarmIds.has(id)) pingedUnanswered.delete(id);
       }
     } catch (err) {
       console.error("[opencode-swarm] monitor error:", err);

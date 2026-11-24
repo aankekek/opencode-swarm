@@ -6,7 +6,7 @@ import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
 import { parseQuotaRetryDelayMs } from "../src/plugin.js";
 import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
-import { buildVerificationIncompleteNudge, hasFreshVerifierPass } from "../src/monitor.js";
+import { buildVerificationIncompleteNudge, findUnansweredMentionTarget, hasFreshVerifierPass } from "../src/monitor.js";
 import { parseMentionsFromText } from "../src/mentions.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "../src/prompts.js";
 
@@ -1988,6 +1988,98 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       const w1 = snap.members.find((m: any) => m.name === "w1");
       expect(w1.paused_quota).toBe(true);
       expect(w1.state).toBe("waiting");
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("X1: findUnansweredMentionTarget uses board truth regardless of wait_since", () => {
+    const w1: any = {
+      id: "m_w1",
+      swarm_id: "sw1",
+      name: "w1",
+      role: "worker",
+      group_prefix: null,
+      state: "waiting",
+      wait_since: 10, // wait_since moved past mention #5
+      last_post_seq: 0,
+      track_status: "open",
+    };
+    const posts: any[] = [
+      {
+        seq: 5,
+        swarm_id: "sw1",
+        swarm_seq: 5,
+        channel: "main",
+        author_name: "coordinator",
+        mentions_json: JSON.stringify(["w1"]),
+        channel_mentions_json: "[]",
+        is_all: 0,
+        body: "@w1 please fix parser",
+        created_at: 100,
+      },
+    ];
+    const hit = findUnansweredMentionTarget([w1], posts);
+    expect(hit?.member.name).toBe("w1");
+    expect(hit?.mentionPost.swarm_seq).toBe(5);
+
+    // Once w1 posts #6, mention #5 is answered
+    posts.push({
+      seq: 6,
+      swarm_id: "sw1",
+      swarm_seq: 6,
+      channel: "main",
+      author_name: "w1",
+      mentions_json: JSON.stringify(["coordinator"]),
+      channel_mentions_json: "[]",
+      is_all: 0,
+      body: "@coordinator [done] fixed",
+      created_at: 200,
+    });
+    expect(findUnansweredMentionTarget([w1], posts)).toBeUndefined();
+  });
+
+  test("X2: stall monitor re-pings unanswered @worker once, then escalates to @coordinator on next tick", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-x2-monitor-escalate-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    ctx.options.stallTimeoutMs = 35;
+    ctx.options.monitorIntervalMs = 20;
+
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const readTool = tools.get("read_board");
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+
+      // w1 goes idle without posting; coordinator is caught up
+      pushEvent({ type: "session.status", data: { sessionID: w1Sess, status: { type: "idle" } } });
+      await readTool.execute({ since: 0 }, { sessionID: "sess_coord" });
+
+      // Wait for tick 1 (re-ping @w1)
+      await new Promise((r) => setTimeout(r, 65));
+      // w1 finishes/parks after the re-ping without posting
+      pushEvent({ type: "session.status", data: { sessionID: w1Sess, status: { type: "idle" } } });
+      // Wait for tick 2 (escalate to @coordinator)
+      await new Promise((r) => setTimeout(r, 65));
+
+      const board = JSON.parse((await readTool.execute({ since: 0, limit: 50 }, { sessionID: "sess_coord" })).content);
+      const monitorPosts = board.posts.filter((p: any) => p.author === "monitor");
+      expect(monitorPosts.length).toBeGreaterThanOrEqual(2);
+      expect(monitorPosts[0].text).toMatch(/^@w1 \[stall\] #1/);
+      expect(monitorPosts[1].text).toMatch(/^@coordinator \[stall\] @w1 has not answered #1/);
+      expect(monitorPosts[1].text).toContain("direct re-ping");
+      expect(monitorPosts[1].text).toContain("switch its model");
     } finally {
       await cleanup();
       try {
