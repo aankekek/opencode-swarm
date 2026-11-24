@@ -108,7 +108,7 @@ export function startStallMonitor(
           if (now - lastActivity < config.stallTimeoutMs) continue;
 
           const counts = db.getTaskCounts(swarm.id);
-          const liveWorkers = members.filter((m) => m.role === "worker").length;
+          const activeWorkers = members.filter((m) => m.role === "worker" && m.track_status === "open").length;
           const anyWorking = members.some((m) => m.state === "working");
           // Board movement means someone other than the monitor/narrator posted;
           // nudge posts of our own must not look like fresh activity.
@@ -137,10 +137,10 @@ export function startStallMonitor(
           let nudgeMessage: string;
           if (coverageDue) {
             lastCoverage.set(swarm.id, { seq: movementSeq, open: counts.open });
-            if (liveWorkers >= maxWorkers) {
+            if (activeWorkers >= maxWorkers) {
               nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned and the worker cap ${maxWorkers} is reached. Finish current tracks so units free, or group the remaining units into fewer workers.`;
             } else {
-              nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned, ${liveWorkers} worker(s) live (cap ${maxWorkers}). Spawn one worker per unit, group by area, or shard with add{tasks}. Use swarm{action:"plan"} to adjust the plan.`;
+              nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned, ${activeWorkers} worker(s) live (cap ${maxWorkers}). Spawn one worker per unit, group by area, or shard with add{tasks}. Use swarm{action:"plan"} to adjust the plan.`;
             }
           } else if (coordinator && latestPost && latestPost.swarm_seq > coordinator.last_read_seq) {
             nudgeMessage = `@coordinator [stall] #${latestPost.swarm_seq} (from @${latestPost.author_name}) is unread; all members are waiting.`;

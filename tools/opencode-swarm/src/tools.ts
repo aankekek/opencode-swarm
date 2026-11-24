@@ -316,12 +316,14 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               error: `task_ids has ${requestedTaskIds.length} id(s) but ${requested} member(s) will be spawned; provide exactly one id per member.`,
             });
           }
-          const liveWorkersBefore = db.listMembers(swarmId, false).filter((m) => m.role === "worker");
-          if (role === "worker" && liveWorkersBefore.length + requested > cap) {
+          const activeWorkersBefore = db
+            .listMembers(swarmId, false)
+            .filter((m) => m.role === "worker" && m.track_status === "open");
+          if (role === "worker" && activeWorkersBefore.length + requested > cap) {
             return toolJson({
               ok: false,
-              error: `Worker cap ${cap} reached (${liveWorkersBefore.length} live + ${requested} requested). Group units or finish tracks first.`,
-              workers: liveWorkersBefore.length,
+              error: `Worker cap ${cap} reached (${activeWorkersBefore.length} active + ${requested} requested). Group units or finish tracks first.`,
+              workers: activeWorkersBefore.length,
               cap,
             });
           }

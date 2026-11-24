@@ -238,7 +238,29 @@ describe("stall monitor coverage nudge", () => {
     }
   });
 
-  test("uses the at-cap message when live workers reach maxWorkers", async () => {
+  test("uses the at-cap message when active open-track workers reach maxWorkers", async () => {
+    const workers = Array.from({ length: 6 }, (_, i) =>
+      makeMember({
+        id: `m_worker_${i}`,
+        name: `worker-${i + 1}`,
+        role: "worker",
+        session_id: `sess_worker_${i}`,
+        track_status: "open",
+      }),
+    );
+    const fixture = makeCoverageFixture({ open: 4, members: [makeMember(), ...workers] });
+    const stop = startCoverageMonitor(fixture, 6);
+    try {
+      expect(await waitUntil(() => coverageBodies(fixture).length === 1, 1000)).toBe(true);
+      const body = coverageBodies(fixture)[0];
+      expect(body).toContain("4 unit(s) unassigned");
+      expect(body).toContain("cap 6 is reached");
+    } finally {
+      stop();
+    }
+  });
+
+  test("does not treat finished track_status=done workers as occupying maxWorkers cap", async () => {
     const workers = Array.from({ length: 6 }, (_, i) =>
       makeMember({
         id: `m_worker_${i}`,
@@ -254,7 +276,8 @@ describe("stall monitor coverage nudge", () => {
       expect(await waitUntil(() => coverageBodies(fixture).length === 1, 1000)).toBe(true);
       const body = coverageBodies(fixture)[0];
       expect(body).toContain("4 unit(s) unassigned");
-      expect(body).toContain("cap 6 is reached");
+      expect(body).toContain("0 worker(s) live (cap 6)");
+      expect(body).not.toContain("cap 6 is reached");
     } finally {
       stop();
     }

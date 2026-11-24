@@ -793,4 +793,37 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       { maxWorkers: 0, maxShardsPerAdd: -3 },
     );
   });
+
+  test("finished workers free maxWorkers cap slots for subsequent batches", async () => {
+    await withBridgeHarness(
+      async ({ registeredTools }) => {
+        const swarmTool = registeredTools.get("swarm")!;
+        const postTool = registeredTools.get("post_message")!;
+        const toolCtx = { sessionID: "coord-sess-1" };
+        await swarmTool.execute({ action: "title", title: "Batched cap" }, toolCtx);
+
+        const batch1 = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "batch", brief: "work", n: 2 }, toolCtx),
+        );
+        expect(batch1.ok).toBe(true);
+
+        const blocked = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "third", brief: "work" }, toolCtx),
+        );
+        expect(blocked.ok).toBe(false);
+        expect(String(blocked.error)).toContain("Worker cap 2 reached (2 active + 1 requested)");
+
+        for (const s of batch1.spawned as Array<{ session_id: string }>) {
+          await postTool.execute({ text: "[done] finished batch 1" }, { sessionID: s.session_id });
+        }
+
+        const batch2 = parseToolResult(
+          await swarmTool.execute({ action: "add", name: "third", brief: "work" }, toolCtx),
+        );
+        expect(batch2.ok).toBe(true);
+        expect(batch2.open_tracks).toBe(1);
+      },
+      { maxWorkers: 2, autoSpawnVerifier: false },
+    );
+  });
 });
