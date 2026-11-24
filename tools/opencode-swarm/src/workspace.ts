@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { SwarmBoardDB, PendingProvisionRow } from "./db.js";
 import type { WorkspaceMode } from "./types.js";
+
+export const MAX_BRANCH_COPY_ENTRIES = 5_000;
+export const MAX_BRANCH_COPY_BYTES = 256 * 1024 * 1024; // 256 MiB
 
 function runGit(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -42,26 +45,102 @@ export function provisionedWorkspacePaths(args: {
   return { dir: join(args.dataDir, "clones", args.swarmId, args.memberName), branch };
 }
 
+/**
+ * Copies a non-git workspace into `destDir` using a two-phase scan-then-copy
+ * with strict entry count and total byte limits, skipping symlinks and any
+ * nested `dataDir`.
+ */
+function copyNonGitWorkspace(
+  srcRoot: string,
+  destDir: string,
+  dataDir: string,
+  maxEntries: number,
+  maxBytes: number,
+): void {
+  const resolvedSrc = resolve(srcRoot);
+  const resolvedDataDir = resolve(dataDir);
+  const dirsToCreate: string[] = [];
+  const filesToCopy: Array<{ src: string; rel: string }> = [];
+  let entries = 0;
+  let totalBytes = 0;
+
+  const stack: string[] = [""];
+  while (stack.length > 0) {
+    const relDir = stack.pop()!;
+    const absDir = relDir ? join(resolvedSrc, relDir) : resolvedSrc;
+    for (const dirent of readdirSync(absDir, { withFileTypes: true })) {
+      const relPath = relDir ? join(relDir, dirent.name) : dirent.name;
+      const absPath = join(resolvedSrc, relPath);
+      if (resolve(absPath) === resolvedDataDir) {
+        continue;
+      }
+      const st = lstatSync(absPath);
+      if (st.isSymbolicLink()) {
+        continue;
+      }
+      if (st.isDirectory()) {
+        entries++;
+        if (entries > maxEntries || totalBytes > maxBytes) {
+          throw new Error(
+            `workspace:"branch" copy aborted: "${srcRoot}" exceeds non-git copy limits (${entries} entries, ${totalBytes} bytes; limits: ${maxEntries} entries, ${maxBytes} bytes). Initialize git or use workspace:"inherit".`,
+          );
+        }
+        dirsToCreate.push(relPath);
+        stack.push(relPath);
+      } else if (st.isFile()) {
+        entries++;
+        totalBytes += st.size;
+        if (entries > maxEntries || totalBytes > maxBytes) {
+          throw new Error(
+            `workspace:"branch" copy aborted: "${srcRoot}" exceeds non-git copy limits (${entries} entries, ${totalBytes} bytes; limits: ${maxEntries} entries, ${maxBytes} bytes). Initialize git or use workspace:"inherit".`,
+          );
+        }
+        filesToCopy.push({ src: absPath, rel: relPath });
+      }
+    }
+  }
+
+  try {
+    mkdirSync(destDir, { recursive: true });
+    for (const relDir of dirsToCreate) {
+      mkdirSync(join(destDir, relDir), { recursive: true });
+    }
+    for (const file of filesToCopy) {
+      copyFileSync(file.src, join(destDir, file.rel));
+    }
+  } catch (err) {
+    try {
+      if (existsSync(destDir)) {
+        rmSync(destDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      }
+    } catch {
+      // Best-effort cleanup
+    }
+    throw err;
+  }
+}
+
 export function provisionMemberWorkspace(args: {
   mode: WorkspaceMode;
   repoRoot: string;
   dataDir: string;
   swarmId: string;
   memberName: string;
+  copyLimits?: { maxEntries?: number; maxBytes?: number };
 }): ProvisionedWorkspace {
   if (args.mode === "inherit") {
     return { mode: "inherit", dir: args.repoRoot, branch: null };
   }
 
-  if (!isGitRepo(args.repoRoot)) {
-    throw new Error(
-      `workspace:"${args.mode}" requires a Git repository at "${args.repoRoot}". Initialize git or use workspace:"inherit".`,
-    );
-  }
-
-  const { dir, branch } = provisionedWorkspacePaths(args);
+  const git = isGitRepo(args.repoRoot);
 
   if (args.mode === "share") {
+    if (!git) {
+      throw new Error(
+        `workspace:"share" requires a Git repository at "${args.repoRoot}". Initialize git or use workspace:"branch" or workspace:"inherit".`,
+      );
+    }
+    const { dir, branch } = provisionedWorkspacePaths(args);
     const baseDir = join(args.dataDir, "worktrees", args.swarmId);
     mkdirSync(baseDir, { recursive: true });
     if (existsSync(dir)) {
@@ -71,11 +150,18 @@ export function provisionMemberWorkspace(args: {
     return { mode: "share", dir, branch };
   }
 
-  // branch: isolated clone
+  // branch: isolated clone (git) or bounded copy (non-git)
+  const { dir, branch } = provisionedWorkspacePaths(args);
   const cloneBase = join(args.dataDir, "clones", args.swarmId);
   mkdirSync(cloneBase, { recursive: true });
   if (existsSync(dir)) {
     throw new Error(`Clone directory "${dir}" already exists for @${args.memberName}.`);
+  }
+  if (!git) {
+    const maxEntries = args.copyLimits?.maxEntries ?? MAX_BRANCH_COPY_ENTRIES;
+    const maxBytes = args.copyLimits?.maxBytes ?? MAX_BRANCH_COPY_BYTES;
+    copyNonGitWorkspace(args.repoRoot, dir, args.dataDir, maxEntries, maxBytes);
+    return { mode: "branch", dir, branch: null };
   }
   runGit(["clone", "--dissociate", "--no-checkout", args.repoRoot, dir], args.repoRoot);
   runGit(["checkout", "-b", branch!], dir);

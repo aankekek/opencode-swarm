@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
@@ -9,6 +9,8 @@ import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gu
 import { buildVerificationIncompleteNudge, findUnansweredMentionTarget, hasFreshVerifierPass } from "../src/monitor.js";
 import { parseMentionsFromText } from "../src/mentions.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "../src/prompts.js";
+import { validateChannelName } from "../src/security.js";
+import { cleanupMemberWorkspace, provisionMemberWorkspace } from "../src/workspace.js";
 
 function createHarness(repoDir: string, dbPath: string) {
   const tools = new Map<string, any>();
@@ -2119,5 +2121,160 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
     expect(verifierPrompt).toContain("cite earlier posts by `#seq`");
     expect(verifierPrompt).toContain("Do not post greetings or acknowledgments");
     expect(verifierPrompt).toContain("call `post_message` and `swarm_wait` in the same turn");
+  });
+
+  test("Z1: non-git workspace:branch copies safely within caps, skips nested dataDir, and aborts over limits", () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-nongit-"));
+    const dataDir = join(root, ".swarm-data");
+    try {
+      mkdirSync(join(root, "src"), { recursive: true });
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(join(root, "README.md"), "hello", "utf8");
+      writeFileSync(join(root, "src", "app.ts"), "export const x = 1;\n", "utf8");
+      writeFileSync(join(dataDir, "ignored.db"), "should-not-copy", "utf8");
+
+      const okWs = provisionMemberWorkspace({
+        mode: "branch",
+        repoRoot: root,
+        dataDir,
+        swarmId: "sw_z1",
+        memberName: "w1",
+      });
+      expect(okWs.mode).toBe("branch");
+      expect(okWs.branch).toBeNull();
+      expect(readFileSync(join(okWs.dir, "README.md"), "utf8")).toBe("hello");
+      expect(readFileSync(join(okWs.dir, "src", "app.ts"), "utf8")).toBe("export const x = 1;\n");
+      expect(existsSync(join(okWs.dir, ".swarm-data"))).toBe(false);
+
+      const cleaned = cleanupMemberWorkspace({
+        mode: okWs.mode,
+        dir: okWs.dir,
+        branch: okWs.branch,
+        repoRoot: root,
+      });
+      expect(cleaned.ok).toBe(true);
+      expect(existsSync(okWs.dir)).toBe(false);
+
+      expect(() =>
+        provisionMemberWorkspace({
+          mode: "branch",
+          repoRoot: root,
+          dataDir,
+          swarmId: "sw_z1",
+          memberName: "w_entries",
+          copyLimits: { maxEntries: 2, maxBytes: 1024 * 1024 },
+        }),
+      ).toThrow(/exceeds non-git copy limits/);
+      expect(existsSync(join(dataDir, "clones", "sw_z1", "w_entries"))).toBe(false);
+
+      expect(() =>
+        provisionMemberWorkspace({
+          mode: "branch",
+          repoRoot: root,
+          dataDir,
+          swarmId: "sw_z1",
+          memberName: "w_bytes",
+          copyLimits: { maxEntries: 100, maxBytes: 10 },
+        }),
+      ).toThrow(/exceeds non-git copy limits/);
+      expect(existsSync(join(dataDir, "clones", "sw_z1", "w_bytes"))).toBe(false);
+
+      expect(() =>
+        provisionMemberWorkspace({
+          mode: "share",
+          repoRoot: root,
+          dataDir,
+          swarmId: "sw_z1",
+          memberName: "w_share",
+        }),
+      ).toThrow(/requires a Git repository/);
+    } finally {
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("Z2: validateChannelName and swarm channel creation enforce [a-z][a-z0-9-]{0,23}", async () => {
+    expect(validateChannelName("dev-ops-1")).toBe("dev-ops-1");
+    expect(validateChannelName("#UI-Build")).toBe("ui-build");
+    expect(validateChannelName("a".repeat(24))).toBe("a".repeat(24));
+
+    for (const bad of ["1dev", "dev_ops", "dev ops", "a".repeat(25), ""]) {
+      expect(() => validateChannelName(bad)).toThrow(/Invalid channel name/);
+    }
+    for (const reserved of ["main", "all", "#MAIN"]) {
+      expect(() => validateChannelName(reserved)).toThrow(/reserved/);
+    }
+
+    const root = mkdtempSync(join(tmpdir(), "swarm-chanval-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = await swarmRuntimePlugin.setup(ctx);
+    try {
+      const swarmTool = tools.get("swarm");
+      await swarmTool.execute({ action: "add", name: "w1", brief: "init" }, { sessionID: "sess_coord" });
+      const badRes = JSON.parse(
+        (await swarmTool.execute({ action: "channel", op: "create", channel: "bad_name" }, { sessionID: "sess_coord" }))
+          .content,
+      );
+      expect(badRes.ok).toBe(false);
+      expect(badRes.error).toContain("Invalid channel name");
+
+      const okRes = JSON.parse(
+        (await swarmTool.execute({ action: "channel", op: "create", channel: "dev-ops" }, { sessionID: "sess_coord" }))
+          .content,
+      );
+      expect(okRes.ok).toBe(true);
+      expect(okRes.channel.name).toBe("dev-ops");
+    } finally {
+      await cleanup?.();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("Z3: post_message returns warnings for unknown and archived @#channel mentions", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-chanwarn-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = await swarmRuntimePlugin.setup(ctx);
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      await swarmTool.execute({ action: "add", name: "w1", brief: "init" }, { sessionID: "sess_coord" });
+
+      await swarmTool.execute({ action: "channel", op: "create", channel: "live" }, { sessionID: "sess_coord" });
+      await swarmTool.execute({ action: "channel", op: "create", channel: "old" }, { sessionID: "sess_coord" });
+      await swarmTool.execute({ action: "channel", op: "archive", channel: "old" }, { sessionID: "sess_coord" });
+
+      const unknownRes = JSON.parse(
+        (await postTool.execute({ text: "hello @#ghost" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(unknownRes.ok).toBe(true);
+      expect(unknownRes.warnings).toEqual(["@#ghost addressed nobody (unknown channel)"]);
+
+      const archivedRes = JSON.parse(
+        (await postTool.execute({ text: "ping @#old" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(archivedRes.ok).toBe(true);
+      expect(archivedRes.warnings).toEqual(["@#old addressed nobody (archived channel)"]);
+
+      const liveRes = JSON.parse(
+        (await postTool.execute({ text: "ping @#live" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(liveRes.ok).toBe(true);
+      expect(liveRes.warnings).toBeUndefined();
+    } finally {
+      await cleanup?.();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
   });
 });

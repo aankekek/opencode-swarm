@@ -31,6 +31,24 @@ export function validateMemberName(raw: string, role?: string): string {
   return cleaned;
 }
 
+/**
+ * Channel name rules:
+ * lowercase, starts with a letter, 1-24 chars of [a-z0-9-],
+ * cannot be reserved names "main" or "all".
+ */
+export function validateChannelName(raw: string): string {
+  const cleaned = raw.trim().replace(/^#+/, "").toLowerCase();
+  if (!/^[a-z][a-z0-9-]{0,23}$/.test(cleaned)) {
+    throw new Error(
+      `Invalid channel name "${raw}". Must be lowercase, start with a letter, and be 1-24 chars of a-z, 0-9, -.`,
+    );
+  }
+  if (cleaned === "main" || cleaned === "all") {
+    throw new Error(`Channel name "${cleaned}" is reserved.`);
+  }
+  return cleaned;
+}
+
 export function normalizeHandle(raw: string): string {
   const cleaned = raw
     .trim()

@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin";
 import type { SwarmBoardDB } from "./db.js";
-import { checkPendingWakePosts } from "./mentions.js";
+import { checkPendingWakePosts, parseMentionsFromText } from "./mentions.js";
 import { formatModelSpec, listAvailableModels } from "./models.js";
 import { hasFreshVerifierPass } from "./monitor.js";
 import type { SwarmChangedEvent } from "./rpc.js";
@@ -890,7 +890,22 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           const post = await deps.postToBoard(caller.swarm_id, caller.name, input.channel ?? "main", text);
           deps.recordWakeSeq(caller.id, post.swarm_seq);
           await deps.maybeWakeIdleCoordinator(caller.swarm_id, post);
-          return toolJson({ ok: true, seq: post.swarm_seq, channel: post.channel });
+          const parsed = parseMentionsFromText(text);
+          const warnings: string[] = [];
+          for (const ch of parsed.channelMentions) {
+            const chRow = db.getChannel(caller.swarm_id, ch);
+            if (!chRow) {
+              warnings.push(`@#${ch} addressed nobody (unknown channel)`);
+            } else if (chRow.archived) {
+              warnings.push(`@#${ch} addressed nobody (archived channel)`);
+            }
+          }
+          return toolJson({
+            ok: true,
+            seq: post.swarm_seq,
+            channel: post.channel,
+            ...(warnings.length > 0 ? { warnings } : {}),
+          });
         } catch (err) {
           if (recent[recent.length - 1] === now) {
             recent.pop();

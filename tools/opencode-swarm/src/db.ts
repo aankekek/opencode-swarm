@@ -16,7 +16,12 @@ import type {
   WakeMode,
   WorkspaceMode,
 } from "./types.js";
-import { globsPotentiallyOverlap, normalizeHandle, validateAndNormalizeGlob } from "./security.js";
+import {
+  globsPotentiallyOverlap,
+  normalizeHandle,
+  validateAndNormalizeGlob,
+  validateChannelName,
+} from "./security.js";
 
 /**
  * How long a lock owned by a killed member must survive before a claim may
@@ -504,10 +509,7 @@ export class SwarmBoardDB {
   // -------------------------------------------------------------------------
 
   createChannel(swarmId: string, name: string, topic: string, createdBy: string): ChannelRow {
-    const clean = normalizeHandle(name);
-    if (clean === "main" || clean === "all") {
-      throw new Error(`Channel name "${clean}" is reserved.`);
-    }
+    const clean = validateChannelName(name);
     const now = Date.now();
     this.db
       .prepare(
@@ -519,9 +521,10 @@ export class SwarmBoardDB {
   }
 
   getChannel(swarmId: string, name: string): ChannelRow | undefined {
+    const lookup = name.trim().replace(/^#+/, "").toLowerCase();
     return this.db
       .prepare(`SELECT * FROM channels WHERE swarm_id = ? AND name = ?`)
-      .get(swarmId, normalizeHandle(name)) as ChannelRow | undefined;
+      .get(swarmId, lookup) as ChannelRow | undefined;
   }
 
   listChannels(swarmId: string): Array<ChannelRow & { subscriber_count: number }> {
