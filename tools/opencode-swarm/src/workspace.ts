@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { SwarmBoardDB, PendingProvisionRow } from "./db.js";
 import type { WorkspaceMode } from "./types.js";
 
 export const MAX_BRANCH_COPY_ENTRIES = 5_000;
 export const MAX_BRANCH_COPY_BYTES = 256 * 1024 * 1024; // 256 MiB
+export const DIRCOPY_MARKER_FILE = ".swarm-dircopy";
 
 function runGit(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -69,6 +70,9 @@ function copyNonGitWorkspace(
     const relDir = stack.pop()!;
     const absDir = relDir ? join(resolvedSrc, relDir) : resolvedSrc;
     for (const dirent of readdirSync(absDir, { withFileTypes: true })) {
+      if (dirent.name === DIRCOPY_MARKER_FILE) {
+        continue;
+      }
       const relPath = relDir ? join(relDir, dirent.name) : dirent.name;
       const absPath = join(resolvedSrc, relPath);
       if (resolve(absPath) === resolvedDataDir) {
@@ -108,6 +112,11 @@ function copyNonGitWorkspace(
     for (const file of filesToCopy) {
       copyFileSync(file.src, join(destDir, file.rel));
     }
+    writeFileSync(
+      join(destDir, DIRCOPY_MARKER_FILE),
+      JSON.stringify({ kind: "dircopy", source: resolvedSrc, createdAt: Date.now() }) + "\n",
+      "utf8",
+    );
   } catch (err) {
     try {
       if (existsSync(destDir)) {

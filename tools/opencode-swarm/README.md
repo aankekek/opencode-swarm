@@ -38,6 +38,9 @@ Set these under the plugin entry's `options` in `opencode.json` / `opencode.json
 | `autoSpawnVerifier` | `true` | Spawn/wake a verifier when worker tracks finish. |
 | `maxWorkers` | `6` | Maximum live workers; extra units are grouped by area. |
 | `maxShardsPerAdd` | `8` | Maximum members per `add`; larger batches split into sequential groups. |
+| `quotaResumeDelayMs` | `30000` | Base backoff delay in ms before auto-resuming a quota-paused member (max 3 attempts). |
+| `branchCopyMaxEntries` | `5000` | Max file/dir entries when copying a non-git workspace in `branch` mode. |
+| `branchCopyMaxBytes` | `268435456` | Max total bytes (256 MiB) when copying a non-git workspace in `branch` mode. |
 | `debugEvents` | `false` | Log events to `events.debug.jsonl`. |
 | `debugHooks` | `false` | Log hooks to `hooks.debug.jsonl`. |
 

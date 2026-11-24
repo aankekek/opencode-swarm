@@ -9,8 +9,8 @@ import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gu
 import { buildVerificationIncompleteNudge, findUnansweredMentionTarget, hasFreshVerifierPass } from "../src/monitor.js";
 import { parseMentionsFromText } from "../src/mentions.js";
 import { buildMemberOpeningPrompt, COORDINATOR_PROTOCOL } from "../src/prompts.js";
-import { validateChannelName } from "../src/security.js";
-import { cleanupMemberWorkspace, provisionMemberWorkspace } from "../src/workspace.js";
+import { validateChannelName, validateMemberName } from "../src/security.js";
+import { cleanupMemberWorkspace, DIRCOPY_MARKER_FILE, provisionMemberWorkspace } from "../src/workspace.js";
 
 function createHarness(repoDir: string, dbPath: string) {
   const tools = new Map<string, any>();
@@ -2270,6 +2270,153 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       );
       expect(liveRes.ok).toBe(true);
       expect(liveRes.warnings).toBeUndefined();
+    } finally {
+      await cleanup?.();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("AA1: validateMemberName reserves monitor-N and narrator-N for their matching roles", () => {
+    expect(() => validateMemberName("monitor-1", "worker")).toThrow(/Reserved role name/);
+    expect(() => validateMemberName("narrator-2", "worker")).toThrow(/Reserved role name/);
+    expect(() => validateMemberName("monitor", "verifier")).toThrow(/Reserved role name/);
+    expect(validateMemberName("monitor-1", "monitor")).toBe("monitor-1");
+    expect(validateMemberName("narrator-2", "narrator")).toBe("narrator-2");
+    expect(validateMemberName("monitor-ops", "worker")).toBe("monitor-ops");
+  });
+
+  test("AA2: swarm add rejects invalid n, mismatched n vs tasks, and empty task slices", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-addval-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = await swarmRuntimePlugin.setup(ctx);
+    try {
+      const swarmTool = tools.get("swarm");
+
+      const badN = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w", brief: "do work", n: 0 }, { sessionID: "sess_coord" }))
+          .content,
+      );
+      expect(badN.ok).toBe(false);
+      expect(badN.error).toContain("n must be at least 1");
+
+      const mismatch = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "w", brief: "do work", n: 3, tasks: ["a", "b"] },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(mismatch.ok).toBe(false);
+      expect(mismatch.error).toContain("must match len(tasks)");
+
+      const blankSlice = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "w", brief: "do work", tasks: ["ok", "   "] },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(blankSlice.ok).toBe(false);
+      expect(blankSlice.error).toContain("tasks[1] is empty");
+    } finally {
+      await cleanup?.();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("AA3: non-git workspace:branch writes .swarm-dircopy marker and respects PluginOptions copy limits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-dircopy-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    writeFileSync(join(repoDir, "a.txt"), "alpha", "utf8");
+    writeFileSync(join(repoDir, "b.txt"), "beta", "utf8");
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    ctx.options.branchCopyMaxEntries = 1;
+    const cleanup = await swarmRuntimePlugin.setup(ctx);
+    try {
+      const swarmTool = tools.get("swarm");
+      const overCap = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "w1", brief: "copy work", workspace: "branch" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(overCap.ok).toBe(false);
+      expect(overCap.error).toContain("exceeds non-git copy limits");
+
+      ctx.options.branchCopyMaxEntries = 20;
+      const okSpawn = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "w2", brief: "copy work", workspace: "branch" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(okSpawn.ok).toBe(true);
+      const statusRes = JSON.parse(
+        (await swarmTool.execute({ action: "status" }, { sessionID: "sess_coord" })).content,
+      );
+      const w2Member = statusRes.members.find((m: any) => m.name === "w2");
+      const wsDir = w2Member.workspace_dir;
+      expect(existsSync(join(wsDir, DIRCOPY_MARKER_FILE))).toBe(true);
+      const marker = JSON.parse(readFileSync(join(wsDir, DIRCOPY_MARKER_FILE), "utf8"));
+      expect(marker.kind).toBe("dircopy");
+    } finally {
+      await cleanup?.();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("AA4: quota auto-resume posts [quota] pause, resume, and exhaustion notices on the board", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-quotapost-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    ctx.options.quotaResumeDelayMs = 20;
+    const origPrompt = ctx.session.prompt;
+    ctx.session.prompt = async (input: { sessionID: string; text: string }) => {
+      if (input.text.includes("SWARM QUOTA RESUME")) {
+        throw new Error("429 quota exceeded");
+      }
+      return origPrompt(input);
+    };
+    const cleanup = await swarmRuntimePlugin.setup(ctx);
+    try {
+      const swarmTool = tools.get("swarm");
+      const readTool = tools.get("read_board");
+      const added = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "do work" }, { sessionID: "sess_coord" })).content,
+      );
+      const workerSession = added.spawned[0].session_id;
+
+      pushEvent({
+        type: "session.execution.failed",
+        data: { sessionID: workerSession, error: "429 quota exceeded" },
+      });
+      await new Promise((r) => setTimeout(r, 240));
+
+      const board = JSON.parse((await readTool.execute({ since: 0, limit: 50 }, { sessionID: "sess_coord" })).content);
+      const quotaPosts = (board.posts as Array<{ text: string }>).map((p) => p.text).filter((t) => t.startsWith("[quota]"));
+      expect(quotaPosts.some((t) => t.includes("paused on quota/rate limit (auto-resume 1/3"))).toBe(true);
+      expect(quotaPosts.some((t) => t.includes("resuming after quota pause (attempt 1/3)"))).toBe(true);
+      expect(quotaPosts.some((t) => t.includes("exhausted quota auto-resume (3 attempts)"))).toBe(true);
     } finally {
       await cleanup?.();
       try {

@@ -25,8 +25,14 @@ export function validateMemberName(raw: string, role?: string): string {
   ) {
     throw new Error(`Reserved member name "${raw}" cannot be used for a worker.`);
   }
-  if ((cleaned === "verifier" || cleaned === "monitor" || cleaned === "narrator") && role && role !== cleaned) {
-    throw new Error(`Reserved role name "${raw}" can only be used with role "${cleaned}".`);
+  if (cleaned === "verifier" && role && role !== "verifier") {
+    throw new Error(`Reserved role name "${raw}" can only be used with role "verifier".`);
+  }
+  if (/^monitor(?:-\d+)?$/.test(cleaned) && role && role !== "monitor") {
+    throw new Error(`Reserved role name "${raw}" can only be used with role "monitor".`);
+  }
+  if (/^narrator(?:-\d+)?$/.test(cleaned) && role && role !== "narrator") {
+    throw new Error(`Reserved role name "${raw}" can only be used with role "narrator".`);
   }
   return cleaned;
 }

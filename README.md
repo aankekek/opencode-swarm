@@ -22,7 +22,7 @@ The **board** is the shared message log. Every post gets a sequence number (`#12
 | --- | --- |
 | OpenCode v2 with `@opencode/plugin@2.3.2` | The plugin is built against this plugin API; older/newer majors may not load. |
 | [Bun](https://bun.sh) | Installs dependencies, runs tests, and builds the GUI bundle. |
-| Git | Required for `workspace:"share"` (worktrees) and `workspace:"branch"` (clones). `workspace:"inherit"` works without it, but then everyone shares one folder. |
+| Git | Required for `workspace:"share"` (worktrees) and Git-based `workspace:"branch"` (clones). `workspace:"branch"` also supports bounded non-git directory copies (`branchCopyMaxEntries` / `branchCopyMaxBytes`), and `workspace:"inherit"` shares one folder. |
 
 ## Install — pick one
 
@@ -181,6 +181,9 @@ Options go under the plugin entry's `options` object.
 | `autoSpawnVerifier` | `true` | Spawn/wake a verifier when all worker tracks finish. |
 | `maxWorkers` | `6` | Cap live workers per swarm; requests with more units are grouped by area. |
 | `maxShardsPerAdd` | `8` | Cap members created by one `add`; larger batches are split into sequential groups. |
+| `quotaResumeDelayMs` | `30000` | Base backoff delay in ms before auto-resuming a quota-paused member (up to 3 attempts). |
+| `branchCopyMaxEntries` | `5000` | Max file/dir entries allowed when copying a non-git workspace in `branch` mode. |
+| `branchCopyMaxBytes` | `268435456` | Max total bytes (256 MiB) allowed when copying a non-git workspace in `branch` mode. |
 | `debugEvents` | `false` | Log raw event payloads to `events.debug.jsonl`. |
 | `debugHooks` | `false` | Log permission and execute hooks to `hooks.debug.jsonl`. |
 
@@ -211,8 +214,15 @@ Safe to delete only when no swarm is running. Deleting the folder loses board hi
 
 ## How it works
 
-### Board and sequence numbers
+### Board, sequence numbers, and guardrails
 Posts are rows in SQLite with a per-swarm `#seq`. Read and wake cursors are sequence numbers, so `read_board(since: 12)` is race-free. `members.json` and `board.jsonl` are mirrors rebuilt from SQLite on startup if a crash left them stale.
+
+Built-in board guardrails match Antigravity's `native_swarm`:
+- **Park guard (`swarm_park_guard`):** `swarm_wait` refuses to park past unread posts between `last_read_seq` and `since`.
+- **Size & rate caps:** Posts are capped at `65,536` bytes and `60` posts/minute per member; briefs at `262,144` bytes; channel topics at `1,024` bytes (no `@` or newlines).
+- **Channel validation:** Channel names must match `[a-z][a-z0-9-]{0,23}` (excluding `main`/`all`), and `post_message` returns `warnings` when `@#channel` targets an unknown or archived channel.
+- **Stop / Exit Swarm Mode:** Run `/swarm stop` (or `/swarm-stop`, or click **Exit Swarm** in the UI) to clean up the active swarm and restore normal coordinator permissions for the session.
+- **Quota auto-resume:** Workers hitting quota/rate-limit errors pause with `[quota]` board notices and auto-retry up to 3 times with exponential backoff (respecting `retry-after`).
 
 ### Units and coverage
 `swarm{action:"plan"}` writes unit rows to `swarm_tasks`, each moving `open → assigned → done`; `add` assigns them, and a worker's `[done]` post (or `mark_done`) completes its units. Recording a plan replaces only the still-open rows, so `plan` is refused once any unit is assigned or done. When at least three units are unassigned and nobody is working, the monitor posts one `@coordinator [coverage]` nudge per board movement, worded differently once the worker cap is reached. With a plan present, `add` also refuses to spawn more workers than there are open units.
@@ -223,12 +233,12 @@ Posts are rows in SQLite with a per-swarm `#seq`. Read and wake cursors are sequ
 ### Workspaces
 - `inherit` — the repo itself, no isolation. Use `owned_globs` to avoid collisions.
 - `share` — a Git worktree on a `swarm/<swarmId>/<name>` branch. Fast, isolated checkout.
-- `branch` — a full `git clone` on its own branch. Slower, fully separate Git state.
+- `branch` — a full `git clone` on its own branch, or a bounded directory copy (`.swarm-dircopy` marker, symlinks and `.opencode`/data dir skipped) when the workspace is not a Git repo.
 
 On `complete`, cleanup removes the worktree/clone directory but leaves its `swarm/<swarmId>/<name>` branch behind. Reclaiming an orphaned swarm leaves workspaces in place.
 
 ### Monitor
-Every `monitorIntervalMs` the monitor looks for idle members and unread handoffs. Past `stallTimeoutMs` it posts one targeted nudge naming the member who can act. If three alerts go unanswered with no board movement, it stops alerting instead of spamming.
+Every `monitorIntervalMs` the monitor looks for idle members, unanswered `@mention` handoffs, and unread posts. Past `stallTimeoutMs` it first sends one direct re-ping for unanswered `@mentions`, then escalates to `@coordinator` with model-switch/nudge context. If three alerts go unanswered with no board movement, it stops alerting instead of spamming.
 
 ### Verifier
 With `autoSpawnVerifier` on, a verifier is spawned or woken when all worker tracks are done. Auto-spawn is capped at three attempts per work cycle; a `PASS` resets the cap so a later work cycle can verify again. The gate is a protocol contract: the coordinator prompt, monitor nudges, and the `swarm_wait` handoff all require `PASS`. `complete` itself does not re-check the board.

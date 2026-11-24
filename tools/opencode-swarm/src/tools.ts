@@ -287,14 +287,36 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
             });
           }
           const role = rawRole as MemberRole;
-          const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
-          if (tasks && tasks.length === 0) {
+          if (input.n !== undefined && (typeof input.n !== "number" || !Number.isInteger(input.n) || input.n < 1)) {
             return toolJson({
               ok: false,
-              error: "tasks must contain at least one slice; omit it for a single worker.",
+              error: `n must be at least 1, got ${input.n}`,
             });
           }
-          const n = typeof input.n === "number" && input.n > 1 ? Math.floor(input.n) : undefined;
+          const tasks = Array.isArray(input.tasks) ? (input.tasks as string[]) : undefined;
+          if (tasks) {
+            if (tasks.length === 0) {
+              return toolJson({
+                ok: false,
+                error: "tasks must contain at least one slice; omit it for a single worker.",
+              });
+            }
+            for (let i = 0; i < tasks.length; i++) {
+              if (typeof tasks[i] !== "string" || !tasks[i].trim()) {
+                return toolJson({
+                  ok: false,
+                  error: `tasks[${i}] is empty: every worker needs an assignment.`,
+                });
+              }
+            }
+            if (input.n !== undefined && input.n !== tasks.length) {
+              return toolJson({
+                ok: false,
+                error: `n (${input.n}) must match len(tasks) (${tasks.length}), or omit n.`,
+              });
+            }
+          }
+          const n = typeof input.n === "number" && input.n > 1 ? input.n : undefined;
           const count = tasks ? tasks.length : n;
           let requestedTaskIds: number[] | undefined;
           if (input.task_ids !== undefined) {

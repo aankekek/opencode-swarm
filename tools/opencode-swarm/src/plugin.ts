@@ -397,6 +397,23 @@ export const swarmRuntimePlugin = Plugin.define({
       if (resetAttempts) quotaResumeAttempts.delete(memberId);
     };
 
+    const postQuotaNotice = (swarmId: string, text: string) => {
+      try {
+        db.addPost({
+          swarmId,
+          channel: "main",
+          authorName: "system",
+          body: text,
+          mentions: [],
+          channelMentions: [],
+          isAll: false,
+        });
+        emitSwarmChanged({ swarmId, reason: "post" });
+      } catch {
+        // Best-effort board notice
+      }
+    };
+
     const scheduleQuotaAutoResume = (member: MemberRow, rawError: unknown) => {
       if (member.role === "coordinator") return;
       if (quotaResumeTimers.has(member.id)) return;
@@ -408,12 +425,20 @@ export const swarmRuntimePlugin = Plugin.define({
           pausedQuota: true,
         });
         emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+        postQuotaNotice(
+          member.swarm_id,
+          `[quota] @${member.name} exhausted quota auto-resume (${MAX_QUOTA_AUTO_RESUMES} attempts); switch its model to continue.`,
+        );
         return;
       }
       const backoffMs = Math.min(quotaResumeBaseMs * 2 ** attempts, 300_000);
       const delayMs = options.quotaResumeDelayMs
         ? backoffMs
         : parseQuotaRetryDelayMs(rawError, backoffMs);
+      postQuotaNotice(
+        member.swarm_id,
+        `[quota] @${member.name} paused on quota/rate limit (auto-resume ${attempts + 1}/${MAX_QUOTA_AUTO_RESUMES} in ${Math.max(1, Math.round(delayMs / 1000))}s).`,
+      );
       const timer = setTimeout(async () => {
         quotaResumeTimers.delete(member.id);
         if (dbClosed || abortController.signal.aborted) return;
@@ -430,6 +455,10 @@ export const swarmRuntimePlugin = Plugin.define({
           pausedQuota: false,
         });
         emitSwarmChanged({ swarmId: swarm.id, reason: "member_state", handle: fresh.name });
+        postQuotaNotice(
+          swarm.id,
+          `[quota] @${fresh.name} resuming after quota pause (attempt ${attempts + 1}/${MAX_QUOTA_AUTO_RESUMES}).`,
+        );
         try {
           await ctx.session.prompt({
             sessionID: fresh.session_id,
@@ -746,12 +775,25 @@ export const swarmRuntimePlugin = Plugin.define({
               workspaceBranch: paths.branch,
             });
           }
+          const branchCopyLimits =
+            (typeof options.branchCopyMaxEntries === "number" && options.branchCopyMaxEntries > 0) ||
+            (typeof options.branchCopyMaxBytes === "number" && options.branchCopyMaxBytes > 0)
+              ? {
+                  ...(typeof options.branchCopyMaxEntries === "number" && options.branchCopyMaxEntries > 0
+                    ? { maxEntries: Math.floor(options.branchCopyMaxEntries) }
+                    : {}),
+                  ...(typeof options.branchCopyMaxBytes === "number" && options.branchCopyMaxBytes > 0
+                    ? { maxBytes: Math.floor(options.branchCopyMaxBytes) }
+                    : {}),
+                }
+              : undefined;
           provisioned = provisionMemberWorkspace({
             mode: wsMode,
             repoRoot: canonicalWorkspaceRoot,
             dataDir,
             swarmId: args.swarmId,
             memberName: cleanName,
+            ...(branchCopyLimits ? { copyLimits: branchCopyLimits } : {}),
           });
           const forked = await forkFn({ sessionID: forkTarget.session_id });
           childSessionId = forked.id;
@@ -772,12 +814,25 @@ export const swarmRuntimePlugin = Plugin.define({
               workspaceBranch: paths.branch,
             });
           }
+          const branchCopyLimits =
+            (typeof options.branchCopyMaxEntries === "number" && options.branchCopyMaxEntries > 0) ||
+            (typeof options.branchCopyMaxBytes === "number" && options.branchCopyMaxBytes > 0)
+              ? {
+                  ...(typeof options.branchCopyMaxEntries === "number" && options.branchCopyMaxEntries > 0
+                    ? { maxEntries: Math.floor(options.branchCopyMaxEntries) }
+                    : {}),
+                  ...(typeof options.branchCopyMaxBytes === "number" && options.branchCopyMaxBytes > 0
+                    ? { maxBytes: Math.floor(options.branchCopyMaxBytes) }
+                    : {}),
+                }
+              : undefined;
           provisioned = provisionMemberWorkspace({
             mode: wsMode,
             repoRoot: canonicalWorkspaceRoot,
             dataDir,
             swarmId: args.swarmId,
             memberName: cleanName,
+            ...(branchCopyLimits ? { copyLimits: branchCopyLimits } : {}),
           });
           const created = await ctx.session.create({
             title: `[swarm:${args.swarmId}] @${cleanName}`,

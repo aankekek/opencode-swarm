@@ -49,6 +49,10 @@ export interface PluginOptions {
   maxShardsPerAdd?: number;
   /** Base delay in ms before auto-resuming a quota-paused member (default: 30000). */
   quotaResumeDelayMs?: number;
+  /** Maximum file/directory entries allowed when copying a non-git workspace in "branch" mode (default: 5000). */
+  branchCopyMaxEntries?: number;
+  /** Maximum total bytes allowed when copying a non-git workspace in "branch" mode (default: 268435456 = 256 MiB). */
+  branchCopyMaxBytes?: number;
 }
 
 export interface SwarmRow {
