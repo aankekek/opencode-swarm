@@ -231,10 +231,22 @@ export const SWARM_RPC_DEF = {
       ),
     },
     completeSwarm: {
-      input: optionalObjectSchema<{ swarmId: string; summary?: string; callerSessionId?: string }>((v) => {
+      input: optionalObjectSchema<{
+        swarmId: string;
+        summary?: string;
+        callerSessionId?: string;
+        exitSession?: boolean;
+        sessionId?: string;
+      }>((v) => {
         if (typeof v.swarmId !== "string") return "swarmId must be a string";
         if (v.callerSessionId !== undefined && typeof v.callerSessionId !== "string") {
           return "callerSessionId must be a string";
+        }
+        if (v.exitSession !== undefined && typeof v.exitSession !== "boolean") {
+          return "exitSession must be a boolean";
+        }
+        if (v.sessionId !== undefined && typeof v.sessionId !== "string") {
+          return "sessionId must be a string";
         }
         return null;
       }),

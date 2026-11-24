@@ -874,4 +874,24 @@ export const SWARM_GUI_STYLES = `
   gap: 10px;
   margin-top: 4px;
 }
+
+.swarm-overlay-exit-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(224, 82, 82, 0.45);
+  background: rgba(224, 82, 82, 0.1);
+  color: var(--text-strong, #ededec);
+  font-size: 12px;
+}
+
+.swarm-overlay-exit-confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
 `;

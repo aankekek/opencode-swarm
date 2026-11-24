@@ -1491,4 +1491,165 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
     const parsed = parseMentionsFromText("waiting on @build-a/@build-b/@build-c, cc user@example.com");
     expect(parsed.memberMentions).toEqual(["build-a", "build-b", "build-c"]);
   });
+
+  test("T1: completeSwarm with exitSession completes swarm, restores coordinator permissions, emits session_exited, and clears session snapshot", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-t1-exit-session-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const updatedPermissions: Array<{ sessionID: string; permissions: unknown }> = [];
+    const origUpdate = ctx.session.update;
+    ctx.session.update = async (arg: any) => {
+      updatedPermissions.push({ sessionID: arg.sessionID, permissions: arg.permissions });
+      return origUpdate ? await origUpdate(arg) : undefined;
+    };
+
+    const emittedEvents: any[] = [];
+    const rpcEvents = (ctx as any)._rpcEvents;
+    if (Array.isArray(rpcEvents)) {
+      // harness captures emitted events if supported; also wrap rpc.register if needed
+    }
+    const origRegister = (ctx as any).rpc?.register;
+    if (origRegister) {
+      (ctx as any).rpc.register = async (def: any, handlersArg: any) => {
+        const reg = await origRegister(def, handlersArg);
+        const origEmit = reg?.events?.emit;
+        if (reg?.events) {
+          reg.events.emit = (evName: string, payload: unknown) => {
+            emittedEvents.push({ evName, payload });
+            return origEmit?.(evName, payload);
+          };
+        }
+        return reg;
+      };
+    }
+
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(addW1.ok).toBe(true);
+
+      const snapBefore = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snapBefore.swarm).not.toBeNull();
+      const swarmId = snapBefore.swarm.id as string;
+
+      const exitRes = await handlers.completeSwarm({
+        swarmId,
+        exitSession: true,
+        sessionId: "sess_coord",
+        summary: "User exited",
+      });
+      expect(exitRes.ok).toBe(true);
+      expect(exitRes.status).toBe("completed");
+
+      expect(updatedPermissions.some((u) => u.sessionID === "sess_coord" && Array.isArray(u.permissions) && u.permissions.length === 0)).toBe(true);
+      expect(emittedEvents.some((e) => e.evName === "changed" && e.payload?.reason === "session_exited" && e.payload?.handle === "sess_coord")).toBe(true);
+
+      const snapAfter = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snapAfter.swarm).toBeNull();
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("T2: running /swarm again in an exited session clears the exit flag and returns the new swarm snapshot", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-t2-reenter-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const handlers = (ctx as any)._rpcHandlers;
+      const cmds = (ctx as any)._cmds as Map<string, any>;
+      const swarmCmd = cmds.get("swarm");
+      expect(swarmCmd).toBeDefined();
+
+      await swarmCmd.execute({ sessionID: "sess_reenter", prompt: "First task" });
+      const firstSnap = await handlers.getSwarmSnapshot({ sessionId: "sess_reenter" });
+      expect(firstSnap.swarm).not.toBeNull();
+
+      await handlers.completeSwarm({
+        swarmId: firstSnap.swarm.id,
+        exitSession: true,
+        sessionId: "sess_reenter",
+      });
+      const exitedSnap = await handlers.getSwarmSnapshot({ sessionId: "sess_reenter" });
+      expect(exitedSnap.swarm).toBeNull();
+
+      await swarmCmd.execute({ sessionID: "sess_reenter", prompt: "Second task" });
+      const secondSnap = await handlers.getSwarmSnapshot({ sessionId: "sess_reenter" });
+      expect(secondSnap.swarm).not.toBeNull();
+      expect(secondSnap.swarm.id).not.toBe(firstSnap.swarm.id);
+      expect(secondSnap.swarm.status).toBe("running");
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("T3: /swarm stop and /swarm-stop exit Swarm mode without starting a new swarm", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-t3-commands-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx } = createHarness(repoDir, dbPath);
+    const synthetics: Array<{ sessionID: string; text: string }> = [];
+    const origSynth = ctx.session.synthetic;
+    ctx.session.synthetic = async (arg: any) => {
+      synthetics.push({ sessionID: arg.sessionID, text: arg.text });
+      return origSynth ? await origSynth(arg) : undefined;
+    };
+
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const handlers = (ctx as any)._rpcHandlers;
+      const cmds = (ctx as any)._cmds as Map<string, any>;
+      const swarmCmd = cmds.get("swarm");
+      const swarmStopCmd = cmds.get("swarm-stop");
+      expect(swarmCmd).toBeDefined();
+      expect(swarmStopCmd).toBeDefined();
+
+      // `/swarm stop` on an active swarm stops and exits without creating another swarm
+      await swarmCmd.execute({ sessionID: "sess_cmd", prompt: "Build feature" });
+      const listBefore = await handlers.listSwarms({});
+      expect(listBefore.swarms.length).toBe(1);
+
+      await swarmCmd.execute({ sessionID: "sess_cmd", prompt: "stop" });
+      const listAfterStop = await handlers.listSwarms({});
+      expect(listAfterStop.swarms.length).toBe(1);
+      expect(listAfterStop.swarms[0].status).toBe("completed");
+      expect((await handlers.getSwarmSnapshot({ sessionId: "sess_cmd" })).swarm).toBeNull();
+      expect(synthetics.some((s) => s.sessionID === "sess_cmd" && s.text.includes("Exited Swarm mode"))).toBe(true);
+
+      // Start again, then use `/swarm-stop`
+      await swarmCmd.execute({ sessionID: "sess_cmd", prompt: "Build feature 2" });
+      expect((await handlers.getSwarmSnapshot({ sessionId: "sess_cmd" })).swarm?.status).toBe("running");
+
+      await swarmStopCmd.execute({ sessionID: "sess_cmd", prompt: "" });
+      const listAfterCmd = await handlers.listSwarms({});
+      expect(listAfterCmd.swarms.length).toBe(2);
+      expect(listAfterCmd.swarms.every((s: any) => s.status === "completed")).toBe(true);
+      expect((await handlers.getSwarmSnapshot({ sessionId: "sess_cmd" })).swarm).toBeNull();
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

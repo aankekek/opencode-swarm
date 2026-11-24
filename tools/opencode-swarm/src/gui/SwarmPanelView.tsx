@@ -12,6 +12,7 @@ export interface SwarmPanelViewProps {
   onSelectSwarm: (id: string) => void;
   onRefresh: () => void;
   onCompleteSwarm: (swarmId: string) => Promise<void>;
+  onExitSwarmMode?: () => Promise<void>;
   onOpenSettings?: () => void;
   rpcError?: () => string | undefined;
   server?: unknown;
@@ -147,6 +148,45 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
     ));
   };
 
+  const confirmExitSwarmMode = () => {
+    if (!props.onExitSwarmMode) return;
+    if (props.snapshot()?.status !== "running") {
+      void props.onExitSwarmMode();
+      return;
+    }
+    props.ctx.dialogs.open((dialog: DialogHandle) => (
+      <Dialog title="Stop & Exit Swarm Mode?">
+        <div style={{ padding: "12px 16px", display: "flex", "flex-direction": "column", gap: "12px" }}>
+          <div>
+            Stop all active workers, release file locks, restore the original composer, and remove all Swarm UI from this session?
+          </div>
+          <div style={{ display: "flex", "justify-content": "flex-end", gap: "8px" }}>
+            <Button variant="ghost" onClick={() => dialog.close()}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={async () => {
+                try {
+                  await props.onExitSwarmMode?.();
+                  dialog.close();
+                } catch (err) {
+                  props.ctx.toast.show({
+                    title: "Failed to exit Swarm mode",
+                    description: err instanceof Error ? err.message : String(err),
+                    variant: "error",
+                  });
+                }
+              }}
+            >
+              Stop & Exit
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+    ));
+  };
+
   return (
     <div class="swarm-gui-panel">
       <div class="swarm-gui-header">
@@ -181,6 +221,11 @@ export default function SwarmPanelView(props: SwarmPanelViewProps) {
         <Show when={props.snapshot()?.status === "running"}>
           <Button size="small" variant="neutral" onClick={confirmCompleteSwarm}>
             Complete
+          </Button>
+        </Show>
+        <Show when={props.onExitSwarmMode}>
+          <Button size="small" variant="danger" onClick={confirmExitSwarmMode}>
+            Exit Swarm
           </Button>
         </Show>
         <Show when={props.onOpenSettings}>

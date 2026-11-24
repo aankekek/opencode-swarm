@@ -359,7 +359,10 @@ export const swarmRuntimePlugin = Plugin.define({
       return undefined;
     }
 
+    const exitedSessionSwarm = new Map<string, string>();
+
     async function ensureCoordinator(sessionId: string, title = "Swarm"): Promise<{ swarmId: string; coordinator: MemberRow }> {
+      exitedSessionSwarm.delete(sessionId);
       const existing = db.getActiveMemberBySession(sessionId);
       if (existing) {
         return { swarmId: existing.swarm_id, coordinator: existing };
@@ -836,6 +839,7 @@ export const swarmRuntimePlugin = Plugin.define({
     const getBoardUrl = () => (boardServer && !boardServerClosed && boardServer.isAlive() ? boardServer.url : "");
 
     let rpcCleanup: (() => Promise<void> | void) | undefined;
+    let rpcHandlersRef: Record<string, (args?: Record<string, unknown>) => Promise<unknown>> | undefined;
     try {
       const rpcHandlers = createRpcHandlers({
         ctx,
@@ -855,6 +859,13 @@ export const swarmRuntimePlugin = Plugin.define({
         waitForQuiesce,
         pendingKillCleanup,
         switchMemberModelInPlace,
+        markSessionSwarmExited: (sid, swId) => {
+          exitedSessionSwarm.set(sid, swId || "*");
+        },
+        isSessionSwarmExited: (sid, swId) => {
+          const v = exitedSessionSwarm.get(sid);
+          return v === "*" || v === swId;
+        },
         beforeUninstallRuntimeDataDelete: async () => {
           stopMonitor();
           abortController.abort();
@@ -887,6 +898,7 @@ export const swarmRuntimePlugin = Plugin.define({
           }
         },
       });
+      rpcHandlersRef = rpcHandlers;
       rpcReg = await (ctx as unknown as {
         rpc?: {
           register?: (
@@ -1024,6 +1036,29 @@ export const swarmRuntimePlugin = Plugin.define({
       return { ok: true };
     };
 
+    const exitSessionSwarm = async (sessionID: string) => {
+      if (rpcHandlersRef?.completeSwarm) {
+        await rpcHandlersRef.completeSwarm({
+          swarmId: "",
+          exitSession: true,
+          sessionId: sessionID,
+          summary: "Exited Swarm mode",
+        });
+      } else {
+        exitedSessionSwarm.set(sessionID, "*");
+        try {
+          await ctx.session.update({ sessionID, permissions: [] });
+        } catch {
+          // Ignore
+        }
+        emitSwarmChanged({ swarmId: "", reason: "session_exited", handle: sessionID, summary: "Exited Swarm mode" });
+      }
+      await ctx.session.synthetic({
+        sessionID,
+        text: "[swarm] Exited Swarm mode for this session. All Swarm UI and coordinator restrictions have been removed — you are back to the original composer.",
+      });
+    };
+
     await ctx.command.transform((cmds) => {
       cmds.add({
         name: "swarm",
@@ -1036,6 +1071,10 @@ export const swarmRuntimePlugin = Plugin.define({
               : rawPrompt && typeof rawPrompt === "object" && "text" in rawPrompt
                 ? String((rawPrompt as { text?: unknown }).text ?? "")
                 : JSON.stringify(rawPrompt ?? "");
+          if (/^(stop|end|exit|off|leave)$/i.test(text.trim())) {
+            await exitSessionSwarm(invocation.sessionID);
+            return;
+          }
           const cleanTitle = text.trim().split(/\r?\n/)[0]?.slice(0, 64) || "Swarm";
 
           // Clear stale rows owned by dead processes before touching coordinator state.
@@ -1075,6 +1114,14 @@ export const swarmRuntimePlugin = Plugin.define({
             text: `${COORDINATOR_PROTOCOL}\n\nUser request:\n${text}`,
             delivery: invocation.delivery,
           });
+        },
+      });
+
+      cmds.add({
+        name: "swarm-stop",
+        description: "Stop any active swarm and exit Swarm mode in the current session, restoring the original composer.",
+        async execute(invocation) {
+          await exitSessionSwarm(invocation.sessionID);
         },
       });
 
@@ -1457,6 +1504,7 @@ export const swarmRuntimePlugin = Plugin.define({
       spawningMembers.clear();
       activeToolCounts.clear();
       quiesceResolvers.clear();
+      exitedSessionSwarm.clear();
       // Deferred kill cleanups release locks and remove worktrees for sessions
       // that never quiesced before shutdown. They must run while the DB is
       // still open: dropping them would orphan locks and workspaces forever,

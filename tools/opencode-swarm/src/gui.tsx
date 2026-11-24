@@ -166,12 +166,33 @@ export default Plugin.define({
     let lastDir: string | undefined;
     let lastSessionId: string | null = null;
     let lastSnapshotSignature = snapshotSignature(null);
+    const dismissedSwarmBySession = new Map<string, string>();
 
     const currentSessionId = () => ctx.sessions.current()?.id ?? null;
     // Tab existence depends only on the session's summon evidence. RPC transport
     // failures must surface inside the panel (rpcError), never by unmounting the tab.
     const activeForThisSession = () => sessionSwarmId() !== null;
     const currentDirectory = () => ctx.sessions.current()?.location?.directory ?? mountedDirectory();
+
+    const clearSwarmUiForSession = (sid: string | null, dismissedId?: string) => {
+      if (sid) {
+        dismissedSwarmBySession.set(sid, dismissedId || "*");
+      }
+      const session = ctx.sessions.current();
+      if (session) {
+        try {
+          ctx.layout.hide(`${ctx.id}:swarm`, session);
+        } catch {
+          // Ignore if panel is already closed
+        }
+      }
+      setSessionSwarmId(null);
+      setSnapshot(null);
+      lastSnapshotSignature = snapshotSignature(null);
+      setSelectedSwarmId(null);
+      setUserPinnedSwarmId(null);
+      setBoardUrl("");
+    };
     const getRpc = () => ctx.client.rpc(SWARM_RPC_DEF);
     const getCallOptions = (timeoutMs = 8000) => {
       const loc =
@@ -267,6 +288,10 @@ export default Plugin.define({
           setBoardUrl((rawSnap as { boardUrl: string }).boardUrl);
         }
         const snap = normalizeSwarmSnapshot(rawSnap);
+        const dismissed = sid ? dismissedSwarmBySession.get(sid) : undefined;
+        if (viaSession && snap && dismissed && (dismissed === "*" || dismissed === snap.swarmId) && snap.status !== "running") {
+          return;
+        }
         const sig = snapshotSignature(snap);
         if (sig !== lastSnapshotSignature) {
           lastSnapshotSignature = sig;
@@ -276,8 +301,9 @@ export default Plugin.define({
         // snapshot means this session is a member of a swarm, whatever its status
         // (running, completing, completed, interrupted). A pinned (history) fetch
         // must not clear or overwrite it, and a poll never writes null here — only
-        // the session-change effect clears it.
+        // the session-change effect or explicit session exit clears it.
         if (viaSession && snap) {
+          if (sid && dismissed) dismissedSwarmBySession.delete(sid);
           setSessionSwarmId(snap.swarmId);
         }
         const currentRpc = rpcStatus();
@@ -350,7 +376,16 @@ export default Plugin.define({
       try {
         ctx.client.rpc(SWARM_RPC_DEF).events.on(
           "changed",
-          () => {
+          (ev) => {
+            if (ev && typeof ev === "object" && (ev as { reason?: string }).reason === "session_exited") {
+              const handle = (ev as { handle?: string }).handle;
+              const swId = (ev as { swarmId?: string }).swarmId;
+              const sid = currentSessionId();
+              if (!handle || handle === sid) {
+                clearSwarmUiForSession(sid, swId);
+                return;
+              }
+            }
             void refresh();
           },
           { signal: eventAbort.signal }
@@ -497,6 +532,29 @@ export default Plugin.define({
       ));
     };
 
+    const exitSwarmModeForCurrentSession = async () => {
+      const sid = currentSessionId();
+      const activeId = sessionSwarmId() ?? snapshot()?.swarmId ?? "";
+      try {
+        await getRpc().completeSwarm(
+          {
+            swarmId: activeId,
+            exitSession: true,
+            ...(sid ? { sessionId: sid } : {}),
+            summary: "Exited Swarm mode",
+          },
+          getCallOptions()
+        );
+      } catch {
+        // Still clear local GUI state even if RPC failed or swarm already ended
+      }
+      clearSwarmUiForSession(sid, activeId);
+      ctx.toast.show({
+        title: "Exited Swarm mode",
+        description: "Swarm UI removed for this session. Back to the original composer.",
+      });
+    };
+
     const openSwarmOverlay = () => {
       ctx.dialogs.open((dialog) => (
         <SwarmControlOverlay
@@ -532,6 +590,7 @@ export default Plugin.define({
             dialog.close();
             openOnboardingWizard();
           }}
+          onExitSwarmMode={exitSwarmModeForCurrentSession}
           onClose={() => dialog.close()}
         />
       ));
@@ -721,6 +780,15 @@ export default Plugin.define({
     }));
 
     safeAdd(Command, () => ({
+      id: "exit-session",
+      title: "Exit Swarm Mode (Current Session)",
+      description: "Stop active swarm and remove all Swarm UI from the current session",
+      group: "Swarm",
+      section: "general" as const,
+      run: () => void exitSwarmModeForCurrentSession(),
+    }));
+
+    safeAdd(Command, () => ({
       id: "uninstall",
       title: "Uninstall Swarm Plugin",
       description: "Open the Swarm removal checklist and completely uninstall Swarm Runtime",
@@ -779,6 +847,7 @@ export default Plugin.define({
                 await getRpc().completeSwarm({ swarmId }, getCallOptions());
                 await refresh();
               }}
+              onExitSwarmMode={exitSwarmModeForCurrentSession}
               server={props.session.server}
             />
           </Suspense>

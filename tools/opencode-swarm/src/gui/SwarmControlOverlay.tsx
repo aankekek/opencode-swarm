@@ -16,6 +16,7 @@ export interface SwarmControlOverlayProps {
   onSetRoleModel: (role: SwarmControlRole, modelSpec: string) => Promise<SetRoleModelResult | null>;
   onOpenBoard: () => void;
   onOpenSetupWizard?: () => void;
+  onExitSwarmMode?: () => Promise<void>;
   onClose: () => void;
 }
 
@@ -58,6 +59,8 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
   const [draftModels, setDraftModels] = createSignal<Partial<Record<SwarmControlRole, string>>>({});
   const [loading, setLoading] = createSignal(true);
   const [saving, setSaving] = createSignal(false);
+  const [confirmingExit, setConfirmingExit] = createSignal(false);
+  const [exiting, setExiting] = createSignal(false);
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
   const isDismissed = createDismissedFlag();
 
@@ -235,6 +238,28 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
             </div>
           </div>
           <div class="swarm-overlay-actions">
+            <Show when={props.onExitSwarmMode}>
+              <Button
+                variant="danger"
+                size="small"
+                disabled={saving() || exiting()}
+                onClick={async () => {
+                  if (props.snapshot()?.status === "running") {
+                    setConfirmingExit(true);
+                    return;
+                  }
+                  setExiting(true);
+                  try {
+                    await props.onExitSwarmMode?.();
+                    if (!isDismissed()) props.onClose();
+                  } finally {
+                    if (!isDismissed()) setExiting(false);
+                  }
+                }}
+              >
+                {exiting() ? "Exiting..." : props.snapshot()?.status === "running" ? "Stop & Exit" : "Exit Swarm"}
+              </Button>
+            </Show>
             <Show when={props.onOpenSetupWizard}>
               <Button variant="ghost" size="small" onClick={() => props.onOpenSetupWizard?.()}>
                 Setup Wizard
@@ -252,6 +277,35 @@ export function SwarmControlOverlay(props: SwarmControlOverlayProps) {
             </Button>
           </div>
         </div>
+
+        <Show when={confirmingExit()}>
+          <div class="swarm-overlay-exit-confirm">
+            <span>
+              Stop active workers, release file locks, restore original composer, and remove all Swarm UI from this session?
+            </span>
+            <div class="swarm-overlay-exit-confirm-actions">
+              <Button variant="ghost" size="small" disabled={exiting()} onClick={() => setConfirmingExit(false)}>
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                size="small"
+                disabled={exiting()}
+                onClick={async () => {
+                  setExiting(true);
+                  try {
+                    await props.onExitSwarmMode?.();
+                    if (!isDismissed()) props.onClose();
+                  } finally {
+                    if (!isDismissed()) setExiting(false);
+                  }
+                }}
+              >
+                {exiting() ? "Stopping..." : "Confirm Stop & Exit"}
+              </Button>
+            </div>
+          </div>
+        </Show>
 
         <Show when={members().length > 0}>
           <div class="swarm-overlay-roster" aria-label="Active swarm members">

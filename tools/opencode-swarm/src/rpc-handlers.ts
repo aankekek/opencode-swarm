@@ -57,6 +57,8 @@ export interface RpcHandlerDeps {
     rerun: boolean;
   }>;
   beforeUninstallRuntimeDataDelete: () => Promise<void>;
+  markSessionSwarmExited?: (sessionId: string, swarmId: string) => void;
+  isSessionSwarmExited?: (sessionId: string, swarmId: string) => boolean;
 }
 
 export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: Record<string, unknown>) => Promise<unknown>> {
@@ -88,7 +90,10 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       if (!swarm && sessionIdArg) {
         const member = db.getActiveMemberBySession(sessionIdArg) ?? db.getLatestMemberBySession(sessionIdArg);
         if (member) {
-          swarm = db.getSwarm(member.swarm_id);
+          const candidate = db.getSwarm(member.swarm_id);
+          if (candidate && (candidate.status === "running" || !deps.isSessionSwarmExited?.(sessionIdArg, candidate.id))) {
+            swarm = candidate;
+          }
         }
       }
       // With no explicit swarmId, resolve only through sessionId. Never fall back
@@ -179,8 +184,27 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       const swarmId = typeof args?.swarmId === "string" ? args.swarmId : "";
       const summary = typeof args?.summary === "string" ? args.summary : undefined;
       const callerSessionId = typeof args?.callerSessionId === "string" ? args.callerSessionId : undefined;
-      const swarm = db.getSwarm(swarmId);
+      const exitSession = Boolean(args?.exitSession);
+      const sessionId = typeof args?.sessionId === "string" ? args.sessionId : callerSessionId;
+
+      let swarm = swarmId ? db.getSwarm(swarmId) : undefined;
+      if (!swarm && exitSession && sessionId) {
+        const member = db.getActiveMemberBySession(sessionId) ?? db.getLatestMemberBySession(sessionId);
+        if (member) {
+          swarm = db.getSwarm(member.swarm_id);
+        }
+      }
       if (!swarm) {
+        if (exitSession && sessionId) {
+          deps.markSessionSwarmExited?.(sessionId, "*");
+          try {
+            await ctx.session.update({ sessionID: sessionId, permissions: [] });
+          } catch {
+            // Ignore if session update unsupported
+          }
+          deps.emitSwarmChanged({ swarmId: "", reason: "session_exited", handle: sessionId, summary });
+          return { ok: true, status: "exited" };
+        }
         return { ok: false, error: `Swarm '${swarmId}' not found.` };
       }
       if (callerSessionId) {
@@ -189,6 +213,30 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           return { ok: false, error: "Only @coordinator may complete the swarm." };
         }
       }
+
+      const coordMember = db.listMembers(swarm.id, true).find((m) => m.role === "coordinator");
+      const coordSessionId = coordMember?.session_id ?? sessionId;
+
+      if (exitSession && swarm.status !== "running") {
+        if (sessionId) {
+          deps.markSessionSwarmExited?.(sessionId, swarm.id);
+        }
+        if (coordSessionId) {
+          try {
+            await ctx.session.update({ sessionID: coordSessionId, permissions: [] });
+          } catch {
+            // Ignore if session update unsupported
+          }
+        }
+        deps.emitSwarmChanged({
+          swarmId: swarm.id,
+          reason: "session_exited",
+          handle: sessionId ?? coordSessionId,
+          summary,
+        });
+        return { ok: true, swarm_id: swarm.id, status: swarm.status };
+      }
+
       // Completion contract: teardown is best-effort per step and always attempts
       // the terminal state. The swarm is marked `completing`, every member is torn
       // down independently (one DB error must not skip the rest), and the
@@ -252,8 +300,26 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
         } catch (err) {
           recordFailure("setSwarmStatus(completed)", err);
         }
+        if (coordSessionId) {
+          try {
+            await ctx.session.update({ sessionID: coordSessionId, permissions: [] });
+          } catch {
+            // Ignore if session update unsupported
+          }
+        }
+        if (exitSession && sessionId) {
+          deps.markSessionSwarmExited?.(sessionId, swarm.id);
+        }
         try {
           deps.emitSwarmChanged({ swarmId: swarm.id, reason: "swarm_completed", summary });
+          if (exitSession) {
+            deps.emitSwarmChanged({
+              swarmId: swarm.id,
+              reason: "session_exited",
+              handle: sessionId ?? coordSessionId,
+              summary,
+            });
+          }
         } catch (err) {
           recordFailure("emitSwarmChanged", err);
         }
@@ -360,7 +426,10 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       if (!swarm && sessionIdArg) {
         const member = db.getActiveMemberBySession(sessionIdArg) ?? db.getLatestMemberBySession(sessionIdArg);
         if (member) {
-          swarm = db.getSwarm(member.swarm_id);
+          const candidate = db.getSwarm(member.swarm_id);
+          if (candidate && (candidate.status === "running" || !deps.isSessionSwarmExited?.(sessionIdArg, candidate.id))) {
+            swarm = candidate;
+          }
         }
       }
       if (!swarm && !swarmIdArg) {
