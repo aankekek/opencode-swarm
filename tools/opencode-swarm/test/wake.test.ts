@@ -76,6 +76,7 @@ function makeDeps(options: StubOptions = {}) {
     listMembers: () => [coord, worker],
     getLatestPostsWindow: () => ({ posts: [] }),
     getLatestPost: () => latestPost,
+    getTaskCounts: () => ({ total: 0, open: 0, assigned: 0, done: 0 }),
     getPostsPage: options.getPostsPage ?? (() => ({ posts: [latestPost], hasMore: false })),
     setMemberState: options.setMemberState ?? (() => {}),
     advanceReadCursor: options.advanceReadCursor ?? (() => {}),

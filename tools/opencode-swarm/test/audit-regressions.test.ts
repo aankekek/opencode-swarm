@@ -1224,4 +1224,47 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       } catch {}
     }
   });
+
+  test("Q: open plan units suppress auto-verifier and complete handoff when batch finishes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-open-units-gate-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      await swarmTool.execute({ action: "title", title: "Batched Plan" }, { sessionID: "sess_coord" });
+      await swarmTool.execute(
+        { action: "plan", tasks: ["unit-1", "unit-2", "unit-3"] },
+        { sessionID: "sess_coord" },
+      );
+
+      const addW1 = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Do unit 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW1.spawned[0].session_id as string;
+
+      await postTool.execute({ text: "[done] finished unit 1" }, { sessionID: w1Sess });
+      pushEvent({ type: "session.status", data: { sessionID: "sess_coord", status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 40));
+
+      const snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      expect(snap.members.filter((m: any) => m.role === "verifier").length).toBe(0);
+
+      const coordPrompts = prompts.filter((p) => p.sessionID === "sess_coord");
+      expect(coordPrompts.length).toBe(1);
+      expect(coordPrompts[0].text).toContain("2 plan unit(s) still open");
+      expect(coordPrompts[0].text).not.toContain('swarm{action:"complete"}');
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

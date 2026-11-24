@@ -950,7 +950,8 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           const anyWorking = nonCoord.some((m) => m.state === "working");
           const workers = nonCoord.filter((m) => m.role === "worker");
           const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
-          if (allWorkersDone && !anyWorking && hasFreshVerifierPass(db, caller.swarm_id, members)) {
+          const openPlanUnits = db.getTaskCounts(caller.swarm_id).open;
+          if (allWorkersDone && openPlanUnits === 0 && !anyWorking && hasFreshVerifierPass(db, caller.swarm_id, members)) {
             const unread = db
               .getPostsPage(caller.swarm_id, sinceSeq, 50, "*")
               .posts.filter((p) => p.author_name !== caller.name);

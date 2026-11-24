@@ -253,6 +253,8 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     const anyWorking = nonCoord.some((m) => m.state === "working");
     const workers = nonCoord.filter((m) => m.role === "worker");
     const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
+    const openPlanUnits = db.getTaskCounts(swarmId).open;
+    const allWorkDone = allWorkersDone && openPlanUnits === 0;
     const latestAuthorMember = db.getMemberByName(swarmId, latestPost.author_name);
     const isVerifierAuthorFlag = isVerifierAuthor(latestPost.author_name, latestAuthorMember);
     const isVerifierReport = isVerifierAuthorFlag && /\b(PASS|FAIL)\b/i.test(latestPost.body);
@@ -265,7 +267,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
 
     if (
       deps.getAutoSpawnVerifier() &&
-      allWorkersDone &&
+      allWorkDone &&
       !anyWorking &&
       !isVerifierReport &&
       !isMonitorStall &&
@@ -305,13 +307,15 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     db.setMemberState(coord.id, "working");
     emitSwarmChanged({ swarmId, reason: "member_state", handle: coord.name });
 
-    const completeReady = hasFreshPass && allWorkersDone && !anyWorking;
+    const completeReady = hasFreshPass && allWorkDone && !anyWorking;
 
     const handoffText = completeReady
       ? `All swarm members finished (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Read board updates since #${prevReadSeq} with read_board, present the final summary to the user, and call swarm{action:"complete"}.`
-      : allWorkersDone && !anyWorking && !hasFreshPass && !isVerifierReport
+      : allWorkDone && !anyWorking && !hasFreshPass && !isVerifierReport
         ? `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Verification is NOT done: no verifier PASS yet. Call read_board(since: ${prevReadSeq}) to review, spawn or repair a verifier (@verifier) to independently verify worker output, and do NOT call swarm{action:"complete"} until a verifier posts PASS.`
-        : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
+        : allWorkersDone && openPlanUnits > 0 && !anyWorking
+          ? `Batch finished (latest #${latestPost.swarm_seq} from @${latestPost.author_name}), with ${openPlanUnits} plan unit(s) still open. Call read_board(since: ${prevReadSeq}) to review and assign the remaining open units.`
+          : `Swarm handoff ready on board (latest #${latestPost.swarm_seq} from @${latestPost.author_name}). Call read_board(since: ${prevReadSeq}) to review and coordinate next steps or complete the swarm.`;
 
     if (coordWaiter) {
       let posts: BoardPostRow[] = [latestPost];
