@@ -469,6 +469,17 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           .listMembers(swarm.id, false)
           .filter((m) => m.role === roleArg);
         for (const m of liveRoleMembers) {
+          const memberSpec =
+            m.model_provider && m.model_id
+              ? formatModelSpec({
+                  providerID: m.model_provider,
+                  id: m.model_id,
+                  ...(m.model_variant ? { variant: m.model_variant } : {}),
+                })
+              : "";
+          if (memberSpec === spec && m.paused_quota !== 1) {
+            continue;
+          }
           const res = await deps.switchMemberModelInPlace(swarm.id, m.name, spec, undefined, {
             interruptAndRerunIfWorking: true,
           });

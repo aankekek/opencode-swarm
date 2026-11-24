@@ -57,8 +57,8 @@ export const SWARM_GUI_STYLES = `
 .swarm-overlay-root {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 8px 4px 4px;
+  gap: 12px;
+  padding: 6px 4px 4px;
   color: var(--text-base, #b5b4b0);
   font-size: 13px;
 }
@@ -68,10 +68,19 @@ export const SWARM_GUI_STYLES = `
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 12px;
-  border-radius: 8px;
+  padding: 12px 14px;
+  border-radius: 10px;
   background: var(--surface-raised-base, #1d1d1c);
   border: 1px solid var(--border-weak-base, #2f2f2d);
+}
+
+.swarm-overlay-top.is-buzzing {
+  border-color: rgba(74, 222, 128, 0.35);
+  background: linear-gradient(135deg, rgba(74, 222, 128, 0.07), var(--surface-raised-base, #1d1d1c) 60%);
+}
+
+.swarm-overlay-top.is-alert {
+  border-color: rgba(245, 166, 35, 0.45);
 }
 
 .swarm-overlay-status {
@@ -84,7 +93,7 @@ export const SWARM_GUI_STYLES = `
 .swarm-overlay-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   padding: 4px 10px;
   border-radius: 999px;
   font-size: 12px;
@@ -94,11 +103,28 @@ export const SWARM_GUI_STYLES = `
   white-space: nowrap;
 }
 
+.swarm-overlay-badge.is-buzzing {
+  background: rgba(74, 222, 128, 0.14);
+  color: #86efac;
+}
+
+.swarm-overlay-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--text-weak, #8a8984);
+}
+
+.swarm-overlay-badge.is-buzzing .swarm-overlay-dot {
+  background: #4ade80;
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.7);
+}
+
 .swarm-overlay-meta {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  gap: 2px;
+  gap: 4px;
 }
 
 .swarm-overlay-meta strong {
@@ -109,9 +135,83 @@ export const SWARM_GUI_STYLES = `
   white-space: nowrap;
 }
 
-.swarm-overlay-meta span {
-  color: var(--text-weak, #8a8984);
+.swarm-overlay-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.swarm-overlay-stat {
   font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--background-base, #141413);
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  color: var(--text-weak, #8a8984);
+}
+
+.swarm-overlay-stat.is-warn {
+  color: #f5b942;
+  border-color: rgba(245, 166, 35, 0.4);
+}
+
+.swarm-overlay-stat.is-danger {
+  color: var(--icon-critical-base, #e05252);
+  border-color: rgba(224, 82, 82, 0.4);
+}
+
+.swarm-overlay-roster {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--background-base, #141413);
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  max-height: 76px;
+  overflow-y: auto;
+}
+
+.swarm-overlay-member-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--surface-raised-base, #1d1d1c);
+  border: 1px solid var(--border-weak-base, #2f2f2d);
+  color: var(--text-base, #b5b4b0);
+}
+
+.swarm-overlay-member-chip.is-working {
+  border-color: rgba(74, 222, 128, 0.4);
+  color: var(--text-strong, #ededec);
+}
+
+.swarm-overlay-member-chip.is-killed {
+  opacity: 0.45;
+}
+
+.swarm-overlay-member-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-weak, #8a8984);
+}
+
+.swarm-overlay-member-chip.is-working .swarm-overlay-member-dot {
+  background: #4ade80;
+}
+
+.swarm-overlay-member-handle {
+  font-weight: 600;
+}
+
+.swarm-overlay-member-model {
+  font-family: var(--font-family-mono, monospace);
+  font-size: 10px;
+  color: var(--text-weak, #8a8984);
 }
 
 .swarm-overlay-error {
@@ -131,52 +231,92 @@ export const SWARM_GUI_STYLES = `
 }
 
 .swarm-overlay-roles {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
-.swarm-overlay-role-row {
+.swarm-overlay-role-card {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   justify-content: space-between;
-  gap: 14px;
-  padding: 10px 12px;
-  border-radius: 8px;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 10px;
   background: var(--surface-raised-base, #1d1d1c);
   border: 1px solid var(--border-weak-base, #2f2f2d);
+  min-width: 0;
+}
+
+.swarm-overlay-role-card.is-dirty {
+  border-color: rgba(245, 166, 35, 0.6);
+  background: linear-gradient(180deg, rgba(245, 166, 35, 0.06), var(--surface-raised-base, #1d1d1c) 55%);
 }
 
 .swarm-overlay-role-info {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   min-width: 0;
-  flex: 1;
 }
 
 .swarm-overlay-role-head {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
 }
 
-.swarm-overlay-role-head strong {
+.swarm-overlay-role-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.swarm-overlay-role-title strong {
   color: var(--text-strong, #ededec);
   font-size: 13px;
 }
 
+.swarm-overlay-role-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.swarm-overlay-dirty-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(245, 166, 35, 0.16);
+  color: #f5b942;
+}
+
 .swarm-overlay-role-count {
-  font-size: 11px;
+  font-size: 10px;
   padding: 1px 6px;
   border-radius: 999px;
   background: var(--surface-base-hover, #262625);
   color: var(--text-weak, #8a8984);
 }
 
+.swarm-overlay-role-count.is-working {
+  background: rgba(74, 222, 128, 0.14);
+  color: #86efac;
+}
+
 .swarm-overlay-role-sub {
   font-size: 11px;
   color: var(--text-weak, #8a8984);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swarm-overlay-role-warn {
+  font-size: 11px;
+  color: #f5b942;
 }
 
 .swarm-overlay-actions {
@@ -187,9 +327,29 @@ export const SWARM_GUI_STYLES = `
 }
 
 .swarm-overlay-select-wrap {
-  flex: 0 0 280px;
-  max-width: 280px;
-  min-width: 220px;
+  width: 100%;
+  min-width: 0;
+}
+
+.swarm-overlay-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-weak-base, #2f2f2d);
+}
+
+.swarm-overlay-footer-note {
+  font-size: 11px;
+  color: var(--text-weak, #8a8984);
+}
+
+.swarm-overlay-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .swarm-model-select {

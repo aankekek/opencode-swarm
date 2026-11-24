@@ -104,8 +104,10 @@ export function SearchableModelSelect(props: SearchableModelSelectProps) {
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  const first = filteredOptions()[0];
-                  if (first) selectOption(first.spec);
+                  if (query().trim().length > 0) {
+                    const first = filteredOptions()[0];
+                    if (first) selectOption(first.spec);
+                  }
                 } else if (e.key === "Escape") {
                   e.preventDefault();
                   e.stopPropagation();

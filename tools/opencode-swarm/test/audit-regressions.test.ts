@@ -1267,4 +1267,44 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       } catch {}
     }
   });
+
+  test("R: setRoleModel with unchanged model does not interrupt or rerun a working worker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-noop-role-switch-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addRes = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "coder", brief: "Keep running" }, { sessionID: "sess_coord" }))
+          .content,
+      );
+      const coderSess = addRes.spawned[0].session_id as string;
+      const promptsBefore = prompts.filter((p) => p.sessionID === coderSess).length;
+
+      // Apply the exact same model the working worker is already running
+      const noopRes = await handlers.setRoleModel({
+        role: "worker",
+        model: "anthropic/claude-sonnet-4-6",
+        sessionId: "sess_coord",
+      });
+
+      expect(noopRes.ok).toBe(true);
+      expect(noopRes.switchedMembers).toEqual([]);
+      expect(noopRes.rerunMembers).toEqual([]);
+      expect((ctx as any)._interrupted).not.toContain(coderSess);
+      expect((ctx as any)._switched.some((s: any) => s.sessionID === coderSess)).toBe(false);
+      expect(prompts.filter((p) => p.sessionID === coderSess).length).toBe(promptsBefore);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

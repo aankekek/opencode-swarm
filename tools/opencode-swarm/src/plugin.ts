@@ -485,6 +485,17 @@ export const swarmRuntimePlugin = Plugin.define({
             throw new Error(`No model or variant specified for "@${memberName}".`);
           }
 
+          const currentSpec = currentModel ? formatModelSpec(currentModel) : "";
+          const nextSpec = formatModelSpec(resolved);
+          if (currentSpec && currentSpec === nextSpec && !wasPausedQuota) {
+            return {
+              name: target.name,
+              model: nextSpec,
+              preserved_history: true,
+              rerun: false,
+            };
+          }
+
           if (wasWorking && opts?.interruptAndRerunIfWorking) {
             await ctx.session.interrupt({ sessionID: target.session_id }).catch(() => {});
           }
