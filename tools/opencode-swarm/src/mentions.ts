@@ -25,7 +25,7 @@ export function parseMentionsFromText(text: string): ParsedMentions {
     channelMentions.add(ch);
   }
 
-  const userRegex = /(?:^|[\s([*`'"])@([a-zA-Z0-9_-]{1,32})(?=$|[\s,.:;!?)\]*`'"—–])/g;
+  const userRegex = /(?:^|[\s([*`'"/])@([a-zA-Z0-9_-]{1,32})(?=$|[\s,.:;!?)\]*`'"—–/])/g;
   while ((m = userRegex.exec(text)) !== null) {
     const name = m[1].toLowerCase();
     if (name === "all" || name === "everyone") {

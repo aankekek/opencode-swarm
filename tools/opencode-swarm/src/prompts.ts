@@ -20,7 +20,7 @@ export const COORDINATOR_PROTOCOL = [
   "If `add` rejects on the cap or shard limit, regroup the units; do not retry blindly.",
   "When a plan exists, `add` assigns units and reports `unassigned_units`; use `plan` for any task with more than 2 units.",
   "## Finish",
-  "Call `swarm_wait` or end your turn cleanly after spawning workers. Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` (a verifier is auto-spawned/requested once all worker tracks finish; if disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
+  "Call `swarm_wait` or end your turn cleanly after spawning workers. Completed workers are verified incrementally as they finish (the auto-verifier spawns or notifies `@verifier` when workers post `[done]` while siblings are still running). Do not call `swarm{action:\"complete\"}` until `@verifier` confirms `PASS` across all worker tracks (if auto-verifier is disabled or unavailable, spawn one yourself). Once `@verifier` posts `PASS`, post `[done] <summary>` (no `@`) and call `swarm{action:\"complete\"}` immediately.",
 ].join("\n");
 
 export function buildMemberOpeningPrompt(args: {
@@ -49,7 +49,8 @@ export function buildMemberOpeningPrompt(args: {
     lines.push(
       `- You are read-only. Never edit workspace files.`,
       `- Inspect diffs, run concrete checks, and use \`post_message\` to send failures to the owning \`@worker\` or PASS to \`@coordinator\`.`,
-      `- Call \`swarm_wait\` when waiting for work so you sleep at 0 tokens.`,
+      `- For incremental verification (some workers \`[done]\` while others are still running), verify the completed tracks now — do not wait for remaining workers; post \`FAIL\` naming \`@worker\` with \`file:line\` if issues are found, or an incremental \`OK\`/\`VERIFIED\` summary to \`@coordinator\`, and reserve final \`PASS\` until all worker tracks are complete.`,
+      `- Do NOT call \`swarm_wait\` mid-verification before finishing checks on ready tracks and posting your report. Only call \`swarm_wait\` when you have no pending verification work (and never pass seconds/timeouts to \`since\`).`,
     );
   } else if (args.role === "monitor") {
     lines.push(
@@ -65,7 +66,7 @@ export function buildMemberOpeningPrompt(args: {
       `- Work only inside your assigned workspace / owned globs.`,
       `- Report progress and handoffs via \`post_message\` with \`@mentions\` (start final completion post with \`[done]\`).`,
       `- You may spawn helpers via \`swarm{action:"add"}\` and manage only helpers you added.`,
-      `- When waiting on another member, call \`swarm_wait\` or end your turn to sleep at 0 tokens.`,
+      `- Do NOT call \`swarm_wait\` mid-task before finishing your assigned work and posting \`[done]\` (or \`[blocked]\` naming who you need). Only call \`swarm_wait\` after posting when waiting on another member (and never pass seconds/timeouts to \`since\`).`,
       `- Once \`@verifier\` posts \`PASS\`, do not post acknowledgment replies (stay idle unless \`@coordinator\` or \`@verifier\` requests follow-up edits).`,
     );
   }

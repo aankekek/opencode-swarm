@@ -21,12 +21,20 @@ export interface WakeControllerDeps {
   spawnVerifier: (args: { swarmId: string; caller: MemberRow; name: string; brief: string }) => Promise<unknown>;
 }
 
+export interface VerifyRequestOptions {
+  incremental?: boolean;
+  doneWorkers?: MemberRow[];
+  openWorkers?: MemberRow[];
+}
+
 export interface WakeController {
   wakeMember: (member: MemberRow, triggerPost: BoardPostRow) => Promise<void>;
+  maybeWakePendingMember: (memberId: string) => Promise<boolean>;
   ensureVerifierForCompletedWork: (
     swarmId: string,
     coord: MemberRow,
     latestPost: BoardPostRow,
+    opts?: VerifyRequestOptions,
   ) => Promise<"spawned" | "requested" | "in_progress" | "unavailable">;
   maybeWakeIdleCoordinator: (swarmId: string, triggerPost?: BoardPostRow) => Promise<void>;
   postToBoard: (
@@ -48,7 +56,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
   const lastCoordinatorWakeSeq = new Map<string, number>();
   const lastWakeSeq = new Map<string, number>();
   const autoVerifierSpawnAttempts = new Map<string, number>();
-  const lastVerificationRequestSeq = new Map<string, number>();
+  const lastVerificationRequest = new Map<string, { seq: number; incremental: boolean }>();
   // Per-swarm in-flight marker so overlapping callers cannot both post [verify]
   // for the same latest post while the first request is still being delivered.
   const verificationRequestsInFlight = new Set<string>();
@@ -73,7 +81,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     lastCoordinatorWakeSeq.clear();
     lastWakeSeq.clear();
     autoVerifierSpawnAttempts.clear();
-    lastVerificationRequestSeq.clear();
+    lastVerificationRequest.clear();
     verificationRequestsInFlight.clear();
   }
 
@@ -164,11 +172,30 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     }
   }
 
+  async function maybeWakePendingMember(memberId: string): Promise<boolean> {
+    const fresh = db.getMemberById(memberId);
+    if (!fresh || fresh.role === "coordinator" || fresh.state !== "waiting" || fresh.paused_quota === 1 || waiters.has(fresh.id)) {
+      return false;
+    }
+    const swarm = db.getSwarm(fresh.swarm_id);
+    if (!swarm || swarm.status !== "running") return false;
+    const effectiveWakeSeq = Math.max(fresh.last_read_seq, getLastWakeSeq(fresh.id));
+    const pending = checkPendingWakePosts(db, fresh, effectiveWakeSeq, fresh.wake_mode !== "any");
+    if (pending.length === 0) return false;
+    await wakeMember(fresh, pending[pending.length - 1]);
+    return true;
+  }
+
   async function ensureVerifierForCompletedWork(
     swarmId: string,
     coord: MemberRow,
     latestPost: BoardPostRow,
+    opts?: VerifyRequestOptions,
   ): Promise<"spawned" | "requested" | "in_progress" | "unavailable"> {
+    const incremental = Boolean(opts?.incremental);
+    const doneNames =
+      (opts?.doneWorkers ?? []).map((w) => w.name).join(", ") || latestPost.author_name;
+    const openNames = (opts?.openWorkers ?? []).map((w) => w.name).join(", ");
     const liveVerifiers = db.listMembers(swarmId, false).filter((m) => m.role === "verifier");
     if (liveVerifiers.length === 0) {
       const attempts = autoVerifierSpawnAttempts.get(swarmId) ?? 0;
@@ -181,18 +208,26 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
           while (db.getMemberByName(swarmId, `verifier-${n}`)) n++;
           verifierName = `verifier-${n}`;
         }
-        const brief = [
-          `You are the swarm verifier. All worker tracks are complete (latest #${latestPost.swarm_seq} from ${latestPost.author_name}).`,
-          `Verify completed worker output against the swarm objective: read board with read_board, independently verify each finished track, inspect diffs and run concrete checks (tests/builds/file review).`,
-          `Then post PASS to @${coord.name} if all checks pass, or FAIL with exact file:line issues naming the responsible @worker.`,
-          `Read-only: do not edit workspace files.`,
-        ].join(" ");
+        const brief = incremental
+          ? [
+              `You are the swarm verifier. Completed worker track(s) ready for incremental verification: ${doneNames} (latest #${latestPost.swarm_seq} from ${latestPost.author_name}); still in progress: ${openNames}.`,
+              `Start verifying the completed track(s) NOW — do not wait for remaining workers. Read the board with read_board, inspect diffs and run concrete checks.`,
+              `Post FAIL naming the owning @worker with exact file:line if you find issues, or an incremental OK/VERIFIED summary to @${coord.name} (reserve final PASS until all worker tracks are complete).`,
+              `Read-only: do not edit workspace files.`,
+            ].join(" ")
+          : [
+              `You are the swarm verifier. All worker tracks are complete (latest #${latestPost.swarm_seq} from ${latestPost.author_name}).`,
+              `Verify completed worker output against the swarm objective: read board with read_board, independently verify each finished track, inspect diffs and run concrete checks (tests/builds/file review).`,
+              `Then post PASS to @${coord.name} if all checks pass, or FAIL with exact file:line issues naming the responsible @worker.`,
+              `Read-only: do not edit workspace files.`,
+            ].join(" ");
         await deps.spawnVerifier({
           swarmId,
           caller: coord,
           name: verifierName,
           brief,
         });
+        lastVerificationRequest.set(swarmId, { seq: latestPost.swarm_seq, incremental });
         return "spawned";
       } catch (err) {
         // Restore the previous attempt count so a failed spawn does not burn an attempt.
@@ -214,19 +249,24 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     if (!waitingVerifier) return "unavailable";
     const fresh = db.getMemberById(waitingVerifier.id) ?? waitingVerifier;
     if (fresh.paused_quota === 1 || fresh.state === "stopped" || fresh.state === "killed") return "unavailable";
-    if (waiters.has(fresh.id)) return "in_progress";
-    if (lastVerificationRequestSeq.get(swarmId) === latestPost.swarm_seq) return "in_progress";
+    const prevReq = lastVerificationRequest.get(swarmId);
+    if (prevReq && prevReq.seq === latestPost.swarm_seq && (incremental || !prevReq.incremental)) {
+      return "in_progress";
+    }
     if (verificationRequestsInFlight.has(swarmId)) return "in_progress";
     verificationRequestsInFlight.add(swarmId);
     try {
+      const verifyMsg = incremental
+        ? `@${fresh.name} [verify] Incremental verification ready: ${latestPost.author_name} finished (#${latestPost.swarm_seq}; completed: ${doneNames}; still open: ${openNames}). Verify the completed track(s) now with read_board, diff inspection, and concrete checks — do not wait for remaining workers. Post FAIL to the owning @worker if issues are found, or an incremental OK/VERIFIED summary to @${coord.name} (reserve final PASS until all tracks are complete).`
+        : `@${fresh.name} [verify] All worker tracks are complete (latest #${latestPost.swarm_seq}). Independently verify completed worker output against the swarm objective: read board with read_board, inspect diffs and run concrete checks, then post PASS to @${coord.name} or FAIL with exact file:line issues naming the responsible @worker.`;
       await postToBoard(
         swarmId,
         coord.name,
         "main",
-        `@${fresh.name} [verify] All worker tracks are complete (latest #${latestPost.swarm_seq}). Independently verify completed worker output against the swarm objective: read board with read_board, inspect diffs and run concrete checks, then post PASS to @${coord.name} or FAIL with exact file:line issues naming the responsible @worker.`,
+        verifyMsg,
         new Set([coord.id]),
       );
-      lastVerificationRequestSeq.set(swarmId, latestPost.swarm_seq);
+      lastVerificationRequest.set(swarmId, { seq: latestPost.swarm_seq, incremental });
       return "requested";
     } catch (err) {
       console.warn("[opencode-swarm] verification request failed:", err instanceof Error ? err.message : String(err));
@@ -245,25 +285,37 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
     if (!coord) return;
 
     const latestPost = triggerPost ?? db.getLatestPost(swarmId);
-    if (!latestPost || latestPost.author_name === coord.name) return;
 
     const nonCoord = members.filter(
       (m) => m.role !== "coordinator" && m.role !== "monitor" && m.role !== "narrator",
     );
     const anyWorking = nonCoord.some((m) => m.state === "working");
     const workers = nonCoord.filter((m) => m.role === "worker");
+    const doneWorkers = workers.filter((w) => w.track_status === "done");
+    const openWorkers = workers.filter((w) => w.track_status === "open");
     const allWorkersDone = workers.length > 0 && workers.every((w) => w.track_status === "done");
     const openPlanUnits = db.getTaskCounts(swarmId).open;
     const allWorkDone = allWorkersDone && openPlanUnits === 0;
-    const latestAuthorMember = db.getMemberByName(swarmId, latestPost.author_name);
-    const isVerifierAuthorFlag = isVerifierAuthor(latestPost.author_name, latestAuthorMember);
-    const isVerifierReport = isVerifierAuthorFlag && /\b(PASS|FAIL)\b/i.test(latestPost.body);
-    const isMonitorStall = latestPost.author_name === "monitor";
+    const latestAuthorMember = latestPost ? db.getMemberByName(swarmId, latestPost.author_name) : undefined;
+    const isVerifierAuthorFlag = latestPost ? isVerifierAuthor(latestPost.author_name, latestAuthorMember) : false;
+    const isVerifierReport = Boolean(latestPost && isVerifierAuthorFlag && /\b(PASS|FAIL)\b/i.test(latestPost.body));
+    const isMonitorStall = latestPost?.author_name === "monitor";
     const hasFreshPass = hasFreshVerifierPass(db, swarmId, members);
     if (hasFreshPass) {
       // A PASS closes the verification cycle: allow a later work cycle to auto-verify again.
       autoVerifierSpawnAttempts.delete(swarmId);
     }
+
+    const findLatestDoneWorkerPost = (): BoardPostRow | undefined => {
+      if (doneWorkers.length === 0) return undefined;
+      const doneNames = new Set(doneWorkers.map((w) => w.name));
+      if (triggerPost && doneNames.has(triggerPost.author_name)) return triggerPost;
+      const { posts } = db.getLatestPostsWindow(swarmId, 200);
+      for (let i = posts.length - 1; i >= 0; i--) {
+        if (doneNames.has(posts[i].author_name)) return posts[i];
+      }
+      return undefined;
+    };
 
     if (
       deps.getAutoSpawnVerifier() &&
@@ -273,9 +325,36 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
       !isMonitorStall &&
       !hasFreshPass
     ) {
-      const outcome = await ensureVerifierForCompletedWork(swarmId, coord, latestPost);
-      if (outcome === "spawned" || outcome === "requested" || outcome === "in_progress") return;
+      const verifyTargetPost =
+        (latestPost && latestPost.author_name !== coord.name ? latestPost : findLatestDoneWorkerPost()) ?? latestPost;
+      if (verifyTargetPost) {
+        const outcome = await ensureVerifierForCompletedWork(swarmId, coord, verifyTargetPost, {
+          incremental: false,
+          doneWorkers,
+          openWorkers: [],
+        });
+        if (outcome === "spawned" || outcome === "requested" || outcome === "in_progress") return;
+      }
+    } else if (
+      deps.getAutoSpawnVerifier() &&
+      !allWorkDone &&
+      doneWorkers.length > 0 &&
+      openWorkers.length > 0 &&
+      !isVerifierReport &&
+      !isMonitorStall &&
+      !hasFreshPass
+    ) {
+      const donePost = findLatestDoneWorkerPost();
+      if (donePost) {
+        await ensureVerifierForCompletedWork(swarmId, coord, donePost, {
+          incremental: true,
+          doneWorkers,
+          openWorkers,
+        });
+      }
     }
+
+    if (!latestPost || latestPost.author_name === coord.name) return;
 
     const coordWaiter = waiters.get(coord.id);
     if ((!coordWaiter && coord.state !== "waiting") || coord.paused_quota === 1) {
@@ -415,6 +494,7 @@ export function createWakeController(deps: WakeControllerDeps): WakeController {
 
   return {
     wakeMember,
+    maybeWakePendingMember,
     ensureVerifierForCompletedWork,
     maybeWakeIdleCoordinator,
     postToBoard,

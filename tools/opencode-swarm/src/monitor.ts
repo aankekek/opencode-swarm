@@ -152,7 +152,7 @@ export function startStallMonitor(
               .join(", ");
             nudgeMessage = `@coordinator [stall] All members idle >${Math.round(config.stallTimeoutMs / 1000)}s with open tracks: ${summary}.`;
           } else if (verifier && verifier.state === "waiting" && !hasPass) {
-            nudgeMessage = `@verifier [stall] All worker tracks are done; please verify pending work or post PASS to @coordinator.`;
+            nudgeMessage = `@${verifier.name} [stall] All worker tracks are done; please verify pending work or post PASS to @coordinator.`;
           } else if (!hasPass) {
             nudgeMessage = buildVerificationIncompleteNudge(swarm.id, verifier);
           } else {

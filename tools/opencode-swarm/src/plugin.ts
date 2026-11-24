@@ -1365,7 +1365,10 @@ export const swarmRuntimePlugin = Plugin.define({
                 if (statusObj?.type === "idle") {
                   db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
                   emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-                  await maybeWakeIdleCoordinator(member.swarm_id);
+                  const rewoke = await wake.maybeWakePendingMember(member.id);
+                  if (!rewoke) {
+                    await maybeWakeIdleCoordinator(member.swarm_id);
+                  }
                 } else if (statusObj?.type === "busy") {
                   db.setMemberState(member.id, "working", { pausedQuota: false });
                   emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
@@ -1385,7 +1388,10 @@ export const swarmRuntimePlugin = Plugin.define({
               } else if (eventType === "session.idle" || eventType === "session.execution.succeeded") {
                 db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
-                await maybeWakeIdleCoordinator(member.swarm_id);
+                const rewoke = await wake.maybeWakePendingMember(member.id);
+                if (!rewoke) {
+                  await maybeWakeIdleCoordinator(member.swarm_id);
+                }
               } else if (eventType === "session.execution.interrupted") {
                 db.setMemberState(member.id, "stopped", { activity: null });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });

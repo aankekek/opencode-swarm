@@ -1307,4 +1307,188 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       } catch {}
     }
   });
+
+  test("S1: swarm_wait clamps out-of-range since to latestSeq so @mention still wakes member", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-s1-clamp-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const waitTool = tools.get("swarm_wait");
+
+      const addRes = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "build-a", brief: "Build A" }, { sessionID: "sess_coord" }))
+          .content,
+      );
+      const wSess = addRes.spawned[0].session_id as string;
+
+      // Worker mistakenly passes since: 450 (e.g. seconds) when board is only at seq 1
+      const waitPromise = waitTool.execute({ since: 450 }, { sessionID: wSess });
+      await new Promise((r) => setTimeout(r, 20));
+
+      await postTool.execute({ text: "@build-a please continue" }, { sessionID: "sess_coord" });
+      const waitRes = JSON.parse((await waitPromise).content);
+
+      expect(waitRes.woken).toBe(true);
+      expect(waitRes.posts.some((p: any) => p.text.includes("@build-a please continue"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("S2: parked verifier in swarm_wait is woken when [verify] is posted", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-s2-parked-verifier-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const waitTool = tools.get("swarm_wait");
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+
+      const addV = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "verifier", role: "verifier", brief: "Verify work" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      const verSess = addV.spawned[0].session_id as string;
+
+      // Verifier finishes initial turn and parks in swarm_wait
+      pushEvent({ type: "session.status", data: { sessionID: verSess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 20));
+      const verWaitPromise = waitTool.execute({}, { sessionID: verSess });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Worker posts [done] -> ensureVerifierForCompletedWork must post @verifier [verify] and wake the parked waiter
+      await postTool.execute({ text: "[done] w1 finished" }, { sessionID: w1Sess });
+      const verWaitRes = JSON.parse((await verWaitPromise).content);
+
+      expect(verWaitRes.woken).toBe(true);
+      expect(verWaitRes.posts.some((p: any) => p.text.includes("[verify]"))).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("S3: incremental verification spawns verifier when 2 of 4 workers finish, then sends final [verify] when all 4 finish", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-s3-incremental-verify-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const readTool = tools.get("read_board");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const sessions: string[] = [];
+      for (let i = 1; i <= 4; i++) {
+        const res = JSON.parse(
+          (await swarmTool.execute({ action: "add", name: `w${i}`, brief: `Task ${i}` }, { sessionID: "sess_coord" }))
+            .content,
+        );
+        sessions.push(res.spawned[0].session_id as string);
+      }
+
+      // 2 of 4 workers finish while w3 and w4 are still working/open
+      await postTool.execute({ text: "[done] w1 complete" }, { sessionID: sessions[0] });
+      await postTool.execute({ text: "[done] w2 complete" }, { sessionID: sessions[1] });
+      await new Promise((r) => setTimeout(r, 30));
+
+      const snapMid = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const verifiersMid = snapMid.members.filter((m: any) => m.role === "verifier");
+      expect(verifiersMid.length).toBe(1);
+      const verSess = verifiersMid[0].session_id as string;
+
+      // Verifier finishes incremental check and goes idle
+      await postTool.execute({ text: "OK @coordinator verified w1 and w2" }, { sessionID: verSess });
+      pushEvent({ type: "session.status", data: { sessionID: verSess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Remaining 2 workers finish
+      await postTool.execute({ text: "[done] w3 complete" }, { sessionID: sessions[2] });
+      await postTool.execute({ text: "[done] w4 complete" }, { sessionID: sessions[3] });
+      // Verifier finishes its incremental turn for w3 and goes idle -> final [verify] is posted
+      pushEvent({ type: "session.status", data: { sessionID: verSess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 30));
+
+      const board = JSON.parse((await readTool.execute({ since: 0, limit: 50 }, { sessionID: "sess_coord" })).content);
+      const finalVerifyPosts = board.posts.filter(
+        (p: any) => p.text.includes("[verify]") && p.text.includes("All worker tracks are complete"),
+      );
+      expect(finalVerifyPosts.length).toBe(1);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("S4: missed @mention while worker is working is delivered when worker goes idle", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-s4-idle-rewake-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "coder", brief: "Code" }, { sessionID: "sess_coord" })).content,
+      );
+      const coderSess = addW.spawned[0].session_id as string;
+      const promptsBefore = prompts.filter((p) => p.sessionID === coderSess).length;
+
+      // Worker is currently "working", so @mention cannot prompt immediately
+      await postTool.execute({ text: "@coder please also check edge case X" }, { sessionID: "sess_coord" });
+      expect(prompts.filter((p) => p.sessionID === coderSess).length).toBe(promptsBefore);
+
+      // Worker finishes turn and emits idle -> missed @mention must be delivered now
+      pushEvent({ type: "session.status", data: { sessionID: coderSess, status: { type: "idle" } } });
+      await new Promise((r) => setTimeout(r, 30));
+
+      const coderPrompts = prompts.filter((p) => p.sessionID === coderSess);
+      expect(coderPrompts.length).toBe(promptsBefore + 1);
+      expect(coderPrompts[coderPrompts.length - 1].text).toContain("please also check edge case X");
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("S5: slash-separated @mentions are parsed while emails remain ignored", () => {
+    const parsed = parseMentionsFromText("waiting on @build-a/@build-b/@build-c, cc user@example.com");
+    expect(parsed.memberMentions).toEqual(["build-a", "build-b", "build-c"]);
+  });
 });

@@ -923,12 +923,20 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
 
     tools.add({
       name: "swarm_wait",
-      description: "Sleep at 0 tokens until a matching post arrives on the board after `since`.",
+      description:
+        "Block at 0 tokens until a matching board post arrives after board sequence number `since`. NOT a timer/sleep — do NOT call mid-task while you still have assigned work; finish and post [done] or PASS/FAIL (or [blocked] naming who you need) first.",
       input: {
         type: "object",
         properties: {
-          since: { type: "number" },
-          mentions_only: { type: "boolean" },
+          since: {
+            type: "number",
+            description:
+              "Board post sequence number (seq, e.g. 12) to wait after — NOT seconds or milliseconds. Omit to use your current read/wake cursor.",
+          },
+          mentions_only: {
+            type: "boolean",
+            description: "Wait only for posts that @mention you (default true). Set false to wake on any board post.",
+          },
         },
       },
       options: { codemode: false },
@@ -940,10 +948,12 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
         if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
         const input = (rawInput ?? {}) as { since?: number; mentions_only?: boolean };
         const mentionsOnly = input.mentions_only ?? true;
-        const sinceSeq =
-          typeof input.since === "number"
-            ? input.since
+        const latestSeq = db.getLatestPost(caller.swarm_id)?.swarm_seq ?? 0;
+        const rawSince =
+          typeof input.since === "number" && Number.isFinite(input.since)
+            ? Math.max(0, Math.floor(input.since))
             : Math.max(caller.last_read_seq, mentionsOnly ? deps.getLastWakeSeq(caller.id) : 0);
+        const sinceSeq = Math.min(rawSince, latestSeq);
 
         // Race-free check: if matching posts already exist after sinceSeq, return immediately
         const immediate = checkPendingWakePosts(db, caller, sinceSeq, mentionsOnly);
