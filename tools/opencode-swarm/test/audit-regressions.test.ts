@@ -1732,4 +1732,161 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       } catch {}
     }
   });
+
+  test("V1: post_message rejects payloads > 64 KiB before mutating worker state, and accepts <= 64 KiB", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-v1-post-size-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+
+      const oversized = "[done] " + "x".repeat(65_536);
+      const rejectRes = JSON.parse((await postTool.execute({ text: oversized }, { sessionID: w1Sess })).content);
+      expect(rejectRes.ok).toBe(false);
+      expect(String(rejectRes.error)).toContain("message too large");
+
+      // Worker must remain working / open track because oversized [done] was rejected
+      const snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const w1 = snap.members.find((m: any) => m.name === "w1");
+      expect(w1.state).toBe("working");
+      expect(w1.track_status).toBe("open");
+
+      const exact = "[done] " + "y".repeat(65_536 - 7);
+      const okRes = JSON.parse((await postTool.execute({ text: exact }, { sessionID: w1Sess })).content);
+      expect(okRes.ok).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("V2: post_message enforces 60 posts/minute per-member rate limit without blocking other members", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-v2-rate-limit-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const postTool = tools.get("post_message");
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+
+      for (let i = 1; i <= 60; i++) {
+        const res = JSON.parse((await postTool.execute({ text: `update ${i}` }, { sessionID: w1Sess })).content);
+        expect(res.ok).toBe(true);
+      }
+
+      const overRes = JSON.parse((await postTool.execute({ text: "update 61" }, { sessionID: w1Sess })).content);
+      expect(overRes.ok).toBe(false);
+      expect(String(overRes.error)).toContain("posting too fast");
+      expect(String(overRes.error)).toContain("60 posts a minute");
+
+      // Coordinator has its own per-member window and can still post
+      const coordRes = JSON.parse((await postTool.execute({ text: "coord ok" }, { sessionID: "sess_coord" })).content);
+      expect(coordRes.ok).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("V3: add enforces 256 KiB brief cap and channel create enforces 1024-byte topic cap without '@' or newlines", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-v3-brief-topic-caps-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools } = createHarness(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+
+      const bigBriefRes = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "w1", brief: "b".repeat(262_145) },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(bigBriefRes.ok).toBe(false);
+      expect(String(bigBriefRes.error)).toContain("brief too large");
+
+      // Spawn a valid worker to initialize the swarm before channel tests
+      const okAdd = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Valid brief" }, { sessionID: "sess_coord" }))
+          .content,
+      );
+      expect(okAdd.ok).toBe(true);
+
+      const longTopic = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "channel", op: "create", channel: "ui", topic: "t".repeat(1025) },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(longTopic.ok).toBe(false);
+      expect(String(longTopic.error)).toContain("1024 bytes");
+
+      const atTopic = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "channel", op: "create", channel: "ui", topic: "ping @w1" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(atTopic.ok).toBe(false);
+      expect(String(atTopic.error)).toContain("may not contain '@'");
+
+      const nlTopic = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "channel", op: "create", channel: "ui", topic: "line1\nline2" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(nlTopic.ok).toBe(false);
+      expect(String(nlTopic.error)).toContain("line breaks");
+
+      const okTopic = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "channel", op: "create", channel: "ui", topic: "UI layout and components" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(okTopic.ok).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

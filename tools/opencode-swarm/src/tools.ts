@@ -18,6 +18,12 @@ import { cleanupMemberWorkspace } from "./workspace.js";
 
 type PluginContext = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0];
 
+export const MAX_POST_MESSAGE_BYTES = 65_536;
+export const MAX_BRIEF_BYTES = 262_144;
+export const MAX_CHANNEL_TOPIC_BYTES = 1_024;
+export const POST_RATE_LIMIT_PER_MINUTE = 60;
+const POST_RATE_WINDOW_MS = 60_000;
+
 function toolJson(payload: unknown): { content: string } {
   return { content: JSON.stringify(payload, null, 2) };
 }
@@ -78,6 +84,7 @@ export interface SwarmToolsDeps {
 
 export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDeps): Promise<void> {
   const { db, waiters, emitSwarmChanged } = deps;
+  const memberPostTimestamps = new Map<string, number[]>();
 
   await ctx.tool.transform((tools) => {
     tools.add({
@@ -263,6 +270,13 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           if (!baseName || !brief) {
             return toolJson({ ok: false, error: "name and brief are required for action:'add'." });
           }
+          const briefBytes = Buffer.byteLength(brief, "utf8");
+          if (briefBytes > MAX_BRIEF_BYTES) {
+            return toolJson({
+              ok: false,
+              error: `brief too large; post a summary and write details to a file (${briefBytes} bytes, limit ${MAX_BRIEF_BYTES})`,
+            });
+          }
 
           const rawRole = input.role !== undefined ? String(input.role).trim().toLowerCase() : "worker";
           const allowedRoles: MemberRole[] = ["worker", "verifier", "monitor", "narrator"];
@@ -394,6 +408,13 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
                 });
               }
               for (let i = 0; i < count; i++) {
+                const sliceBriefBytes = Buffer.byteLength(briefFor(i), "utf8");
+                if (sliceBriefBytes > MAX_BRIEF_BYTES) {
+                  return toolJson({
+                    ok: false,
+                    error: `brief too large; post a summary and write details to a file (${sliceBriefBytes} bytes, limit ${MAX_BRIEF_BYTES})`,
+                  });
+                }
                 const shardName = validateMemberName(`${baseName}-${i + 1}`, role);
                 const existing = db.getMemberByName(swarmId, shardName);
                 if (existing) {
@@ -626,7 +647,18 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               if (caller.role !== "coordinator") {
                 return toolJson({ ok: false, error: "Only @coordinator may create channels." });
               }
-              const created = db.createChannel(caller.swarm_id, chName, String(input.topic ?? ""), caller.name);
+              const topic = String(input.topic ?? "");
+              const topicBytes = Buffer.byteLength(topic, "utf8");
+              if (topicBytes > MAX_CHANNEL_TOPIC_BYTES) {
+                return toolJson({
+                  ok: false,
+                  error: `topic is longer than ${MAX_CHANNEL_TOPIC_BYTES} bytes (${topicBytes} bytes)`,
+                });
+              }
+              if (/[@\r\n]/.test(topic)) {
+                return toolJson({ ok: false, error: "a topic may not contain '@' or line breaks" });
+              }
+              const created = db.createChannel(caller.swarm_id, chName, topic, caller.name);
               return toolJson({ ok: true, channel: created });
             }
             if (op === "archive") {
@@ -812,12 +844,33 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
         const caller = db.getActiveMemberBySession(toolCtx.sessionID);
         if (!caller) return toolJson({ ok: false, error: "Session is not an active swarm member." });
         const input = rawInput as { text: string; channel?: string; mark_done?: boolean };
+        const text = typeof input.text === "string" ? input.text : "";
+        const textBytes = Buffer.byteLength(text, "utf8");
+        if (textBytes > MAX_POST_MESSAGE_BYTES) {
+          return toolJson({
+            ok: false,
+            error: `message too large; post a summary and write details to a file (${textBytes} bytes, limit ${MAX_POST_MESSAGE_BYTES})`,
+          });
+        }
+        const now = Date.now();
+        const cutoff = now - POST_RATE_WINDOW_MS;
+        const recent = (memberPostTimestamps.get(caller.id) ?? []).filter((ts) => ts > cutoff);
+        if (recent.length >= POST_RATE_LIMIT_PER_MINUTE) {
+          memberPostTimestamps.set(caller.id, recent);
+          return toolJson({
+            ok: false,
+            error: `posting too fast; slow down and retry (limit ${POST_RATE_LIMIT_PER_MINUTE} posts a minute)`,
+          });
+        }
+        recent.push(now);
+        memberPostTimestamps.set(caller.id, recent);
+
         const isDonePost =
           Boolean(input.mark_done) ||
-          /^\s*\[done\]/i.test(input.text) ||
-          /@\S+\s+\[done\]/i.test(input.text);
-        const isVerifierPass = caller.role === "verifier" && /\bPASS\b/i.test(input.text);
-        const isVerifierFail = caller.role === "verifier" && /\bFAIL\b/i.test(input.text);
+          /^\s*\[done\]/i.test(text) ||
+          /@\S+\s+\[done\]/i.test(text);
+        const isVerifierPass = caller.role === "verifier" && /\bPASS\b/i.test(text);
+        const isVerifierFail = caller.role === "verifier" && /\bFAIL\b/i.test(text);
 
         if (isDonePost || isVerifierPass) {
           db.setTrackStatus(caller.id, "done");
@@ -834,11 +887,14 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           emitSwarmChanged({ swarmId: caller.swarm_id, reason: "member_state", handle: caller.name });
         }
         try {
-          const post = await deps.postToBoard(caller.swarm_id, caller.name, input.channel ?? "main", input.text);
+          const post = await deps.postToBoard(caller.swarm_id, caller.name, input.channel ?? "main", text);
           deps.recordWakeSeq(caller.id, post.swarm_seq);
           await deps.maybeWakeIdleCoordinator(caller.swarm_id, post);
           return toolJson({ ok: true, seq: post.swarm_seq, channel: post.channel });
         } catch (err) {
+          if (recent[recent.length - 1] === now) {
+            recent.pop();
+          }
           return toolJson({ ok: false, error: err instanceof Error ? err.message : String(err) });
         }
       },
