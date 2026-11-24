@@ -47,6 +47,8 @@ export interface PluginOptions {
   maxWorkers?: number;
   /** Maximum members spawned by one `add` call; split into sequential batches (default: 8). */
   maxShardsPerAdd?: number;
+  /** Base delay in ms before auto-resuming a quota-paused member (default: 30000). */
+  quotaResumeDelayMs?: number;
 }
 
 export interface SwarmRow {

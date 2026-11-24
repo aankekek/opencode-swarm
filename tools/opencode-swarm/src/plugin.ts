@@ -33,9 +33,30 @@ function toolJson(payload: unknown): { content: string } {
   return { content: JSON.stringify(payload, null, 2) };
 }
 
+const DEFAULT_QUOTA_RESUME_DELAY_MS = 30_000;
+const MAX_QUOTA_AUTO_RESUMES = 3;
+
+function errorText(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw instanceof Error) return `${raw.name}: ${raw.message}`;
+  return JSON.stringify(raw ?? "");
+}
+
 function isQuotaOrRateLimitError(raw: unknown): boolean {
-  const text = typeof raw === "string" ? raw : JSON.stringify(raw ?? "");
-  return /(429|quota|rate[\s_-]?limit|insufficient_quota|usage limit|resource_exhausted)/i.test(text);
+  return /(429|quota|rate[\s_-]?limit|insufficient_quota|usage limit|resource_exhausted)/i.test(errorText(raw));
+}
+
+export function parseQuotaRetryDelayMs(raw: unknown, fallbackMs = DEFAULT_QUOTA_RESUME_DELAY_MS): number {
+  const text = errorText(raw);
+  const secMatch = /(?:retry|try again|wait|reset)[^\d]{0,20}(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b/i.exec(text);
+  if (secMatch) {
+    return Math.min(Math.max(Math.round(Number(secMatch[1]) * 1000), 1_000), 300_000);
+  }
+  const minMatch = /(?:retry|try again|wait|reset)[^\d]{0,20}(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b/i.exec(text);
+  if (minMatch) {
+    return Math.min(Math.max(Math.round(Number(minMatch[1]) * 60_000), 1_000), 300_000);
+  }
+  return fallbackMs;
 }
 
 function safeParseStringArray(raw: string | null | undefined): string[] {
@@ -360,6 +381,82 @@ export const swarmRuntimePlugin = Plugin.define({
     }
 
     const exitedSessionSwarm = new Map<string, string>();
+    const quotaResumeBaseMs =
+      typeof options.quotaResumeDelayMs === "number" && options.quotaResumeDelayMs > 0
+        ? options.quotaResumeDelayMs
+        : DEFAULT_QUOTA_RESUME_DELAY_MS;
+    const quotaResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const quotaResumeAttempts = new Map<string, number>();
+
+    const cancelQuotaAutoResume = (memberId: string, resetAttempts = false) => {
+      const existing = quotaResumeTimers.get(memberId);
+      if (existing) {
+        clearTimeout(existing);
+        quotaResumeTimers.delete(memberId);
+      }
+      if (resetAttempts) quotaResumeAttempts.delete(memberId);
+    };
+
+    const scheduleQuotaAutoResume = (member: MemberRow, rawError: unknown) => {
+      if (member.role === "coordinator") return;
+      if (quotaResumeTimers.has(member.id)) return;
+      const attempts = quotaResumeAttempts.get(member.id) ?? 0;
+      if (attempts >= MAX_QUOTA_AUTO_RESUMES) {
+        db.setMemberState(member.id, "waiting", {
+          activity: null,
+          error: "Quota/rate limit reached (auto-resume exhausted — switch model)",
+          pausedQuota: true,
+        });
+        emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+        return;
+      }
+      const backoffMs = Math.min(quotaResumeBaseMs * 2 ** attempts, 300_000);
+      const delayMs = options.quotaResumeDelayMs
+        ? backoffMs
+        : parseQuotaRetryDelayMs(rawError, backoffMs);
+      const timer = setTimeout(async () => {
+        quotaResumeTimers.delete(member.id);
+        if (dbClosed || abortController.signal.aborted) return;
+        const fresh = db.getMemberById(member.id);
+        if (!fresh || fresh.state === "killed" || fresh.state === "stopped" || fresh.paused_quota !== 1) return;
+        const swarm = db.getSwarm(fresh.swarm_id);
+        if (!swarm || swarm.status !== "running") return;
+
+        quotaResumeAttempts.set(member.id, attempts + 1);
+        const latestSeq = db.getLatestPost(swarm.id)?.swarm_seq ?? 0;
+        db.setMemberState(fresh.id, "working", {
+          activity: "Resuming after quota pause...",
+          error: null,
+          pausedQuota: false,
+        });
+        emitSwarmChanged({ swarmId: swarm.id, reason: "member_state", handle: fresh.name });
+        try {
+          await ctx.session.prompt({
+            sessionID: fresh.session_id,
+            text: [
+              `[SWARM QUOTA RESUME for @${fresh.name} — Swarm ${swarm.id}]`,
+              `Your quota/rate-limit pause has cleared (board head #${latestSeq}).`,
+              `Call read_board(since: ${fresh.last_read_seq}) to catch up on any missed posts, then continue your assigned work and report via post_message.`,
+            ].join("\n"),
+            delivery: "queue",
+          });
+        } catch (err) {
+          const stillQuota = isQuotaOrRateLimitError(err);
+          db.setMemberState(fresh.id, "waiting", {
+            activity: null,
+            error: stillQuota ? "Quota/rate limit reached" : (err instanceof Error ? err.message : String(err)),
+            pausedQuota: stillQuota,
+          });
+          emitSwarmChanged({ swarmId: swarm.id, reason: "member_state", handle: fresh.name });
+          if (stillQuota) {
+            const latestFresh = db.getMemberById(fresh.id);
+            if (latestFresh) scheduleQuotaAutoResume(latestFresh, err);
+          }
+        }
+      }, delayMs);
+      timer.unref?.();
+      quotaResumeTimers.set(member.id, timer);
+    };
 
     async function ensureCoordinator(sessionId: string, title = "Swarm"): Promise<{ swarmId: string; coordinator: MemberRow }> {
       exitedSessionSwarm.delete(sessionId);
@@ -511,6 +608,7 @@ export const swarmRuntimePlugin = Plugin.define({
               ...(resolved.variant ? { variant: resolved.variant } : {}),
             },
           });
+          cancelQuotaAutoResume(target.id, true);
           db.setMemberModel(target.id, resolved);
 
           const shouldRerun = Boolean(opts?.interruptAndRerunIfWorking && (wasWorking || wasPausedQuota) && target.role !== "coordinator");
@@ -1410,6 +1508,7 @@ export const swarmRuntimePlugin = Plugin.define({
               if (eventType === "session.status") {
                 const statusObj = data.status as { type?: string; message?: string } | undefined;
                 if (statusObj?.type === "idle") {
+                  cancelQuotaAutoResume(member.id, true);
                   db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
                   emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
                   const rewoke = await wake.maybeWakePendingMember(member.id);
@@ -1417,6 +1516,7 @@ export const swarmRuntimePlugin = Plugin.define({
                     await maybeWakeIdleCoordinator(member.swarm_id);
                   }
                 } else if (statusObj?.type === "busy") {
+                  cancelQuotaAutoResume(member.id, false);
                   db.setMemberState(member.id, "working", { pausedQuota: false });
                   emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
                 } else if (statusObj?.type === "retry") {
@@ -1427,12 +1527,15 @@ export const swarmRuntimePlugin = Plugin.define({
                       pausedQuota: true,
                     });
                     emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+                    scheduleQuotaAutoResume(member, statusObj.message ?? data);
                   }
                 }
               } else if (eventType === "session.execution.started") {
+                cancelQuotaAutoResume(member.id, false);
                 db.setMemberState(member.id, "working", { pausedQuota: false });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
               } else if (eventType === "session.idle" || eventType === "session.execution.succeeded") {
+                cancelQuotaAutoResume(member.id, true);
                 db.setMemberState(member.id, "waiting", { activity: null, pausedQuota: false });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
                 const rewoke = await wake.maybeWakePendingMember(member.id);
@@ -1440,6 +1543,7 @@ export const swarmRuntimePlugin = Plugin.define({
                   await maybeWakeIdleCoordinator(member.swarm_id);
                 }
               } else if (eventType === "session.execution.interrupted") {
+                cancelQuotaAutoResume(member.id, true);
                 db.setMemberState(member.id, "stopped", { activity: null });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
               } else if (eventType === "session.execution.failed") {
@@ -1450,12 +1554,16 @@ export const swarmRuntimePlugin = Plugin.define({
                   pausedQuota: isQuota,
                 });
                 emitSwarmChanged({ swarmId: member.swarm_id, reason: "member_state", handle: member.name });
+                if (isQuota) {
+                  scheduleQuotaAutoResume(member, data.error ?? data);
+                }
               } else if (eventType === "session.step.started") {
                 db.incrementMemberSteps(member.id, "Thinking...");
               } else if (eventType === "session.tool.called") {
                 const toolLabel = pendingCalls.get(String(data.id))?.tool ?? String(data.tool ?? "tool");
                 db.incrementMemberSteps(member.id, `Running ${toolLabel}`, "tool");
               } else if (eventType === "session.deleted") {
+                cancelQuotaAutoResume(member.id, true);
                 db.setMemberState(member.id, "killed");
                 resolveWaiterAborted(member.id);
                 db.releaseLocksForMember(member.id);
@@ -1505,6 +1613,11 @@ export const swarmRuntimePlugin = Plugin.define({
       activeToolCounts.clear();
       quiesceResolvers.clear();
       exitedSessionSwarm.clear();
+      for (const timer of quotaResumeTimers.values()) {
+        clearTimeout(timer);
+      }
+      quotaResumeTimers.clear();
+      quotaResumeAttempts.clear();
       // Deferred kill cleanups release locks and remove worktrees for sessions
       // that never quiesced before shutdown. They must run while the DB is
       // still open: dropping them would orphan locks and workspaces forever,

@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import swarmRuntimePlugin from "../index.js";
+import { parseQuotaRetryDelayMs } from "../src/plugin.js";
 import { buildSortedModelOptions, resolveRecommendedRoleModels } from "../src/gui/recommendedModels.js";
 import { buildVerificationIncompleteNudge, hasFreshVerifierPass } from "../src/monitor.js";
 import { parseMentionsFromText } from "../src/mentions.js";
@@ -1882,6 +1883,111 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
         ).content,
       );
       expect(okTopic.ok).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("W1: worker paused on quota/rate-limit auto-resumes after delay and catches up on board", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-w1-quota-resume-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, prompts, pushEvent } = createHarness(repoDir, dbPath);
+    ctx.options.quotaResumeDelayMs = 30;
+
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      const w1Sess = addW.spawned[0].session_id as string;
+      const promptsBefore = prompts.filter((p) => p.sessionID === w1Sess).length;
+
+      pushEvent({
+        type: "session.execution.failed",
+        data: { sessionID: w1Sess, error: "429 rate limit exceeded" },
+      });
+      await new Promise((r) => setTimeout(r, 15));
+
+      const pausedSnap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const pausedW1 = pausedSnap.members.find((m: any) => m.name === "w1");
+      expect(pausedW1.paused_quota).toBe(true);
+      expect(pausedW1.state).toBe("waiting");
+
+      // Wait for auto-resume timer (30ms) to fire
+      await new Promise((r) => setTimeout(r, 60));
+
+      const resumedSnap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const resumedW1 = resumedSnap.members.find((m: any) => m.name === "w1");
+      expect(resumedW1.paused_quota).toBe(false);
+      expect(resumedW1.state).toBe("working");
+
+      const w1Prompts = prompts.filter((p) => p.sessionID === w1Sess);
+      expect(w1Prompts.length).toBe(promptsBefore + 1);
+      expect(w1Prompts[w1Prompts.length - 1].text).toContain("[SWARM QUOTA RESUME");
+      expect(w1Prompts[w1Prompts.length - 1].text).toContain("read_board");
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("W2: bounded quota auto-resume exhausts after 3 failed attempts and parseQuotaRetryDelayMs parses retry hints", async () => {
+    expect(parseQuotaRetryDelayMs("rate limit, retry in 45s")).toBe(45_000);
+    expect(parseQuotaRetryDelayMs("quota reached, try again in 2 minutes")).toBe(120_000);
+
+    const root = mkdtempSync(join(tmpdir(), "swarm-w2-quota-exhaust-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+
+    const { ctx, tools, pushEvent } = createHarness(repoDir, dbPath);
+    ctx.options.quotaResumeDelayMs = 12;
+
+    let resumePromptAttempts = 0;
+    const origPrompt = ctx.session.prompt;
+    let w1Sess = "";
+    ctx.session.prompt = async (arg: any) => {
+      if (w1Sess && arg.sessionID === w1Sess && String(arg.text).includes("[SWARM QUOTA RESUME")) {
+        resumePromptAttempts++;
+        throw new Error("429 quota exceeded");
+      }
+      return await origPrompt(arg);
+    };
+
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      const swarmTool = tools.get("swarm");
+      const handlers = (ctx as any)._rpcHandlers;
+
+      const addW = JSON.parse(
+        (await swarmTool.execute({ action: "add", name: "w1", brief: "Work 1" }, { sessionID: "sess_coord" })).content,
+      );
+      w1Sess = addW.spawned[0].session_id as string;
+
+      pushEvent({
+        type: "session.execution.failed",
+        data: { sessionID: w1Sess, error: "429 quota exceeded" },
+      });
+
+      // Backoff: 12ms + 24ms + 48ms = 84ms -> wait 180ms for all 3 attempts to complete and exhaust
+      await new Promise((r) => setTimeout(r, 180));
+
+      expect(resumePromptAttempts).toBe(3);
+      const snap = await handlers.getSwarmSnapshot({ sessionId: "sess_coord" });
+      const w1 = snap.members.find((m: any) => m.name === "w1");
+      expect(w1.paused_quota).toBe(true);
+      expect(w1.state).toBe("waiting");
     } finally {
       await cleanup();
       try {
