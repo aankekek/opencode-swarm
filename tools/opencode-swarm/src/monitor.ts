@@ -139,6 +139,8 @@ export function startStallMonitor(
             lastCoverage.set(swarm.id, { seq: movementSeq, open: counts.open });
             if (activeWorkers >= maxWorkers) {
               nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned and the worker cap ${maxWorkers} is reached. Finish current tracks so units free, or group the remaining units into fewer workers.`;
+            } else if (counts.assigned > 0 || counts.done > 0) {
+              nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned, ${activeWorkers} worker(s) live (cap ${maxWorkers}). Spawn one worker per unit, group units via add{task_ids:[...]}, or shard with add{tasks}.`;
             } else {
               nudgeMessage = `@coordinator [coverage] ${counts.open} unit(s) unassigned, ${activeWorkers} worker(s) live (cap ${maxWorkers}). Spawn one worker per unit, group by area, or shard with add{tasks}. Use swarm{action:"plan"} to adjust the plan.`;
             }

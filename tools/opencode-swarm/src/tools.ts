@@ -299,6 +299,10 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               error: `task_ids can only be assigned to workers; ${role}s do not own units.`,
             });
           }
+          if (requestedTaskIds && requestedTaskIds.length === 0) {
+            return toolJson({ ok: false, error: "task_ids must contain at least one unit id." });
+          }
+          const uniqueTaskIds = requestedTaskIds ? Array.from(new Set(requestedTaskIds)) : undefined;
           const cap = positiveInt(deps.options.maxWorkers) ?? 6;
           const shardCap = positiveInt(deps.options.maxShardsPerAdd) ?? 8;
 
@@ -310,10 +314,10 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
           }
 
           const requested = count ?? 1;
-          if (requestedTaskIds && requestedTaskIds.length !== requested) {
+          if (uniqueTaskIds && requested > 1 && uniqueTaskIds.length !== requested) {
             return toolJson({
               ok: false,
-              error: `task_ids has ${requestedTaskIds.length} id(s) but ${requested} member(s) will be spawned; provide exactly one id per member.`,
+              error: `task_ids has ${uniqueTaskIds.length} unique id(s) but ${requested} member(s) will be spawned; provide exactly one id per member (or spawn 1 worker to group multiple ids).`,
             });
           }
           const activeWorkersBefore = db
@@ -330,17 +334,17 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
 
           // Resolve which plan units this add owns before spawning anything.
           const planTasks = db.listTasks(swarmId);
-          let unitByIndex: Array<SwarmTaskRow | undefined> = [];
-          if (requestedTaskIds) {
+          let unitByIndex: SwarmTaskRow[][] = [];
+          if (uniqueTaskIds) {
             const byId = new Map(planTasks.map((t) => [t.id, t]));
-            const missing = requestedTaskIds.filter((id) => !byId.has(id));
+            const missing = uniqueTaskIds.filter((id) => !byId.has(id));
             if (missing.length > 0) {
               return toolJson({
                 ok: false,
                 error: `task_ids not found in this swarm's plan: ${missing.join(", ")}.`,
               });
             }
-            const unavailable = requestedTaskIds.filter((id) => byId.get(id)!.status !== "open");
+            const unavailable = uniqueTaskIds.filter((id) => byId.get(id)!.status !== "open");
             if (unavailable.length > 0) {
               return toolJson({
                 ok: false,
@@ -349,7 +353,11 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
                   .join(", ")}.`,
               });
             }
-            unitByIndex = requestedTaskIds.map((id) => byId.get(id));
+            if (requested === 1) {
+              unitByIndex = [uniqueTaskIds.map((id) => byId.get(id)!)];
+            } else {
+              unitByIndex = uniqueTaskIds.map((id) => [byId.get(id)!]);
+            }
           } else if (planTasks.length > 0 && role === "worker") {
             const openTasks = planTasks.filter((t) => t.status === "open");
             if (openTasks.length < requested) {
@@ -358,14 +366,18 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
                 error: `Plan has ${openTasks.length} open unit(s); spawning ${requested} worker(s) would leave some without a unit. Reduce the batch, add units, or spawn without a plan.`,
               });
             }
-            unitByIndex = openTasks.slice(0, requested);
+            unitByIndex = openTasks.slice(0, requested).map((t) => [t]);
           }
           const briefFor = (index: number): string => {
             if (tasks && typeof tasks[index] === "string") {
               return `${brief}\n\nAssigned slice: ${tasks[index]}`;
             }
-            const unit = unitByIndex[index];
-            return unit ? `${brief}\n\nAssigned unit: ${unit.label}` : brief;
+            const units = unitByIndex[index] ?? [];
+            if (units.length === 1) return `${brief}\n\nAssigned unit: ${units[0].label}`;
+            if (units.length > 1) {
+              return `${brief}\n\nAssigned units:\n${units.map((u) => `- ${u.label}`).join("\n")}`;
+            }
+            return brief;
           };
 
           const spawned: Array<{ name: string; session_id: string; model: string; workspace: string }> = [];
@@ -447,9 +459,14 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               });
             }
             for (let i = 0; i < spawnedMembers.length; i++) {
-              const unit = unitByIndex[i];
-              if (!unit) continue;
-              db.assignTasks(swarmId, spawnedMembers[i].id, spawnedMembers[i].name, [unit.id]);
+              const units = unitByIndex[i];
+              if (!units || units.length === 0) continue;
+              db.assignTasks(
+                swarmId,
+                spawnedMembers[i].id,
+                spawnedMembers[i].name,
+                units.map((u) => u.id),
+              );
             }
             const liveWorkersAfter = db.listMembers(swarmId, false).filter((m) => m.role === "worker");
             const counts = db.getTaskCounts(swarmId);

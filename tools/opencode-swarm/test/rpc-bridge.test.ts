@@ -868,4 +868,49 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       expect(tasks.find((t) => t.id === (plan.task_ids as number[])[2])?.assignee).toBeNull();
     });
   });
+
+  test("single worker can group multiple task_ids and mark all done together", async () => {
+    await withBridgeHarness(async ({ registeredTools }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const postTool = registeredTools.get("post_message")!;
+      const readTool = registeredTools.get("read_board")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Grouped units" }, toolCtx);
+
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["alpha", "beta", "gamma"] }, toolCtx),
+      );
+      const ids = plan.task_ids as number[];
+
+      const emptyIds = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "empty", brief: "work", task_ids: [] }, toolCtx),
+      );
+      expect(emptyIds.ok).toBe(false);
+      expect(String(emptyIds.error)).toContain("at least one unit id");
+
+      const grouped = parseToolResult(
+        await swarmTool.execute(
+          { action: "add", name: "batch", brief: "Handle batch", task_ids: [ids[0], ids[1]] },
+          toolCtx,
+        ),
+      );
+      expect(grouped.ok).toBe(true);
+      expect(grouped.assigned_units).toBe(2);
+      expect(grouped.open_units).toBe(1);
+
+      const batchSess = (grouped.spawned as Array<{ session_id: string }>)[0].session_id;
+      const board = parseToolResult(await readTool.execute({ since: 0 }, { sessionID: batchSess }));
+      const briefPost = (board.posts as Array<{ text: string }>).find((p) => p.text.includes("@batch"))?.text ?? "";
+      expect(briefPost).toContain("Assigned units:");
+      expect(briefPost).toContain("- alpha");
+      expect(briefPost).toContain("- beta");
+
+      await postTool.execute({ text: "[done] finished alpha and beta" }, { sessionID: batchSess });
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      const tasks = status.tasks as Array<{ id: number; status: string }>;
+      expect(tasks.find((t) => t.id === ids[0])?.status).toBe("done");
+      expect(tasks.find((t) => t.id === ids[1])?.status).toBe("done");
+      expect(tasks.find((t) => t.id === ids[2])?.status).toBe("open");
+    });
+  });
 });

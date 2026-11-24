@@ -283,6 +283,20 @@ describe("stall monitor coverage nudge", () => {
     }
   });
 
+  test("does not suggest swarm{action:\"plan\"} when a plan is already in progress", async () => {
+    const fixture = makeCoverageFixture({ open: 4 });
+    fixture.counts = { total: 5, open: 4, assigned: 1, done: 0 };
+    const stop = startCoverageMonitor(fixture, 6);
+    try {
+      expect(await waitUntil(() => coverageBodies(fixture).length === 1, 1000)).toBe(true);
+      const body = coverageBodies(fixture)[0];
+      expect(body).toContain("add{task_ids:[...]}");
+      expect(body).not.toContain('swarm{action:"plan"}');
+    } finally {
+      stop();
+    }
+  });
+
   test("does not nudge while a member is working", async () => {
     const working = makeMember({
       id: "m_worker",
