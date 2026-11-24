@@ -2087,4 +2087,37 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       } catch {}
     }
   });
+
+  test("Y1: prompts enforce board hygiene, #seq citations, no greetings/acks, and same-turn post+wait", () => {
+    expect(COORDINATOR_PROTOCOL).toContain("Cite earlier posts by `#seq`");
+    expect(COORDINATOR_PROTOCOL).toContain("never copy-paste or summarize one worker's report");
+
+    const workerPrompt = buildMemberOpeningPrompt({
+      swarmId: "sw_1",
+      name: "w1",
+      role: "worker",
+      brief: "Do work",
+      workspaceMode: "inherit",
+      workspaceDir: "/repo",
+      ownedGlobs: [],
+      channels: ["main"],
+    });
+    expect(workerPrompt).toContain("cite earlier posts by `#seq`");
+    expect(workerPrompt).toContain("Never post greetings or acknowledgments");
+    expect(workerPrompt).toContain("call `post_message` and `swarm_wait` in the same turn");
+
+    const verifierPrompt = buildMemberOpeningPrompt({
+      swarmId: "sw_1",
+      name: "verifier",
+      role: "verifier",
+      brief: "Verify work",
+      workspaceMode: "inherit",
+      workspaceDir: "/repo",
+      ownedGlobs: [],
+      channels: ["main"],
+    });
+    expect(verifierPrompt).toContain("cite earlier posts by `#seq`");
+    expect(verifierPrompt).toContain("Do not post greetings or acknowledgments");
+    expect(verifierPrompt).toContain("call `post_message` and `swarm_wait` in the same turn");
+  });
 });

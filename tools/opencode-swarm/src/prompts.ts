@@ -8,7 +8,7 @@ export const COORDINATOR_PROTOCOL = [
   "2. **Name the swarm** with `swarm{action:\"title\", title:\"...\"}`.",
   "3. **Manual Model & Variant Rule:** Leave `model` and `variant` unset to inherit your own model/variant, UNLESS the user explicitly asks for a specific model or variant. Use `swarm{action:\"models\"}` to inspect available models and variants.",
   "4. **Workspace Isolation:** Use `workspace:\"share\"` (Git worktree) for authors editing in parallel, or `owned_globs` when sharing `inherit`. Leave readers/verifiers on `inherit`.",
-  "5. **Addressing:** Use `@name` for one worker, `@all` only for broadcast rules, `@#channel` for channel-wide asks. Cite earlier posts by `#seq`.",
+  "5. **Addressing & Board Hygiene:** Use `@name` for one worker, `@all` only for broadcast rules, `@#channel` for channel-wide asks. Cite earlier posts by `#seq` — never copy-paste or summarize one worker's report into a message for another worker or verifier (e.g. `@verifier check #4 and #6`).",
   "## Sizing the swarm (before spawning)",
   "1. List the independent units first: items, files or areas that can change without touching each other. A request that lists N items is N units unless they share files.",
   "2. Post the list once as `#plan`, or record it with `swarm{action:\"plan\", tasks:[...]}`, then spawn against it.",
@@ -50,6 +50,7 @@ export function buildMemberOpeningPrompt(args: {
       `- You are read-only. Never edit workspace files.`,
       `- Inspect diffs, run concrete checks, and use \`post_message\` to send failures to the owning \`@worker\` or PASS to \`@coordinator\`.`,
       `- For incremental verification (some workers \`[done]\` while others are still running), verify the completed tracks now — do not wait for remaining workers; post \`FAIL\` naming \`@worker\` with \`file:line\` if issues are found, or an incremental \`OK\`/\`VERIFIED\` summary to \`@coordinator\`, and reserve final \`PASS\` until all worker tracks are complete.`,
+      `- Keep posts short and cite earlier posts by \`#seq\` instead of re-quoting them. Do not post greetings or acknowledgments; when finished with your check, call \`post_message\` and \`swarm_wait\` in the same turn.`,
       `- Do NOT call \`swarm_wait\` mid-verification before finishing checks on ready tracks and posting your report. Only call \`swarm_wait\` when you have no pending verification work (and never pass seconds/timeouts to \`since\`).`,
     );
   } else if (args.role === "monitor") {
@@ -65,6 +66,7 @@ export function buildMemberOpeningPrompt(args: {
     lines.push(
       `- Work only inside your assigned workspace / owned globs.`,
       `- Report progress and handoffs via \`post_message\` with \`@mentions\` (start final completion post with \`[done]\`).`,
+      `- Keep posts short (write large logs/diffs to a file and post a summary + path) and cite earlier posts by \`#seq\` instead of re-quoting them. Never post greetings or acknowledgments (no 'hello', 'ready', or 'acknowledging'); when posting your final \`[done]\` result, call \`post_message\` and \`swarm_wait\` in the same turn.`,
       `- You may spawn helpers via \`swarm{action:"add"}\` and manage only helpers you added.`,
       `- Do NOT call \`swarm_wait\` mid-task before finishing your assigned work and posting \`[done]\` (or \`[blocked]\` naming who you need). Only call \`swarm_wait\` after posting when waiting on another member (and never pass seconds/timeouts to \`since\`).`,
       `- Once \`@verifier\` posts \`PASS\`, do not post acknowledgment replies (stay idle unless \`@coordinator\` or \`@verifier\` requests follow-up edits).`,
