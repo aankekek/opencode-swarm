@@ -1183,7 +1183,7 @@ export class SwarmBoardDB {
       .prepare(
         `UPDATE swarm_tasks
             SET status = 'open', assignee_member_id = NULL, assignee_name = NULL, updated_at = ?
-          WHERE assignee_member_id = ?`,
+          WHERE assignee_member_id = ? AND status = 'assigned'`,
       )
       .run(Date.now(), memberId);
     return Number(res.changes);

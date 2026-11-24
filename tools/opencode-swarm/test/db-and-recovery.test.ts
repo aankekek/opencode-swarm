@@ -1050,6 +1050,13 @@ describe("Swarm unit plan", () => {
 
       expect(db.releaseTasksForMember(workerA.id)).toBe(0);
 
+      // Releasing a worker with 'done' units must not un-complete them.
+      expect(db.completeTasksForMember(workerB.id)).toBe(1);
+      expect(db.releaseTasksForMember(workerB.id)).toBe(0);
+      const afterDone = db.listTasks(swarm.id).find((t) => t.id === t3.id);
+      expect(afterDone?.status).toBe("done");
+      expect(afterDone?.assignee_member_id).toBe(workerB.id);
+
       db.close();
     } finally {
       try {

@@ -546,6 +546,11 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
               });
             }
             db.setMemberState(t.id, "killed");
+            try {
+              db.releaseTasksForMember(t.id);
+            } catch (err) {
+              console.warn("[opencode-swarm] Failed to release plan units for killed member:", err);
+            }
             deps.resolveWaiterAborted(t.id);
             try {
               await ctx.session.interrupt({ sessionID: t.session_id });

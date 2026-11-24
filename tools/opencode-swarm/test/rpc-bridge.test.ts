@@ -826,4 +826,46 @@ describe("SWARM_RPC_DEF and RPC bridge", () => {
       { maxWorkers: 2, autoSpawnVerifier: false },
     );
   });
+
+  test("killing a worker reopens assigned plan units while preserving done units", async () => {
+    await withBridgeHarness(async ({ registeredTools, registeredHandlers }) => {
+      const swarmTool = registeredTools.get("swarm")!;
+      const postTool = registeredTools.get("post_message")!;
+      const toolCtx = { sessionID: "coord-sess-1" };
+      await swarmTool.execute({ action: "title", title: "Kill releases units" }, toolCtx);
+
+      const plan = parseToolResult(
+        await swarmTool.execute({ action: "plan", tasks: ["unit-a", "unit-b", "unit-c"] }, toolCtx),
+      );
+      const addRes = parseToolResult(
+        await swarmTool.execute({ action: "add", name: "w", brief: "work", n: 3 }, toolCtx),
+      );
+      const spawned = addRes.spawned as Array<{ name: string; session_id: string }>;
+
+      // w-1 finishes unit-a, then is killed via swarm{action:"kill"} -> unit-a stays done
+      await postTool.execute({ text: "[done] finished unit-a" }, { sessionID: spawned[0].session_id });
+      const kill1 = parseToolResult(await swarmTool.execute({ action: "kill", name: "w-1" }, toolCtx));
+      expect(kill1.ok).toBe(true);
+
+      // w-2 is killed mid-work via swarm{action:"kill"} -> unit-b reopens
+      const kill2 = parseToolResult(await swarmTool.execute({ action: "kill", name: "w-2" }, toolCtx));
+      expect(kill2.ok).toBe(true);
+
+      // w-3 is killed mid-work via RPC killMember -> unit-c reopens
+      const statusBeforeRpc = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      const rpcKill = (await registeredHandlers.killMember({
+        swarmId: (statusBeforeRpc.swarm as { id: string }).id,
+        handle: "w-3",
+      })) as { ok: boolean };
+      expect(rpcKill.ok).toBe(true);
+
+      const status = parseToolResult(await swarmTool.execute({ action: "status" }, toolCtx));
+      const tasks = status.tasks as Array<{ id: number; status: string; assignee: string | null }>;
+      expect(tasks.find((t) => t.id === (plan.task_ids as number[])[0])?.status).toBe("done");
+      expect(tasks.find((t) => t.id === (plan.task_ids as number[])[1])?.status).toBe("open");
+      expect(tasks.find((t) => t.id === (plan.task_ids as number[])[1])?.assignee).toBeNull();
+      expect(tasks.find((t) => t.id === (plan.task_ids as number[])[2])?.status).toBe("open");
+      expect(tasks.find((t) => t.id === (plan.task_ids as number[])[2])?.assignee).toBeNull();
+    });
+  });
 });

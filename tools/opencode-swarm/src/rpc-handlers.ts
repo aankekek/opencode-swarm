@@ -296,6 +296,11 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
         }
       }
       db.setMemberState(target.id, "killed");
+      try {
+        db.releaseTasksForMember(target.id);
+      } catch (err) {
+        console.warn("[opencode-swarm] Failed to release plan units for killed member:", err);
+      }
       deps.resolveWaiterAborted(target.id);
       try {
         await ctx.session.interrupt({ sessionID: target.session_id });
