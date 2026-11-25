@@ -28,21 +28,33 @@ export function hasFreshVerifierPass(db: SwarmBoardDB, swarmId: string, members?
   const byName = new Map<string, MemberRow>();
   for (const m of memberList) byName.set(m.name, m);
 
-  const { posts } = db.getLatestPostsWindow(swarmId, 200);
-  for (let i = posts.length - 1; i >= 0; i--) {
-    const post = posts[i];
-    const member = byName.get(post.author_name);
-    if (isVerifierAuthor(post.author_name, member)) {
-      if (/\bFAIL\b/i.test(post.body)) return false;
-      if (/\bPASS\b/i.test(post.body)) return true;
-      continue;
+  // Walk the board newest-first in pages until one post decides the question.
+  // A single bounded window used to make an older PASS invisible behind a
+  // talkative coordinator tail, so the monitor nudged for verification that
+  // had already happened.
+  const PAGE = 200;
+  let posts = db.getLatestPostsWindow(swarmId, PAGE).posts;
+
+  while (true) {
+    for (let i = posts.length - 1; i >= 0; i--) {
+      const post = posts[i];
+      const member = byName.get(post.author_name);
+      if (isVerifierAuthor(post.author_name, member)) {
+        if (/\bFAIL\b/i.test(post.body)) return false;
+        if (/\bPASS\b/i.test(post.body)) return true;
+        continue;
+      }
+      if (post.author_name === "monitor" || post.author_name === "narrator") continue;
+      if (member?.role === "coordinator" || post.author_name === "coordinator") continue;
+      if (isPassAcknowledgementPost(post.body)) continue;
+      return false;
     }
-    if (post.author_name === "monitor" || post.author_name === "narrator") continue;
-    if (member?.role === "coordinator" || post.author_name === "coordinator") continue;
-    if (isPassAcknowledgementPost(post.body)) continue;
-    return false;
+
+    if (posts.length < PAGE) return false;
+    const older = db.getPostsBefore(swarmId, posts[0].swarm_seq, PAGE);
+    if (older.posts.length === 0) return false;
+    posts = older.posts;
   }
-  return false;
 }
 
 export function buildVerificationIncompleteNudge(swarmId: string, verifier?: MemberRow): string {

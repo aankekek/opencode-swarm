@@ -893,6 +893,21 @@ export class SwarmBoardDB {
     return { posts: sliced, hasMore };
   }
 
+  /**
+   * The page of posts immediately older than `beforeSeq`, returned oldest-first.
+   * Backwards paging for callers that must examine the whole board (for example
+   * verifier-pass freshness) without loading every post at once.
+   */
+  getPostsBefore(swarmId: string, beforeSeq: number, limit = 200): { posts: BoardPostRow[]; hasMore: boolean } {
+    const rows = this.db
+      .prepare(`SELECT * FROM board_posts WHERE swarm_id = ? AND swarm_seq < ? ORDER BY swarm_seq DESC LIMIT ?`)
+      .all(swarmId, beforeSeq, limit + 1) as unknown as BoardPostRow[];
+    const hasMore = rows.length > limit;
+    const sliced = hasMore ? rows.slice(0, limit) : rows;
+    sliced.reverse();
+    return { posts: sliced, hasMore };
+  }
+
   getLatestPost(swarmId: string): BoardPostRow | undefined {
     return this.db
       .prepare(`SELECT * FROM board_posts WHERE swarm_id = ? ORDER BY swarm_seq DESC LIMIT 1`)

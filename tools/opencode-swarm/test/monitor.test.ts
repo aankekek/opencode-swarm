@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SwarmBoardDB } from "../src/db.js";
-import { startStallMonitor } from "../src/monitor.js";
+import { openSqliteDatabase, SwarmBoardDB as BoardDB } from "../src/db.js";
+import { hasFreshVerifierPass, startStallMonitor } from "../src/monitor.js";
 import type { BoardPostRow, MemberRow, SwarmRow } from "../src/types.js";
 
 function makeSwarm(overrides: Partial<SwarmRow> = {}): SwarmRow {
@@ -335,6 +339,116 @@ describe("stall monitor coverage nudge", () => {
       expect(coverageBodies(fixture).length).toBe(0);
     } finally {
       stop();
+    }
+  });
+});
+
+describe("hasFreshVerifierPass", () => {
+  async function makeBoard() {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-pass-fresh-"));
+    const sqlite = await openSqliteDatabase(join(dir, "board.db"));
+    const db = new BoardDB(sqlite, dir);
+    const { swarm } = db.createSwarmWithCoordinator({
+      title: "Fresh Pass",
+      objective: "Verifier pass freshness",
+      coordinatorSessionId: "sess_fresh_coord",
+      workspaceDir: dir,
+    });
+    db.insertMember({
+      swarmId: swarm.id,
+      name: "verifier",
+      sessionId: "sess_fresh_verifier",
+      role: "verifier",
+      addedBy: "coordinator",
+      workspaceMode: "inherit",
+      workspaceDir: dir,
+      brief: "verify",
+      channels: ["main"],
+    });
+    db.insertMember({
+      swarmId: swarm.id,
+      name: "w1",
+      sessionId: "sess_fresh_w1",
+      role: "worker",
+      addedBy: "coordinator",
+      workspaceMode: "inherit",
+      workspaceDir: dir,
+      brief: "work",
+      channels: ["main"],
+    });
+
+    const post = (authorName: string, body: string) =>
+      db.addPost({
+        swarmId: swarm.id,
+        authorName,
+        channel: "main",
+        mentions: [],
+        channelMentions: [],
+        isAll: false,
+        body,
+      });
+    const chatter = (n: number) => {
+      for (let i = 0; i < n; i++) post("coordinator", `status update ${i}: still coordinating`);
+    };
+    const close = () => {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    };
+
+    return { dir, db, swarm, post, chatter, close };
+  }
+
+  test("finds a PASS older than the newest 200 posts", async () => {
+    const board = await makeBoard();
+    try {
+      board.post("verifier", "PASS — verified the parser and the CLI");
+      board.chatter(250);
+
+      // The pass is 251 posts back; a fixed 200-post window cannot see it.
+      expect(hasFreshVerifierPass(board.db, board.swarm.id)).toBe(true);
+    } finally {
+      board.close();
+    }
+  });
+
+  test("a worker post after the PASS still invalidates it", async () => {
+    const board = await makeBoard();
+    try {
+      board.post("verifier", "PASS");
+      board.chatter(250);
+      board.post("w1", "[done] changed the parser again");
+
+      expect(hasFreshVerifierPass(board.db, board.swarm.id)).toBe(false);
+    } finally {
+      board.close();
+    }
+  });
+
+  test("a FAIL anywhere above the PASS invalidates it", async () => {
+    const board = await makeBoard();
+    try {
+      board.post("verifier", "PASS");
+      board.chatter(250);
+      board.post("verifier", "FAIL: the CLI still drops the flag");
+
+      expect(hasFreshVerifierPass(board.db, board.swarm.id)).toBe(false);
+    } finally {
+      board.close();
+    }
+  });
+
+  test("stops walking at the first decisive post instead of scanning the whole board", async () => {
+    const board = await makeBoard();
+    try {
+      board.post("verifier", "PASS");
+      board.chatter(5);
+      board.post("w1", "[done] fresh work");
+
+      // The newest decisive post is a worker post, so the PASS behind it must
+      // not count.
+      expect(hasFreshVerifierPass(board.db, board.swarm.id)).toBe(false);
+    } finally {
+      board.close();
     }
   });
 });
