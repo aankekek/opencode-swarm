@@ -857,7 +857,8 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       const boardPath = join(db.getSwarmDir(swarm.id), "board.jsonl");
       const lines = readFileSync(boardPath, "utf8").split("\n").filter((l) => l.length > 0);
       expect(lines.length).toBe(3);
-      // Simulate a crash between COMMIT and the append of the last post.
+      // Simulate a mirror that fell behind the DB (torn write, or a crash in an
+      // older run before the append moved inside addPost's transaction).
       writeFileSync(boardPath, lines.slice(0, -1).join("\n") + "\n", "utf8");
 
       db.rebuildMirrors();
@@ -873,6 +874,67 @@ describe("SwarmBoardDB & Crash Recovery", () => {
       const parsed = rebuilt.map((l) => JSON.parse(l) as { seq: number; text: string });
       expect(parsed.map((p) => p.seq)).toEqual([1, 2, 3]);
       expect(parsed.map((p) => p.text)).toEqual(["post 1", "post 2", "post 3"]);
+
+      db.close();
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("a failed board.jsonl append still commits the post and repairs the mirror", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "swarm-mirror-append-"));
+    const dbPath = join(dir, "board.db");
+    try {
+      const sqlite = await openSqliteDatabase(dbPath);
+      const db = new SwarmBoardDB(sqlite, dir);
+      const { swarm } = db.createSwarmWithCoordinator({
+        title: "Append Failure Swarm",
+        objective: "Mirror append failure",
+        coordinatorSessionId: "coord_append_fail",
+        workspaceDir: dir,
+      });
+
+      const boardPath = join(db.getSwarmDir(swarm.id), "board.jsonl");
+      const realAppend = (db as unknown as { appendBoardJsonl: (post: unknown) => void }).appendBoardJsonl.bind(db);
+      let appendCalls = 0;
+      (db as unknown as { appendBoardJsonl: (post: unknown) => void }).appendBoardJsonl = () => {
+        appendCalls += 1;
+        throw new Error("EPERM: mirror is locked");
+      };
+
+      let post;
+      try {
+        post = db.addPost({
+          swarmId: swarm.id,
+          authorName: "coordinator",
+          channel: "main",
+          mentions: [],
+          channelMentions: [],
+          isAll: false,
+          body: "survived the mirror failure",
+        });
+      } finally {
+        (db as unknown as { appendBoardJsonl: (post: unknown) => void }).appendBoardJsonl = realAppend;
+      }
+
+      // One append attempt, which threw: the failure is recorded, not retried.
+      expect(appendCalls).toBe(1);
+      expect(post.swarm_seq).toBe(1);
+
+      // The post is committed to SQLite...
+      const rows = db.getPostsPage(swarm.id, 0, 10).posts;
+      expect(rows.length).toBe(1);
+      expect(rows[0].body).toBe("survived the mirror failure");
+
+      // ...and the mirror was rewritten from those rows instead of staying a
+      // line short.
+      const lines = readFileSync(boardPath, "utf8").split("\n").filter((l) => l.length > 0);
+      expect(lines.length).toBe(1);
+      const mirror = JSON.parse(lines[0]) as { seq: number; text: string };
+      expect(mirror.seq).toBe(1);
+      expect(mirror.text).toBe("survived the mirror failure");
 
       db.close();
     } finally {

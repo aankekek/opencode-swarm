@@ -786,40 +786,64 @@ export class SwarmBoardDB {
     isAll: boolean;
     body: string;
   }): BoardPostRow {
-    const post = this.withImmediateTransaction(() => {
-      const row = this.db
-        .prepare(`SELECT COALESCE(MAX(swarm_seq), 0) AS max_seq FROM board_posts WHERE swarm_id = ?`)
-        .get(args.swarmId) as { max_seq: number };
-      const swarmSeq = row.max_seq + 1;
-      const now = Date.now();
-      const info = this.db
-        .prepare(
-          `INSERT INTO board_posts (swarm_id, swarm_seq, channel, author_name, mentions_json, channel_mentions_json, is_all, body, created_at)
+    let mirrorFailed = false;
+    try {
+      const post = this.withImmediateTransaction(() => {
+        const row = this.db
+          .prepare(`SELECT COALESCE(MAX(swarm_seq), 0) AS max_seq FROM board_posts WHERE swarm_id = ?`)
+          .get(args.swarmId) as { max_seq: number };
+        const swarmSeq = row.max_seq + 1;
+        const now = Date.now();
+        const info = this.db
+          .prepare(
+            `INSERT INTO board_posts (swarm_id, swarm_seq, channel, author_name, mentions_json, channel_mentions_json, is_all, body, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          args.swarmId,
-          swarmSeq,
-          args.channel,
-          args.authorName,
-          JSON.stringify(args.mentions),
-          JSON.stringify(args.channelMentions),
-          args.isAll ? 1 : 0,
-          args.body,
-          now,
-        );
+          )
+          .run(
+            args.swarmId,
+            swarmSeq,
+            args.channel,
+            args.authorName,
+            JSON.stringify(args.mentions),
+            JSON.stringify(args.channelMentions),
+            args.isAll ? 1 : 0,
+            args.body,
+            now,
+          );
 
-      this.db
-        .prepare(`UPDATE members SET last_post_seq = ?, last_post_time = ? WHERE swarm_id = ? AND name = ?`)
-        .run(swarmSeq, now, args.swarmId, args.authorName);
+        this.db
+          .prepare(`UPDATE members SET last_post_seq = ?, last_post_time = ? WHERE swarm_id = ? AND name = ?`)
+          .run(swarmSeq, now, args.swarmId, args.authorName);
 
-      return this.db
-        .prepare(`SELECT * FROM board_posts WHERE seq = ?`)
-        .get(Number(info.lastInsertRowid)) as BoardPostRow;
-    });
+        const inserted = this.db
+          .prepare(`SELECT * FROM board_posts WHERE seq = ?`)
+          .get(Number(info.lastInsertRowid)) as BoardPostRow;
 
-    this.appendBoardJsonl(post);
-    return post;
+        // Append the file mirror inside the same transaction that inserted the
+        // row. The old order — COMMIT, then append — left board.jsonl a line
+        // short whenever the append failed, and nothing re-read that file until
+        // the next startup rebuild, so the divergence was silent.
+        //
+        // A mirror failure still must not cost the caller its post: SQLite
+        // holds the truth, so record the miss and rewrite the file from the
+        // committed rows below.
+        try {
+          this.appendBoardJsonl(inserted);
+        } catch (err) {
+          mirrorFailed = true;
+          console.warn("[opencode-swarm] Failed to append board.jsonl; repairing the mirror:", err);
+        }
+        return inserted;
+      });
+
+      if (mirrorFailed) this.repairBoardJsonl(post.swarm_id);
+      return post;
+    } catch (err) {
+      // The append may have landed before a failed COMMIT. Converge the mirror
+      // so board.jsonl never keeps a post the transaction rolled back.
+      this.repairBoardJsonl(args.swarmId);
+      throw err;
+    }
   }
 
   getPostsPage(
@@ -1032,15 +1056,7 @@ export class SwarmBoardDB {
         console.warn(`[opencode-swarm] Failed to rebuild members.json for ${swarm.id}:`, err);
       }
 
-      try {
-        const rows = this.db
-          .prepare(`SELECT * FROM board_posts WHERE swarm_id = ? ORDER BY seq ASC`)
-          .all(swarm.id) as unknown as BoardPostRow[];
-        const body = rows.map((row) => formatBoardJsonlLine(row) + "\n").join("");
-        writeFileAtomic(join(this.getSwarmDir(swarm.id), "board.jsonl"), body);
-      } catch (err) {
-        console.warn(`[opencode-swarm] Failed to rebuild board.jsonl for ${swarm.id}:`, err);
-      }
+      this.repairBoardJsonl(swarm.id);
     }
   }
 
@@ -1192,11 +1208,36 @@ export class SwarmBoardDB {
     return Number(res.changes);
   }
 
+  /**
+   * Append one post to the board.jsonl mirror.
+   *
+   * Throws on failure (unlike the rest of the mirror paths) so the caller knows
+   * the file is behind the DB and can converge it. Called from inside
+   * `addPost`'s transaction.
+   */
   private appendBoardJsonl(post: BoardPostRow) {
+    appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), formatBoardJsonlLine(post) + "\n", "utf8");
+  }
+
+  /**
+   * Rewrite one swarm's board.jsonl from authoritative SQLite rows.
+   *
+   * Repair path for a mirror that fell behind (a torn append, a crash during
+   * the previous run, or a failed append in `addPost`). Never throws: a repair
+   * that cannot run just leaves the divergence for the next startup rebuild.
+   */
+  private repairBoardJsonl(swarmId: string): void {
     try {
-      appendFileSync(join(this.getSwarmDir(post.swarm_id), "board.jsonl"), formatBoardJsonlLine(post) + "\n", "utf8");
+      const rows = this.db
+        .prepare(`SELECT * FROM board_posts WHERE swarm_id = ? ORDER BY seq ASC`)
+        .all(swarmId) as unknown as BoardPostRow[];
+      const body = rows.map((row) => formatBoardJsonlLine(row) + "\n").join("");
+      writeFileAtomic(join(this.getSwarmDir(swarmId), "board.jsonl"), body);
     } catch (err) {
-      console.warn("[opencode-swarm] Failed to append board.jsonl:", err);
+      console.warn(
+        `[opencode-swarm] Failed to repair board.jsonl for ${swarmId}; it will converge on the next startup rebuild:`,
+        err,
+      );
     }
   }
 }
