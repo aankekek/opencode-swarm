@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Socket } from "node:net";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_URL_HOSTS, readSwarmFileSnapshot } from "./board-snapshot.js";
 import type { SwarmBoardDB } from "./db.js";
 import { formatModelSpec, parseModelSpec, type AvailableModelEntry } from "./models.js";
 import type { MemberRole } from "./types.js";
@@ -72,17 +73,6 @@ function readJsonFileSafe(filePath: string): unknown {
     return JSON.parse(raw);
   } catch {
     return null;
-  }
-}
-
-function readTextTailSafe(filePath: string, maxBytes = MAX_BODY_BYTES): string {
-  try {
-    if (!existsSync(filePath)) return "";
-    const raw = readFileSync(filePath, "utf8");
-    if (raw.length <= maxBytes) return raw;
-    return raw.slice(raw.length - maxBytes);
-  } catch {
-    return "";
   }
 }
 
@@ -296,9 +286,8 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
 
         const catalog = await deps.getAvailableModels();
         const swarmDir = deps.db.getSwarmDir(swarm.id);
-        const viewJson = readJsonFileSafe(join(swarmDir, "view.json"));
+        const files = readSwarmFileSnapshot(swarmDir);
         const planJson = readJsonFileSafe(join(swarmDir, "plan.json"));
-        const rawBoardText = readTextTailSafe(join(swarmDir, "board.jsonl"));
 
         const payload = {
           conversationId: conversationIdParam ?? "",
@@ -359,10 +348,12 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
             };
           }),
           edges: Array.from(edgeMap.values()),
-          view: viewJson,
+          view: files.view,
           plan: planJson,
           dir: swarmDir,
-          raw: rawBoardText,
+          raw: files.raw,
+          urlHosts: [...DEFAULT_URL_HOSTS],
+          frames: [],
           availableModels: catalog.models,
           roleModels: deps.getRoleModelDefaults(),
         };

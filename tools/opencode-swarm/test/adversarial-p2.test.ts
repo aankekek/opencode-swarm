@@ -193,9 +193,14 @@ describe("Adversarial Audit P2 Hardening Regressions", () => {
       headers: { Authorization: `Bearer ${handle.token}` },
     });
     expect(res.status).toBe(200);
-    const data = (await res.json()) as { dir?: string; raw?: string };
+    const data = (await res.json()) as {
+      dir?: string;
+      raw?: { board?: string; members?: string; view?: string };
+    };
     expect(typeof data.dir).toBe("string");
-    expect(data.raw).toContain("hello raw tab");
+    expect(typeof data.raw).toBe("object");
+    expect(data.raw?.board).toContain("hello raw tab");
+    expect(data.raw?.view).toBe("");
 
     await handle.close();
     expect(handle.isAlive()).toBe(false);
