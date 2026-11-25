@@ -21,7 +21,11 @@ export interface PluginOptions {
   stallTimeoutMs?: number;
   monitorIntervalMs?: number;
   allowCoordinatorEdits?: boolean;
-  /** Always allow shell execution when resolved shell policy is "allow" (default: true). */
+  /**
+   * Let a resolved shell policy of "allow" override the host's own permission
+   * (default: false). Without this, the plugin only ever tightens the host's
+   * shell decision and never widens it.
+   */
   overrideShellAllow?: boolean;
   /** Coordinator shell policy ("allow" when overrideShellAllow: true, "ask" otherwise). */
   coordinatorShellPolicy?: ShellPolicy;

@@ -416,7 +416,11 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
 
     execFileSync("git", ["init", repoDir], { stdio: "ignore" });
 
-    const { ctx, tools, hooks } = createMockContext(repoDir, dbPath);
+    const { ctx, tools, hooks } = createMockContext(repoDir, dbPath, {
+      // Opt in explicitly: shell widening is no longer the default.
+      overrideShellAllow: true,
+      coordinatorShellPolicy: "allow",
+    });
     const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
 
     try {

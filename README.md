@@ -62,7 +62,6 @@ bun install && bun run build:gui
     {
       "package": "C:/Users/you/Desktop/Swarm for opencode/tools/opencode-swarm",
       "options": {
-        "overrideShellAllow": true,
         "boardServer": true
       }
     }
@@ -80,7 +79,7 @@ bun install && bun run build:gui
   "plugins": [
     {
       "package": "../tools/opencode-swarm",
-      "options": { "overrideShellAllow": true, "boardServer": true }
+      "options": { "boardServer": true }
     }
   ]
 }
@@ -170,8 +169,8 @@ Options go under the plugin entry's `options` object.
 | `stallTimeoutMs` | `180000` | Idle time before the monitor nudges a stuck swarm. |
 | `monitorIntervalMs` | `30000` | How often the monitor checks for stalls. |
 | `allowCoordinatorEdits` | `false` | Let the coordinator edit files. Off by default so it delegates. |
-| `overrideShellAllow` | `true` | When on, the coordinator's shell resolves to `allow` unless `coordinatorShellPolicy` is set. |
-| `coordinatorShellPolicy` | `"allow"` if `overrideShellAllow`, else `"ask"` | Shell policy for the coordinator. |
+| `overrideShellAllow` | `false` | Let a resolved shell policy of `"allow"` override the host's own permission. Without it the plugin only ever tightens shell, never widens it. |
+| `coordinatorShellPolicy` | `"ask"` (`"allow"` only when `overrideShellAllow`) | Shell policy for the coordinator. |
 | `workerShellPolicy` | `"ask"` | Shell policy for workers. `"deny"` or `"ask"` is safer unless workers use isolated worktrees. |
 | `verifierShellPolicy` | `"ask"` | `"ask"` lets you approve read-only checks; `"deny"` keeps the verifier strictly read-only. |
 | `roleModels` | `{}` | Per-role manual `provider/model#variant` defaults. |
@@ -188,6 +187,8 @@ Options go under the plugin entry's `options` object.
 | `debugHooks` | `false` | Log permission and execute hooks to `hooks.debug.jsonl`. |
 
 A note on shell: shell execution is **not** path-contained. A permitted `bun test` or `rm` runs with your user's reach. The fence covers `edit`, `external_directory`, and swarm tool paths. For real containment, use a container or VM.
+
+Shell widening is opt-in. The plugin only ever tightens the host's shell decision unless you set `overrideShellAllow: true` *and* a role policy of `"allow"` (e.g. `{ "overrideShellAllow": true, "workerShellPolicy": "allow" }`). With the defaults, each member's shell prompt is whatever your own OpenCode permission config says.
 
 ## Where your data lives
 

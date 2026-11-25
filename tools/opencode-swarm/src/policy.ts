@@ -57,7 +57,7 @@ export function looksLikeWriteTool(toolName: string): boolean {
 
 export function resolveCoordinatorShellPolicy(options: PluginOptions): ShellPolicy {
   if (options.coordinatorShellPolicy) return options.coordinatorShellPolicy;
-  const override = options.overrideShellAllow ?? true;
+  const override = options.overrideShellAllow ?? false;
   return override ? "allow" : "ask";
 }
 

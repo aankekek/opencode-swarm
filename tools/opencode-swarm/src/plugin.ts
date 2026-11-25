@@ -1440,7 +1440,10 @@ export const swarmRuntimePlugin = Plugin.define({
             // when action === "shell" and the member's resolved shell policy is "allow"
             // AND overrideShellAllow === true (for live non-killed members), explicitly set event.effect = "allow",
             // while keeping edit and external_directory strictly fenced via tightenEffect.
-            const overrideShell = options.overrideShellAllow ?? true;
+            //
+            // Off by default: the plugin must never widen the host's own shell
+            // permission unless the user opts in.
+            const overrideShell = options.overrideShellAllow ?? false;
             if (
               action === "shell" &&
               overrideShell &&
