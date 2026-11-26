@@ -1280,7 +1280,7 @@ export const swarmRuntimePlugin = Plugin.define({
 
       cmds.add({
         name: "swarm-models",
-        description: "List available models & variants or manually assign role/member models.",
+        description: "List available models & variants.",
         async execute(invocation) {
           const catalog = await listAvailableModels(ctx, { all: false });
           const lines = [

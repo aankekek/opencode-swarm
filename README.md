@@ -147,14 +147,14 @@ Do not call `complete` yourself from the coordinator unless the verifier has pos
 | `claim` | Claims file globs (only in `workspace:"inherit"`). |
 | `complete` | Ends the swarm, tears down children and workspaces (coordinator only). |
 
-`add` extras: `n` spawns `<name>-1..<name>-N`, `tasks` gives each copy its own slice, `workspace` is `inherit` | `share` | `branch`, `fork` copies conversation history from a member or `"coordinator"`, `channels` joins channels at spawn, and `owned_globs` claims write scope up front. When a plan exists, `add` takes `task_ids` (one per spawned worker, workers only); without them it assigns the first open units in order and appends `Assigned unit: <label>` to the brief. The response reports `total_units`, `open_units`, `assigned_units`, `done_units` and `unassigned_units`. It rejects batches larger than the open units, `task_ids` on a non-worker, ids already taken, `tasks: []`, and requests past `maxWorkers` or `maxShardsPerAdd`.
+`add` extras: `n` spawns `<name>-1..<name>-N`, `tasks` gives each copy its own slice, `workspace` is `inherit` | `share` | `branch`, `fork` copies conversation history from another member (the coordinator's own context cannot be forked), `channels` joins channels at spawn, and `owned_globs` claims write scope up front. When a plan exists, `add` takes `task_ids` (one per spawned worker, workers only); without them it assigns the first open units in order and appends `Assigned unit: <label>` to the brief. The response reports `total_units`, `open_units`, `assigned_units`, `done_units` and `unassigned_units`. It rejects batches larger than the open units, `task_ids` on a non-worker, ids already taken, `tasks: []`, and requests past `maxWorkers` or `maxShardsPerAdd`.
 
 ## Models and variants
 
 Nothing is auto-picked. Workers inherit the coordinator's model and variant unless you say otherwise. Four ways to choose:
 
 1. **Tool:** `swarm{action:"models"}`, then `swarm{action:"add", model:"provider/model#variant"}` or `swarm{action:"model", name:"parser", variant:"high"}`.
-2. **Slash command:** `/swarm-models` lists models and variants and can assign role defaults.
+2. **Slash command:** `/swarm-models` lists models and variants. It does not assign anything; use `options.roleModels` (below) or the Board's Members tab for defaults.
 3. **Swarm Board UI:** **Members** tab → **Model** / **Variant** dropdowns; changes apply to waiting members live.
 4. **Config:** `options.roleModels`, e.g. `{ "worker": "anthropic/claude-sonnet-4-6#high" }`. A `coordinator` entry switches the coordinator session when the swarm is created.
 
@@ -179,7 +179,7 @@ Options go under the plugin entry's `options` object.
 | `dbPath` | unset | Explicit SQLite path. Defaults to `~/.opencode-swarm/<hash>/board.db`. |
 | `autoSpawnVerifier` | `true` | Spawn/wake a verifier when all worker tracks finish. |
 | `maxWorkers` | `6` | Cap live workers per swarm; requests with more units are grouped by area. |
-| `maxShardsPerAdd` | `8` | Cap members created by one `add`; larger batches are split into sequential groups. |
+| `maxShardsPerAdd` | `8` | Cap members created by one `add`. A larger batch is rejected, not split; spawn the rest in a second `add`. |
 | `quotaResumeDelayMs` | `30000` | Base backoff delay in ms before auto-resuming a quota-paused member (up to 3 attempts). |
 | `branchCopyMaxEntries` | `5000` | Max file/dir entries allowed when copying a non-git workspace in `branch` mode. |
 | `branchCopyMaxBytes` | `268435456` | Max total bytes (256 MiB) allowed when copying a non-git workspace in `branch` mode. |
