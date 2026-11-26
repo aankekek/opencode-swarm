@@ -1,11 +1,57 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripJsonComments } from "../src/uninstall.js";
 
 const SWARM_MATCH_RE = /(?:^|[\\/])(?:opencode-swarm|swarm-runtime)(?:$|[\\/])|local\.(?:opencode-swarm|swarm-runtime)/i;
+
+/**
+ * Options a newly registered plugin entry gets. Shell widening is opt-in
+ * (`overrideShellAllow` defaults to false), so do not pre-enable it here.
+ */
+const DEFAULT_PLUGIN_OPTIONS = { boardServer: true } as const;
+
+/**
+ * True when `dist/gui-experimental.cjs` is missing or older than any file that
+ * feeds it. The installer used to rebuild only when the bundle was absent, so a
+ * checkout with a committed-but-stale bundle never picked up GUI fixes.
+ */
+export function guiBundleIsStale(pluginRoot: string): boolean {
+  const bundlePath = join(pluginRoot, "dist", "gui-experimental.cjs");
+  let bundleMtime: number;
+  try {
+    bundleMtime = statSync(bundlePath).mtimeMs;
+  } catch {
+    return true;
+  }
+
+  const newestMtime = (path: string): number => {
+    let stat;
+    try {
+      stat = statSync(path);
+    } catch {
+      return 0;
+    }
+    if (!stat.isDirectory()) return stat.mtimeMs;
+    let entries: string[];
+    try {
+      entries = readdirSync(path);
+    } catch {
+      return 0;
+    }
+    let newest = 0;
+    for (const entry of entries) {
+      newest = Math.max(newest, newestMtime(join(path, entry)));
+    }
+    return newest;
+  };
+
+  return ["src", "index.ts", "vite.config.ts", "package.json"].some(
+    (rel) => newestMtime(join(pluginRoot, rel)) > bundleMtime,
+  );
+}
 
 function samePath(a: string, b: string): boolean {
   const ra = resolve(a);
@@ -61,7 +107,7 @@ export function registerSwarmInGlobalConfig(
       : null;
     const preservedOptions = firstObj && firstObj.options !== undefined
       ? firstObj.options
-      : { overrideShellAllow: true, boardServer: true };
+      : { ...DEFAULT_PLUGIN_OPTIONS };
     const replacement = {
       package: targetPath,
       options: preservedOptions,
@@ -82,10 +128,7 @@ export function registerSwarmInGlobalConfig(
   } else {
     plugins.push({
       package: targetPath,
-      options: {
-        overrideShellAllow: true,
-        boardServer: true,
-      },
+      options: { ...DEFAULT_PLUGIN_OPTIONS },
     });
     parsed.plugins = plugins;
   }
@@ -105,7 +148,7 @@ function main() {
     execFileSync("bun", ["install"], { cwd: pluginRoot, stdio: "inherit" });
   }
 
-  if (forceRebuild || !existsSync(join(pluginRoot, "dist", "gui-experimental.cjs"))) {
+  if (forceRebuild || guiBundleIsStale(pluginRoot)) {
     console.log("[install:plugin] Building Desktop GUI bundle (bun run build:gui)...");
     execFileSync("bun", ["run", "build:gui"], { cwd: pluginRoot, stdio: "inherit" });
   }
