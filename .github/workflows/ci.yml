@@ -8,10 +8,18 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The plugin's path, worktree and directory-copy code is win32-sensitive
+    # (case-insensitive roots, drive letters, CRLF), so run the suite on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: tools/opencode-swarm
+        # Git Bash on Windows: same multi-line semantics on both runners.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -24,4 +32,5 @@ jobs:
       - name: Build GUI bundle
         run: bun run build:gui
       - name: Run tests
-        run: bun test --timeout 15000
+        # Windows runners are slower; the ubuntu job used to allow only 15 s.
+        run: bun test --timeout 30000
