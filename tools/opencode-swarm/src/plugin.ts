@@ -849,6 +849,7 @@ export const swarmRuntimePlugin = Plugin.define({
             ...(branchCopyLimits ? { copyLimits: branchCopyLimits } : {}),
           });
           const created = await ctx.session.create({
+            parentID: args.caller.session_id,
             title: `[swarm:${args.swarmId}] @${cleanName}`,
             location: { directory: provisioned.dir },
             permissions: buildRolePermissions(args.role, options),

@@ -311,8 +311,8 @@ describe("Concurrency, State & Contract Audit Regressions", () => {
       expect(addRes.ok).toBe(true);
       const coderSess = addRes.spawned[0].session_id as string;
 
-      // Worker session must omit parentID so built-in subagent pill does not appear
-      expect(capturedCreateInput.parentID).toBeUndefined();
+      // Worker session sets parentID so member clicks open in the subagent temporary tab
+      expect(capturedCreateInput.parentID).toBe("sess_coord");
 
       const handlers = (ctx as any)._rpcHandlers;
       const roleCfg = await handlers.getRoleConfig({ sessionId: "sess_coord" });
