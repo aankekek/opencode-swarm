@@ -328,6 +328,70 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
     }
   });
 
+  test("a share member's own location serves the owner's board and policy, and leaves the owner running", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-member-location-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+
+    execFileSync("git", ["init", repoDir], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@local"], { stdio: "ignore" });
+    writeFileSync(join(repoDir, "README.md"), "# Test\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "init"], { stdio: "ignore" });
+
+    const owner = createMockContext(repoDir, dbPath);
+    const cleanup = (await swarmRuntimePlugin.setup(owner.ctx)) as () => Promise<void>;
+
+    try {
+      const swarmTool = owner.tools.get("swarm");
+      const status = async () =>
+        JSON.parse((await swarmTool.execute({ action: "status" }, { sessionID: "sess_coord" })).content);
+      const added = JSON.parse(
+        (
+          await swarmTool.execute(
+            { action: "add", name: "parser", brief: "Fix parser", workspace: "share" },
+            { sessionID: "sess_coord" },
+          )
+        ).content,
+      );
+      expect(added.ok).toBe(true);
+      const workerSession = added.spawned[0].session_id;
+      const worktree = (await status()).members.find((m: any) => m.name === "parser").workspace_dir;
+      expect(existsSync(worktree)).toBe(true);
+
+      // The host sets the plugin up again for the worker's own location, with the same options.
+      const member = createMockContext(worktree, dbPath);
+      const detach = (await swarmRuntimePlugin.setup(member.ctx)) as () => Promise<void>;
+
+      // Its board tools reach the owner's swarm instead of an empty board.
+      const posted = JSON.parse(
+        (await member.tools.get("post_message").execute({ text: "@coordinator [start] parsing" }, { sessionID: workerSession }))
+          .content,
+      );
+      expect(posted.ok).toBe(true);
+      const read = JSON.parse(
+        (await owner.tools.get("read_board").execute({ since: 0 }, { sessionID: "sess_coord" })).content,
+      );
+      expect(read.posts.some((p: any) => p.author === "parser" && p.text.includes("[start] parsing"))).toBe(true);
+
+      // Its permission hook applies the worker's policy.
+      const shell: any = { sessionID: workerSession, action: "shell", resources: ["ls"], effect: "allow" };
+      await member.hooks["permission.evaluate"](shell);
+      expect(shell.effect).toBe("ask");
+
+      // The owner was not taken for a duplicate load and disposed, and outlives the member location.
+      expect((await status()).ok).toBe(true);
+      await detach();
+      expect((await status()).ok).toBe(true);
+    } finally {
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
   test("completion contains a failing member teardown and always ends completed", async () => {
     const root = mkdtempSync(join(tmpdir(), "swarm-complete-fail-"));
     const repoDir = join(root, "repo");

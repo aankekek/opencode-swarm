@@ -26,7 +26,13 @@ import type {
   WorkspaceMode,
 } from "./types.js";
 import { createWakeController, type WaiterEntry } from "./wake.js";
-import { cleanupMemberWorkspace, provisionedWorkspacePaths, provisionMemberWorkspace, recoverPendingProvisions } from "./workspace.js";
+import {
+  cleanupMemberWorkspace,
+  isMemberWorkspace,
+  provisionedWorkspacePaths,
+  provisionMemberWorkspace,
+  recoverPendingProvisions,
+} from "./workspace.js";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -85,12 +91,27 @@ function cloneToolInput(input: unknown): Record<string, unknown> | undefined {
 
 const activePluginInstances = new Map<string, () => Promise<void>>();
 
+// Live swarm owners in this process, keyed by the real path of the data dir their members' workspaces are provisioned
+// under. The host sets the plugin up once per location, and a `share`/`branch` member's session lives in a location of its
+// own. That setup must attach to the owner: on its own it would open an empty board for the workspace path (so every board
+// tool answers "Session is not an active swarm member" and no swarm policy applies), or, with `dbPath` set, dispose the
+// owner as a duplicate load. Kept on globalThis so it holds even if the host loads this module once per location.
+type AttachMemberLocation = (memberCtx: Context) => Promise<() => Promise<void>>;
+const swarmOwners = ((globalThis as Record<symbol, unknown>)[Symbol.for("opencode-swarm.owners")] ??= new Map()) as Map<
+  string,
+  AttachMemberLocation
+>;
+
 export const swarmRuntimePlugin = Plugin.define({
   id: "local.opencode-swarm",
 
   async setup(ctx: Context) {
     const workspaceRoot = resolve(ctx.location.directory);
     const canonicalWorkspaceRoot = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : workspaceRoot;
+
+    for (const [ownerDataDir, attach] of swarmOwners) {
+      if (isMemberWorkspace(ownerDataDir, canonicalWorkspaceRoot)) return attach(ctx);
+    }
 
     const options = (ctx.options ?? {}) as PluginOptions;
     const stallTimeoutMs = options.stallTimeoutMs ?? 180_000;
@@ -1082,10 +1103,18 @@ export const swarmRuntimePlugin = Plugin.define({
       console.warn("[opencode-swarm] Failed to register RPC domain:", err);
     }
 
+    // What a member's own location must answer with: the swarm tools and the hooks that police and annotate its
+    // sessions. Each is registered here, and again on that location's context when it attaches (see `swarmOwners`).
+    const surface: Array<(c: Context) => Promise<unknown>> = [];
+    const serve = async (register: (c: Context) => Promise<unknown>) => {
+      surface.push(register);
+      await register(ctx);
+    };
+
     // -----------------------------------------------------------------------
     // 1. Register 4 Antigravity Core Tools: swarm, post_message, read_board, swarm_wait
     // -----------------------------------------------------------------------
-    await registerSwarmTools(ctx, {
+    await serve((c) => registerSwarmTools(c, {
       db,
       options,
       canonicalWorkspaceRoot,
@@ -1103,7 +1132,7 @@ export const swarmRuntimePlugin = Plugin.define({
       recordWakeSeq: wake.recordWakeSeq,
       resolveWaiterAborted,
       waitForQuiesce,
-    });
+    }));
 
     // -----------------------------------------------------------------------
     // 2. Register V2 Slash Commands: /swarm and /swarm-models
@@ -1315,7 +1344,7 @@ export const swarmRuntimePlugin = Plugin.define({
     // -----------------------------------------------------------------------
     // 3. Tool Execute Hook (Call-ID Cache + Defense-in-Depth)
     // -----------------------------------------------------------------------
-    await ctx.tool.hook("execute.before", async (event) => {
+    await serve((c) => c.tool.hook("execute.before", async (event) => {
       const toolName = String(event.tool ?? "").toLowerCase();
       if (event.id) {
         cachePendingCall(event.id, {
@@ -1407,12 +1436,12 @@ export const swarmRuntimePlugin = Plugin.define({
       if (verdict.decision === "deny") {
         throw new Error(verdict.reason ?? `[SWARM] Blocked '${toolName}' for @${member.name}.`);
       }
-    });
+    }));
 
     // -----------------------------------------------------------------------
     // 4. Permission Evaluate Hook (In-Place Mutation)
     // -----------------------------------------------------------------------
-    await ctx.permission.hook("evaluate", async (event) => {
+    await serve((c) => c.permission.hook("evaluate", async (event) => {
       const action = String(event.action ?? "").toLowerCase();
       if (action !== "edit" && action !== "shell" && action !== "external_directory") return;
 
@@ -1494,12 +1523,12 @@ export const swarmRuntimePlugin = Plugin.define({
           reason: reason ?? null,
         });
       }
-    });
+    }));
 
     // -----------------------------------------------------------------------
     // 5. Compaction Hook
     // -----------------------------------------------------------------------
-    await ctx.session.hook("compaction", async (event) => {
+    await serve((c) => c.session.hook("compaction", async (event) => {
       const member = db.getActiveMemberBySession(event.sessionID);
       if (!member) return;
       const locks = db
@@ -1515,7 +1544,7 @@ export const swarmRuntimePlugin = Plugin.define({
         type: "text",
         text: `Preserve in compaction summary: Swarm=${member.swarm_id}, Member=@${member.name}, Role=${member.role}, Model=${modelSpec}, Workspace=${member.workspace_mode}:${member.workspace_dir}, OwnedGlobs=[${locks.join(", ")}], LastReadSeq=${member.last_read_seq}.`,
       });
-    });
+    }));
 
     // -----------------------------------------------------------------------
     // 6. Event Stream Consumer
@@ -1670,12 +1699,39 @@ export const swarmRuntimePlugin = Plugin.define({
       (swarmId, authorName, channel, text) => postToBoard(swarmId, authorName, channel, text),
     );
 
+    // A member location attaches by registering the owner's surface on its own context; detaching disposes those
+    // registrations, and the owner detaches every member location before it closes the board they read.
+    const ownerKey = realpathSync(dataDir);
+    const attached = new Set<() => Promise<void>>();
+    const attach = async (memberCtx: Context) => {
+      const registrations: unknown[] = [];
+      for (const register of surface) registrations.push(await register(memberCtx));
+      const detach = async () => {
+        if (!attached.delete(detach)) return;
+        for (const registration of registrations) {
+          await (registration as { dispose?: () => Promise<void> } | undefined)?.dispose?.();
+        }
+      };
+      attached.add(detach);
+      return detach;
+    };
+
     let cleanedUp = false;
     const cleanup = async () => {
       if (cleanedUp) return;
       cleanedUp = true;
       if (activePluginInstances.get(instanceKey) === cleanup) {
         activePluginInstances.delete(instanceKey);
+      }
+      if (swarmOwners.get(ownerKey) === attach) {
+        swarmOwners.delete(ownerKey);
+      }
+      for (const detach of Array.from(attached)) {
+        try {
+          await detach();
+        } catch (err) {
+          console.warn("[opencode-swarm] detaching a member location failed during shutdown:", err);
+        }
       }
       stopMonitor();
       abortController.abort();
@@ -1730,6 +1786,7 @@ export const swarmRuntimePlugin = Plugin.define({
       }
     };
     activePluginInstances.set(instanceKey, cleanup);
+    swarmOwners.set(ownerKey, attach);
     return cleanup;
   },
 });

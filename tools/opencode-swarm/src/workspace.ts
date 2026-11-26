@@ -243,6 +243,11 @@ function isStrictlyInside(parent: string, child: string): boolean {
   return !rel.startsWith("..");
 }
 
+/** True when `dir` lies in a member workspace provisioned under `dataDir`: a `share` worktree or a `branch` clone. */
+export function isMemberWorkspace(dataDir: string, dir: string): boolean {
+  return ["worktrees", "clones"].some((sub) => isStrictlyInside(join(dataDir, sub), dir));
+}
+
 /**
  * Recover workspaces that were provisioned but never recorded as members
  * (crash between provisioning and `insertMember`). Each pending row is an

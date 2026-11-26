@@ -83,11 +83,14 @@ export interface SwarmToolsDeps {
   waitForQuiesce: (sessionId: string, timeoutMs?: number) => Promise<boolean>;
 }
 
-export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDeps): Promise<void> {
+export async function registerSwarmTools(
+  ctx: PluginContext,
+  deps: SwarmToolsDeps,
+): ReturnType<PluginContext["tool"]["transform"]> {
   const { db, waiters, emitSwarmChanged } = deps;
   const memberPostTimestamps = new Map<string, number[]>();
 
-  await ctx.tool.transform((tools) => {
+  return ctx.tool.transform((tools) => {
     tools.add({
       name: "swarm",
       description:
