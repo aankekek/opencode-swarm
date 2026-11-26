@@ -5,8 +5,8 @@ import { join } from "node:path";
  * The board pane's file snapshot.
  *
  * `assets/swarm_board/app.js` and `hive.js` are written against the sidecar's
- * `/api/swarm` payload (see `assets/swarm_board/main.mjs`, `readView` and the
- * snapshot return). They read:
+ * `/api/swarm` payload (see `docs/reference/swarm-sidecar/main.mjs`, `readView`
+ * and the snapshot return). They read:
  *
  *   snap.view = { exists, dir, source, json, jsonMtime, jsonError,
  *                 html, htmlKey, htmlMtime, htmlError }

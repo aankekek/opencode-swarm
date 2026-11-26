@@ -11,9 +11,9 @@ import { openSqliteDatabase, SwarmBoardDB } from "../src/db.js";
  *
  * The pane's front-end is vendored from the sidecar (`assets/swarm_board/
  * app.js`, `hive.js`). These assertions are the fields those two files actually
- * read, taken from `main.mjs`'s snapshot: a `view` object, a `raw` object with
- * three strings, `urlHosts`, and `frames`. Regressing any of them breaks a tab
- * without failing typecheck.
+ * read, taken from the sidecar's snapshot (`docs/reference/swarm-sidecar/
+ * main.mjs`): a `view` object, a `raw` object with three strings, `urlHosts`,
+ * and `frames`. Regressing any of them breaks a tab without failing typecheck.
  */
 
 async function makeBoard() {
@@ -172,6 +172,23 @@ describe("board snapshot contract", () => {
       expect(next.unchanged).toBeUndefined();
       expect(next.etag).not.toBe(first.etag);
       expect(next.view.json.headline).toBe("changed");
+    } finally {
+      await board.close();
+    }
+  });
+
+  test("does not serve the reference sidecar from the pane asset directory", async () => {
+    const board = await makeBoard();
+    try {
+      const base = `http://127.0.0.1:${board.handle.port}`;
+      // The Antigravity sidecar lives in docs/reference/, not in assets/, so it
+      // must not be reachable over the board port.
+      for (const path of ["/main.mjs", "/channels.mjs", "/sidecar.json"]) {
+        const res = await fetch(`${base}${path}`);
+        expect(res.status).toBe(404);
+      }
+      const pane = await fetch(`${base}/app.js`);
+      expect(pane.status).toBe(200);
     } finally {
       await board.close();
     }

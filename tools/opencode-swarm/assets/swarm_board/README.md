@@ -1,5 +1,10 @@
 # swarm_board — Swarm
 
+> Reference note: this is Antigravity's sidecar documentation. Its server
+> (`main.mjs`), channel helpers (`channels.mjs`) and app manifest live in
+> `docs/reference/swarm-sidecar/` and are not built or served by this plugin.
+> Only the static pane files in this directory are served.
+
 Realtime UI sidecar for **native swarm**: the shared message board, the
 roster, and who @mentions whom — for the swarm of the conversation the pane
 is open in, and only that one.
