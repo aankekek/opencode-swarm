@@ -1274,4 +1274,184 @@ describe("Swarm Runtime E2E (1:1 Antigravity + Review 3 Gate)", () => {
       } catch {}
     }
   });
+
+  test("AB1: a configured narrator role model survives plugin setup and role-models.json reload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-narrator-cfg-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    mkdirSync(dirname(dbPath), { recursive: true });
+    writeFileSync(
+      join(dirname(dbPath), "role-models.json"),
+      JSON.stringify({ narrator: "openai/gpt-5.4#high" }, null, 2),
+      "utf8",
+    );
+
+    const { ctx, tools, commands } = createMockContext(repoDir, dbPath, {
+      roleModels: { narrator: "anthropic/claude-sonnet-4-6" },
+    });
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    try {
+      await commands.get("swarm").execute({ sessionID: "sess_coord", prompt: "Narrator cfg", delivery: "queue" });
+      const res = JSON.parse(
+        (await tools.get("swarm").execute({ action: "models" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(res.role_defaults.narrator).toBe("anthropic/claude-sonnet-4-6");
+    } finally {
+      await cleanup();
+    }
+
+    const { ctx: ctx2, tools: tools2, commands: commands2 } = createMockContext(repoDir, dbPath);
+    const cleanup2 = (await swarmRuntimePlugin.setup(ctx2)) as () => Promise<void>;
+    try {
+      await commands2.get("swarm").execute({ sessionID: "sess_coord", prompt: "Narrator reload", delivery: "queue" });
+      const res2 = JSON.parse(
+        (await tools2.get("swarm").execute({ action: "models" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(res2.role_defaults.narrator).toBe("openai/gpt-5.4#high");
+    } finally {
+      await cleanup2();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("AB2: pending kill cleanup is keyed per member, and dispose releases locks without deleting workspaces", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-kill-memberkey-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    writeFileSync(join(repoDir, "seed.txt"), "seed", "utf8");
+
+    const stream = createEventStream();
+    const { ctx, tools, hooks, commands } = createMockContext(repoDir, dbPath, {}, () => stream);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let reader: SwarmBoardDB | undefined;
+    try {
+      const swarmTool = tools.get("swarm");
+      await commands.get("swarm").execute({ sessionID: "sess_coord", prompt: "Kill key test", delivery: "queue" });
+
+      const spawn = async (name: string) => {
+        const res = JSON.parse(
+          (await swarmTool.execute(
+            { action: "add", name, brief: "work", workspace: "inherit" },
+            { sessionID: "sess_coord" },
+          )).content,
+        );
+        expect(res.ok).toBe(true);
+        return res.spawned[0].session_id as string;
+      };
+      const s1 = await spawn("w1");
+      const s2 = await spawn("w2");
+      for (const [sess, glob] of [[s1, "src/a/**/*.ts"], [s2, "src/b/**/*.ts"]] as const) {
+        const claim = JSON.parse(
+          (await swarmTool.execute({ action: "claim", globs: [glob] }, { sessionID: sess })).content,
+        );
+        expect(claim.ok).toBe(true);
+      }
+      for (const [id, sess, sub] of [["call_k1", s1, "a"], ["call_k2", s2, "b"]] as const) {
+        await hooks["tool.execute.before"]({
+          id,
+          tool: "write",
+          input: { filePath: join(repoDir, "src", sub, "x.ts") },
+          sessionID: sess,
+        });
+      }
+      for (const name of ["w1", "w2"]) {
+        const killRes = JSON.parse(
+          (await swarmTool.execute({ action: "kill", name }, { sessionID: "sess_coord" })).content,
+        );
+        expect(killRes.ok).toBe(true);
+      }
+
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      const swarmId = reader.getActiveSwarms()[0].id;
+      expect(reader.listLocks(swarmId)).toHaveLength(2);
+
+      // Only w1's tool finishes: only w1's deferred cleanup may run.
+      stream.push({ type: "session.tool.success", data: { sessionID: s1 } });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      const remaining = reader.listLocks(swarmId);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].owner_name).toBe("w2");
+
+      // Dispose with w2 still pending: its lock is released, nothing orphaned.
+      reader.close();
+      reader = undefined;
+      await cleanup();
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      expect(reader.listLocks(swarmId)).toHaveLength(0);
+      stream.end();
+    } finally {
+      reader?.close();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
+
+  test("AB3: dispose with a non-quiesced killed member keeps its workspace directory across restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "swarm-kill-keepws-"));
+    const repoDir = join(root, "repo");
+    const dbPath = join(root, "data", "board.db");
+    mkdirSync(repoDir, { recursive: true });
+    writeFileSync(join(repoDir, "seed.txt"), "seed", "utf8");
+
+    const stream = createEventStream();
+    const { ctx, tools, hooks, commands } = createMockContext(repoDir, dbPath, {}, () => stream);
+    const cleanup = (await swarmRuntimePlugin.setup(ctx)) as () => Promise<void>;
+    let cleanup2: (() => Promise<void>) | undefined;
+    let reader: SwarmBoardDB | undefined;
+    try {
+      const swarmTool = tools.get("swarm");
+      await commands.get("swarm").execute({ sessionID: "sess_coord", prompt: "Keep ws test", delivery: "queue" });
+      const addRes = JSON.parse(
+        (await swarmTool.execute(
+          { action: "add", name: "w1", brief: "work", workspace: "branch" },
+          { sessionID: "sess_coord" },
+        )).content,
+      );
+      expect(addRes.ok).toBe(true);
+      const workerSession = addRes.spawned[0].session_id as string;
+      const statusRes = JSON.parse(
+        (await swarmTool.execute({ action: "status" }, { sessionID: "sess_coord" })).content,
+      );
+      const wsDir = statusRes.members.find((m: any) => m.name === "w1").workspace_dir as string;
+      expect(existsSync(join(wsDir, "seed.txt"))).toBe(true);
+
+      await hooks["tool.execute.before"]({
+        id: "call_keep_1",
+        tool: "write",
+        input: { filePath: join(wsDir, "x.ts") },
+        sessionID: workerSession,
+      });
+      const killRes = JSON.parse(
+        (await swarmTool.execute({ action: "kill", name: "w1" }, { sessionID: "sess_coord" })).content,
+      );
+      expect(killRes.ok).toBe(true);
+      expect(existsSync(wsDir)).toBe(true);
+
+      await cleanup();
+      // The tool may still be running in it: dispose must not delete the workspace.
+      expect(existsSync(wsDir)).toBe(true);
+      stream.end();
+
+      // Simulate restart: plugin reloads cleanly, 0 orphaned locks, workspace untouched.
+      const { ctx: ctx2 } = createMockContext(repoDir, dbPath);
+      cleanup2 = (await swarmRuntimePlugin.setup(ctx2)) as () => Promise<void>;
+      reader = new SwarmBoardDB(await openSqliteDatabase(dbPath), dirname(dbPath));
+      const swarmId = reader.listSwarms(1)[0].id;
+      expect(reader.listLocks(swarmId)).toHaveLength(0);
+      expect(existsSync(wsDir)).toBe(true);
+    } finally {
+      reader?.close();
+      await cleanup2?.();
+      await cleanup();
+      try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  });
 });

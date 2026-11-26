@@ -11,6 +11,15 @@ export type SwarmTaskStatus = "open" | "assigned" | "done";
 export type ShellPolicy = "deny" | "ask" | "allow";
 export type PermissionEffect = "allow" | "ask" | "deny";
 
+/** Deferred cleanup for a killed member whose session still has tools in flight. Keyed by member id. */
+export interface PendingKillCleanupEntry {
+  memberId: string;
+  sessionId: string;
+  releaseLocks: () => void;
+  cleanupWorkspace: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 export interface ModelSelection {
   providerID: string;
   id: string;

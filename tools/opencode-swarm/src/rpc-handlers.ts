@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { SwarmBoardDB } from "./db.js";
 import { formatModelSpec, listAvailableModels, resolveAndValidateModel } from "./models.js";
 import type { SwarmChangedEvent, UninstallSelection } from "./rpc.js";
-import type { MemberRole, ModelSelection } from "./types.js";
+import type { MemberRole, ModelSelection, PendingKillCleanupEntry } from "./types.js";
 import { buildUninstallPlan, executeUninstallPlan } from "./uninstall.js";
 import { cleanupMemberWorkspace } from "./workspace.js";
 
@@ -43,7 +43,7 @@ export interface RpcHandlerDeps {
   emitSwarmChanged: (event: SwarmChangedEvent) => void;
   resolveWaiterAborted: (memberId: string) => void;
   waitForQuiesce: (sessionId: string, timeoutMs?: number) => Promise<boolean>;
-  pendingKillCleanup: Map<string, () => void>;
+  pendingKillCleanup: Map<string, PendingKillCleanupEntry>;
   switchMemberModelInPlace: (
     swarmId: string,
     memberName: string,
@@ -373,8 +373,10 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       } catch {
         // Already idle
       }
-      const finishKillCleanup = () => {
+      const releaseLocks = () => {
         db.releaseLocksForMember(target.id);
+      };
+      const cleanupWorkspace = () => {
         cleanupMemberWorkspace({
           mode: target.workspace_mode,
           dir: target.workspace_dir,
@@ -384,22 +386,29 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       };
       const quiesced = await deps.waitForQuiesce(target.session_id, 400);
       if (quiesced) {
-        finishKillCleanup();
+        releaseLocks();
+        cleanupWorkspace();
       } else {
-        deps.pendingKillCleanup.set(target.session_id, finishKillCleanup);
+        const entry: PendingKillCleanupEntry = {
+          memberId: target.id,
+          sessionId: target.session_id,
+          releaseLocks,
+          cleanupWorkspace,
+        };
         // Safety net: if the session never quiesces (e.g. the runtime never
-        // emits tool.success/failed) release the locks and the workspace after
-        // 15s instead of leaking them forever.
-        const safety = setTimeout(() => {
-          if (deps.pendingKillCleanup.get(target.session_id) !== finishKillCleanup) return;
-          deps.pendingKillCleanup.delete(target.session_id);
+        // emits tool.success/failed) release the locks after 15s. The workspace
+        // is intentionally left in place: a tool may still be running in it.
+        entry.timer = setTimeout(() => {
+          if (deps.pendingKillCleanup.get(target.id) !== entry) return;
+          deps.pendingKillCleanup.delete(target.id);
           try {
-            finishKillCleanup();
+            releaseLocks();
           } catch {
             // Best-effort deferred cleanup
           }
         }, 15_000);
-        safety.unref?.();
+        entry.timer.unref?.();
+        deps.pendingKillCleanup.set(target.id, entry);
       }
       deps.emitSwarmChanged({ swarmId: swarm.id, reason: "member_killed", handle: target.name, summary: reason });
       return { ok: true };
@@ -416,6 +425,7 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
             worker: deps.roleModels.worker ?? "",
             verifier: deps.roleModels.verifier ?? "",
             monitor: deps.roleModels.monitor ?? "",
+            narrator: deps.roleModels.narrator ?? "",
           },
           models: [],
         };
@@ -447,7 +457,7 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           ? `${catalog.models[0].providerID}/${catalog.models[0].id}`
           : "";
       const liveMembers = swarm ? db.listMembers(swarm.id, false) : [];
-      const pickRoleModel = (role: "coordinator" | "worker" | "verifier" | "monitor") => {
+      const pickRoleModel = (role: "coordinator" | "worker" | "verifier" | "monitor" | "narrator") => {
         const member = liveMembers.find((m) => m.role === role);
         if (member?.model_provider && member?.model_id) {
           return formatModelSpec({
@@ -469,6 +479,7 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
           worker: pickRoleModel("worker"),
           verifier: pickRoleModel("verifier"),
           monitor: pickRoleModel("monitor"),
+          narrator: pickRoleModel("narrator"),
         },
         models: catalog.models.map((m) => ({
           providerID: m.providerID,
@@ -483,7 +494,7 @@ export function createRpcHandlers(deps: RpcHandlerDeps): Record<string, (args?: 
       const swarmIdArg = typeof args?.swarmId === "string" ? args.swarmId : undefined;
       const sessionIdArg = typeof args?.sessionId === "string" ? args.sessionId : undefined;
 
-      if (!["coordinator", "worker", "verifier", "monitor"].includes(roleArg)) {
+      if (!["coordinator", "worker", "verifier", "monitor", "narrator"].includes(roleArg)) {
         return {
           ok: false,
           role: roleArg,

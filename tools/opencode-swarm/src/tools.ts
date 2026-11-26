@@ -9,6 +9,7 @@ import type {
   BoardPostRow,
   MemberRole,
   MemberRow,
+  PendingKillCleanupEntry,
   PluginOptions,
   SwarmTaskRow,
   WorkspaceMode,
@@ -38,7 +39,7 @@ export interface SwarmToolsDeps {
   canonicalWorkspaceRoot: string;
   roleModels: Partial<Record<MemberRole, string>>;
   waiters: Map<string, WaiterEntry>;
-  pendingKillCleanup: Map<string, () => void>;
+  pendingKillCleanup: Map<string, PendingKillCleanupEntry>;
   getBoardUrl: () => string;
   emitSwarmChanged: (event: SwarmChangedEvent) => void;
   ensureCoordinator: (sessionId: string, title?: string) => Promise<{ swarmId: string; coordinator: MemberRow }>;
@@ -617,8 +618,10 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
             } catch {
               // Already idle
             }
-            const finishKillCleanup = () => {
+            const releaseLocks = () => {
               db.releaseLocksForMember(t.id);
+            };
+            const cleanupWorkspace = () => {
               cleanupMemberWorkspace({
                 mode: t.workspace_mode,
                 dir: t.workspace_dir,
@@ -628,22 +631,30 @@ export async function registerSwarmTools(ctx: PluginContext, deps: SwarmToolsDep
             };
             const quiesced = await deps.waitForQuiesce(t.session_id, 400);
             if (quiesced) {
-              finishKillCleanup();
+              releaseLocks();
+              cleanupWorkspace();
             } else {
-              deps.pendingKillCleanup.set(t.session_id, finishKillCleanup);
+              const entry: PendingKillCleanupEntry = {
+                memberId: t.id,
+                sessionId: t.session_id,
+                releaseLocks,
+                cleanupWorkspace,
+              };
               // Safety net: if the session never quiesces (e.g. the runtime
-              // never emits tool.success/failed) release the locks and the
-              // workspace after 15s instead of leaking them forever.
-              const safety = setTimeout(() => {
-                if (deps.pendingKillCleanup.get(t.session_id) !== finishKillCleanup) return;
-                deps.pendingKillCleanup.delete(t.session_id);
+              // never emits tool.success/failed) release the locks after 15s.
+              // The workspace is intentionally left in place: a tool may still
+              // be running in it, and it is reclaimed on swarm completion.
+              entry.timer = setTimeout(() => {
+                if (deps.pendingKillCleanup.get(t.id) !== entry) return;
+                deps.pendingKillCleanup.delete(t.id);
                 try {
-                  finishKillCleanup();
+                  releaseLocks();
                 } catch {
                   // Best-effort deferred cleanup
                 }
               }, 15_000);
-              safety.unref?.();
+              entry.timer.unref?.();
+              deps.pendingKillCleanup.set(t.id, entry);
             }
             emitSwarmChanged({
               swarmId: t.swarm_id,

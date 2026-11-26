@@ -98,6 +98,7 @@ export interface SwarmRoleConfig {
     worker: string;
     verifier: string;
     monitor: string;
+    narrator?: string;
   };
   models: SwarmModelCatalogItem[];
 }

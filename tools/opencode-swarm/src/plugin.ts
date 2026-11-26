@@ -21,6 +21,7 @@ import type {
   MemberRole,
   MemberRow,
   ModelSelection,
+  PendingKillCleanupEntry,
   PluginOptions,
   WorkspaceMode,
 } from "./types.js";
@@ -132,7 +133,7 @@ export const swarmRuntimePlugin = Plugin.define({
       : join(homedir(), ".opencode-swarm", "role-models.json");
     mkdirSync(dirname(roleModelsPath), { recursive: true });
 
-    const VALID_ROLE_KEYS = new Set<MemberRole>(["coordinator", "worker", "verifier", "monitor"]);
+    const VALID_ROLE_KEYS = new Set<MemberRole>(["coordinator", "worker", "verifier", "monitor", "narrator"]);
     const roleModels: Partial<Record<MemberRole, string>> = {};
     try {
       if (existsSync(roleModelsPath)) {
@@ -280,7 +281,14 @@ export const swarmRuntimePlugin = Plugin.define({
     const memberSwitchLocks = new Map<string, Promise<unknown>>();
     const activeToolCounts = new Map<string, number>();
     const quiesceResolvers = new Map<string, Array<() => void>>();
-    const pendingKillCleanup = new Map<string, () => void>();
+    const pendingKillCleanup = new Map<string, PendingKillCleanupEntry>();
+
+    function hasPendingKillForSession(sessionId: string): boolean {
+      for (const entry of pendingKillCleanup.values()) {
+        if (entry.sessionId === sessionId) return true;
+      }
+      return false;
+    }
 
     function notifySessionQuiesced(sessionId: string) {
       const resolvers = quiesceResolvers.get(sessionId);
@@ -288,11 +296,17 @@ export const swarmRuntimePlugin = Plugin.define({
         quiesceResolvers.delete(sessionId);
         for (const fn of resolvers) fn();
       }
-      const deferred = pendingKillCleanup.get(sessionId);
-      if (deferred) {
-        pendingKillCleanup.delete(sessionId);
+      for (const [memberId, entry] of Array.from(pendingKillCleanup)) {
+        if (entry.sessionId !== sessionId) continue;
+        pendingKillCleanup.delete(memberId);
+        if (entry.timer) clearTimeout(entry.timer);
         try {
-          deferred();
+          entry.releaseLocks();
+        } catch {
+          // Ignore deferred cleanup error
+        }
+        try {
+          entry.cleanupWorkspace();
         } catch {
           // Ignore deferred cleanup error
         }
@@ -319,7 +333,7 @@ export const swarmRuntimePlugin = Plugin.define({
       // counts here is fine but must NOT fake quiescence: only the real
       // `session.tool.success|failed` decrement may trigger deferred cleanup,
       // otherwise we could rmSync a worktree under a still-running tool.
-      if (pendingKillCleanup.has(sessionId)) {
+      if (hasPendingKillForSession(sessionId)) {
         activeToolCounts.delete(sessionId);
         return;
       }
@@ -1676,18 +1690,17 @@ export const swarmRuntimePlugin = Plugin.define({
       }
       quotaResumeTimers.clear();
       quotaResumeAttempts.clear();
-      // Deferred kill cleanups release locks and remove worktrees for sessions
-      // that never quiesced before shutdown. They must run while the DB is
-      // still open: dropping them would orphan locks and workspaces forever,
-      // because a same-PID reload makes startup reconciliation skip the swarm.
-      for (const [sessionId, finishKillCleanup] of Array.from(pendingKillCleanup)) {
-        // Another path (quiesce notification) may have already taken it.
-        if (pendingKillCleanup.get(sessionId) !== finishKillCleanup) continue;
-        pendingKillCleanup.delete(sessionId);
+      // Deferred kill cleanups for sessions that never quiesced before shutdown:
+      // release their locks while the DB is still open (a same-PID reload makes
+      // startup reconciliation skip the swarm), but never delete the workspace,
+      // since an in-flight tool or shell may still be using it.
+      for (const [memberId, entry] of Array.from(pendingKillCleanup)) {
+        pendingKillCleanup.delete(memberId);
+        if (entry.timer) clearTimeout(entry.timer);
         try {
-          finishKillCleanup();
+          entry.releaseLocks();
         } catch (err) {
-          console.warn("[opencode-swarm] deferred kill cleanup error during shutdown:", err);
+          console.warn("[opencode-swarm] deferred kill lock release error during shutdown:", err);
         }
       }
       pendingKillCleanup.clear();
