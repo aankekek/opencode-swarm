@@ -51,7 +51,8 @@ const CSP_HEADER = [
 ].join("; ");
 
 // Applied to every response (JSON, preload.js, static assets, 404s, auth failures).
-// The board URL carries `?token=`, so never leak it via Referer to external hosts.
+// The bootstrap URL carries `?token=` once; it is exchanged for an HttpOnly
+// cookie and the redirect drops it, so never leak it via Referer either.
 const BASE_RESPONSE_HEADERS: Record<string, string> = {
   "Content-Security-Policy": CSP_HEADER,
   "Referrer-Policy": "no-referrer",
@@ -127,6 +128,34 @@ function hasValidBearer(req: IncomingMessage, expectedToken: string): boolean {
   return auth.slice("Bearer ".length).trim() === expectedToken;
 }
 
+/** Name of the cookie the token exchange sets. Same-origin, HttpOnly, Strict. */
+export const TOKEN_COOKIE = "swarm_board_token";
+
+function readCookie(req: IncomingMessage, name: string): string | undefined {
+  const header = req.headers.cookie;
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(eq + 1).trim());
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Accept either the bearer header (scripts, tests) or the cookie the token
+ * exchange sets (the browser pane). The pane never sees the token in JS: the
+ * first GET swaps `?token=` for an HttpOnly cookie and redirects to a clean URL.
+ */
+function hasValidAuth(req: IncomingMessage, expectedToken: string): boolean {
+  return hasValidBearer(req, expectedToken) || readCookie(req, TOKEN_COOKIE) === expectedToken;
+}
+
 const PRELOAD_JS = `(() => {
   const root = document.documentElement;
   const applyTheme = () => {
@@ -182,6 +211,8 @@ const PRELOAD_JS = `(() => {
       }
     }
   });
+  // iframe fallback: a top-level load is redirected after swapping ?token= for
+  // an HttpOnly cookie, but a cross-site iframe is not sent that cookie.
   const token = new URLSearchParams(window.location.search).get('token');
   if (token && typeof window.fetch === 'function') {
     const origFetch = window.fetch.bind(window);
@@ -226,8 +257,35 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
 
       const reqUrl = new URL(req.url ?? "/", `http://127.0.0.1:${actualPort}`);
 
+      // Token exchange: the URL the plugin hands out carries ?token=. For a
+      // top-level navigation (a browser tab) swap it for an HttpOnly
+      // SameSite=Strict cookie and redirect to the same path without it, so the
+      // token never stays in the address bar, history or a Referer.
+      //
+      // An iframe load (the desktop app's pane) keeps the current behaviour: a
+      // cross-site iframe is not sent SameSite cookies, so preload.js still
+      // reads ?token= there and adds the bearer header.
+      const fetchDest = req.headers["sec-fetch-dest"];
+      const isTopLevelNavigation = fetchDest === undefined || fetchDest === "document";
+      if (req.method === "GET" && reqUrl.searchParams.has("token") && isTopLevelNavigation) {
+        if (reqUrl.searchParams.get("token") !== token) {
+          return sendJson(res, 401, { ok: false, error: "Unauthorized" });
+        }
+        const rest = new URL(reqUrl);
+        rest.searchParams.delete("token");
+        const query = rest.searchParams.toString();
+        res.writeHead(302, {
+          "Set-Cookie": `${TOKEN_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/`,
+          Location: `${rest.pathname}${query ? `?${query}` : ""}`,
+          "Cache-Control": "no-store",
+          ...BASE_RESPONSE_HEADERS,
+        });
+        res.end();
+        return;
+      }
+
       if (req.method === "GET" && reqUrl.pathname === "/api/swarm") {
-        if (!hasValidBearer(req, token)) {
+        if (!hasValidAuth(req, token)) {
           return sendJson(res, 401, { ok: false, error: "Unauthorized" });
         }
         const swarmIdParam = reqUrl.searchParams.get("swarmId");
@@ -371,7 +429,7 @@ export async function startBoardServer(deps: BoardServerDeps, port = 0): Promise
       }
 
       if (req.method === "POST" && (reqUrl.pathname === "/api/member/model" || reqUrl.pathname === "/api/role-models")) {
-        if (!hasValidBearer(req, token)) {
+        if (!hasValidAuth(req, token)) {
           return sendJson(res, 401, { ok: false, error: "Unauthorized" });
         }
         const contentType = req.headers["content-type"] ?? "";

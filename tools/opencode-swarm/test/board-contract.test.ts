@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startBoardServer } from "../src/board-server.js";
+import { startBoardServer, TOKEN_COOKIE } from "../src/board-server.js";
 import { VIEW_MAX_BYTES } from "../src/board-snapshot.js";
 import { openSqliteDatabase, SwarmBoardDB } from "../src/db.js";
 
@@ -189,6 +189,77 @@ describe("board snapshot contract", () => {
       }
       const pane = await fetch(`${base}/app.js`);
       expect(pane.status).toBe(200);
+    } finally {
+      await board.close();
+    }
+  });
+});
+
+describe("board token exchange", () => {
+  async function openBoard() {
+    const board = await makeBoard();
+    return { board, base: `http://127.0.0.1:${board.handle.port}` };
+  }
+
+  test("a top-level bootstrap URL swaps ?token= for an HttpOnly cookie and redirects to a clean URL", async () => {
+    const { board, base } = await openBoard();
+    try {
+      const res = await fetch(`${base}/?token=${board.handle.token}`, { redirect: "manual" });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/");
+      expect(res.headers.get("location")).not.toContain(board.handle.token);
+
+      const cookie = res.headers.get("set-cookie") ?? "";
+      expect(cookie).toContain(`${TOKEN_COOKIE}=${board.handle.token}`);
+      expect(cookie).toContain("HttpOnly");
+      expect(cookie).toContain("SameSite=Strict");
+      expect(cookie).toContain("Path=/");
+    } finally {
+      await board.close();
+    }
+  });
+
+  test("the cookie authorizes GET and POST without a bearer header", async () => {
+    const { board, base } = await openBoard();
+    try {
+      const cookie = `${TOKEN_COOKIE}=${board.handle.token}`;
+
+      const get = await fetch(`${base}/api/swarm`, { headers: { Cookie: cookie } });
+      expect(get.status).toBe(200);
+
+      // Auth passes; the missing Content-Type is what rejects this POST (415),
+      // not auth (401).
+      const post = await fetch(`${base}/api/member/model`, { method: "POST", headers: { Cookie: cookie } });
+      expect(post.status).toBe(415);
+
+      const anonymous = await fetch(`${base}/api/swarm`);
+      expect(anonymous.status).toBe(401);
+    } finally {
+      await board.close();
+    }
+  });
+
+  test("a bad bootstrap token is rejected without setting a cookie", async () => {
+    const { board, base } = await openBoard();
+    try {
+      const res = await fetch(`${base}/?token=wrong`, { redirect: "manual" });
+      expect(res.status).toBe(401);
+      expect(res.headers.get("set-cookie")).toBeNull();
+    } finally {
+      await board.close();
+    }
+  });
+
+  test("an iframe load keeps ?token= so the desktop pane's preload fallback still works", async () => {
+    const { board, base } = await openBoard();
+    try {
+      const res = await fetch(`${base}/?token=${board.handle.token}`, {
+        redirect: "manual",
+        headers: { "Sec-Fetch-Dest": "iframe" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(await res.text()).toContain("preload.js");
     } finally {
       await board.close();
     }
